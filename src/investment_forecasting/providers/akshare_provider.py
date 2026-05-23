@@ -68,6 +68,68 @@ class AkshareProvider:
             raise ProviderDataError(f"AKShare returned no history for {asset.asset_type}:{asset.code}")
         return records
 
+    def asset_universe(self, asset_types: tuple[str, ...] = ("stock", "etf", "fund")) -> list[dict[str, Any]]:
+        assets: list[dict[str, Any]] = []
+        if "stock" in asset_types:
+            assets.extend(self._stock_universe())
+        if "etf" in asset_types:
+            assets.extend(self._etf_universe())
+        if "fund" in asset_types:
+            assets.extend(self._fund_universe())
+        return assets
+
+    def _stock_universe(self) -> list[dict[str, Any]]:
+        raw = self._with_retry("stock:universe", lambda: self.ak.stock_zh_a_spot_em())
+        assets = []
+        for row in _records(raw):
+            raw_code = _value(row, "代码", "code")
+            if raw_code is None:
+                continue
+            code = str(raw_code).zfill(6)
+            name = str(_value(row, "名称", "name") or code)
+            assets.append(
+                {
+                    "code": code,
+                    "name": name,
+                    "asset_type": "stock",
+                    "market": "CN",
+                    "provider_symbol": _provider_symbol(code),
+                }
+            )
+        return assets
+
+    def _etf_universe(self) -> list[dict[str, Any]]:
+        raw = self._with_retry("etf:universe", lambda: self.ak.fund_etf_spot_em())
+        assets = []
+        for row in _records(raw):
+            raw_code = _value(row, "代码", "基金代码", "code")
+            if raw_code is None:
+                continue
+            code = str(raw_code).zfill(6)
+            name = str(_value(row, "名称", "基金简称", "name") or code)
+            assets.append(
+                {
+                    "code": code,
+                    "name": name,
+                    "asset_type": "etf",
+                    "market": "CN",
+                    "provider_symbol": _provider_symbol(code),
+                }
+            )
+        return assets
+
+    def _fund_universe(self) -> list[dict[str, Any]]:
+        raw = self._with_retry("fund:universe", lambda: self.ak.fund_open_fund_rank_em(symbol="全部"))
+        assets = []
+        for row in _records(raw):
+            raw_code = _value(row, "基金代码", "代码", "code")
+            if raw_code is None:
+                continue
+            code = str(raw_code).zfill(6)
+            name = str(_value(row, "基金简称", "名称", "name") or code)
+            assets.append({"code": code, "name": name, "asset_type": "fund", "market": "CN", "provider_symbol": None})
+        return assets
+
     def _etf_history(self, asset: Any, start_date: str, end_date: str) -> Any:
         try:
             return self._with_retry(
@@ -238,6 +300,11 @@ def _find_rank_row(raw_rank: Any, code: str) -> Mapping[str, Any]:
         if str(_value(row, "基金代码", "code")) == code:
             return row
     return {}
+
+
+def _provider_symbol(code: str) -> str:
+    prefix = "sh" if code.startswith(("5", "6", "9")) else "sz"
+    return f"{prefix}{code}"
 
 
 def _records(raw_rows: Any) -> list[Mapping[str, Any]]:

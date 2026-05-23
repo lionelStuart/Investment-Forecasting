@@ -11,6 +11,7 @@ python3 -m pip install -e '.[dev]'
 investment-forecasting db init --db data/investment_forecasting.sqlite3
 investment-forecasting ingest mvp --db data/investment_forecasting.sqlite3 --start-date 20240520 --end-date 20240522
 investment-forecasting ingest mvp --universe research --db data/investment_forecasting.sqlite3 --start-date 20240101 --end-date 20260523
+investment-forecasting ingest full --db data/investment_forecasting.sqlite3 --asset-types stock,etf,fund --max-assets 300 --start-date 20240101 --end-date 20260523
 investment-forecasting ingest macro --db data/investment_forecasting.sqlite3 --start-date 20240520 --end-date 20240524 --series DGS10,T10YIE,DTWEXBGS
 investment-forecasting features calculate --db data/investment_forecasting.sqlite3 --start-date 20240520 --end-date 20240522
 investment-forecasting market snapshot --db data/investment_forecasting.sqlite3 --date 20240522
@@ -31,7 +32,7 @@ python3 -m pytest
 
 当前阶段的目标不是做一个演示页面，而是把系统推进到可给真实用户试用的投资研究工作台：
 
-- 数据更完整：默认保留轻量 MVP 标的池，同时提供 `--universe research` 扩展到更多指数、ETF、基金和代表性股票；后续继续引入全市场列表、基金持仓、行业和资金流。
+- 数据更完整：默认保留轻量 MVP 标的池，同时提供 `--universe research` 扩展到更多指数、ETF、基金和代表性股票；`ingest full` 会从 AKShare 动态发现 A 股、ETF、公募基金列表并批量拉取历史数据，支持用 `--max-assets` 分批推进到更全量覆盖。
 - 曲线先行：任何预测前都要先能看到资产历史行情/净值和累计涨幅曲线，让用户理解趋势、波动和回撤背景。
 - 预测入库：所有模型预测写入 `model_predictions`，包含周期、上涨概率、预期收益区间、下行风险、置信度和输入窗口。
 - 事后评分：预测和建议到期后要用未来真实值评分，持续记录方向准确率、收益误差、风险识别、跑赢基准和综合分。
@@ -93,7 +94,8 @@ WebUI
 
 - `mvp`：少量指数、ETF、基金和股票，用于本地快速验证。
 - `research`：扩展的指数、宽基/行业/债券/货币 ETF、偏股基金和代表性股票，用于更接近真实使用的研究样本。
-- 后续目标：通过 AKShare/Tushare 拉取全 A 股、ETF 全列表、公募基金全列表、行业分类、基金持仓和资金流，形成可筛选的全量资产池。
+- `full`：通过 AKShare 动态发现 A 股、ETF、公募基金列表，再按日期区间拉取历史行情/净值；大批量运行建议先设置 `--max-assets` 分批入库和检查质量报告。
+- 后续目标：继续引入 Tushare、行业分类、基金持仓和资金流，形成更稳定的全量资产池。
 
 优先数据源：
 

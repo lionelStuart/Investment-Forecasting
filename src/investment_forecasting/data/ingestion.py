@@ -69,6 +69,8 @@ UNIVERSES = {
     "research": RESEARCH_UNIVERSE,
 }
 
+CORE_INDEX_UNIVERSE = [asset for asset in RESEARCH_UNIVERSE if asset.asset_type == "index"]
+
 
 def ingest_mvp_universe(
     db_path: str | Path,
@@ -137,3 +139,27 @@ def ingest_mvp_universe(
             raise
 
     return summary
+
+
+def discover_akshare_universe(
+    provider: AkshareProvider | None = None,
+    asset_types: tuple[str, ...] = ("stock", "etf", "fund"),
+    max_assets: int | None = None,
+    include_core_indices: bool = True,
+) -> list[UniverseAsset]:
+    provider = provider or AkshareProvider()
+    discovered = [
+        UniverseAsset(
+            code=str(item["code"]),
+            name=str(item["name"]),
+            asset_type=str(item["asset_type"]),
+            market=str(item.get("market") or "CN"),
+            provider_symbol=item.get("provider_symbol"),
+        )
+        for item in provider.asset_universe(asset_types=asset_types)
+    ]
+    if max_assets is not None:
+        discovered = discovered[:max_assets]
+    if include_core_indices:
+        return [*CORE_INDEX_UNIVERSE, *discovered]
+    return discovered

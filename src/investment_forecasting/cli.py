@@ -7,7 +7,7 @@ from pathlib import Path
 
 from investment_forecasting.advice.generator import AdviceGenerationError, generate_daily_advice
 from investment_forecasting.advice.scoring import AdviceScoringError, score_matured_advice
-from investment_forecasting.data.ingestion import UNIVERSES, ingest_mvp_universe
+from investment_forecasting.data.ingestion import UNIVERSES, discover_akshare_universe, ingest_mvp_universe
 from investment_forecasting.data.macro import DEFAULT_FRED_SERIES, ingest_fred_macro
 from investment_forecasting.db import init_db
 from investment_forecasting.mcp.tools import call_tool, list_tools
@@ -67,6 +67,20 @@ def build_parser() -> argparse.ArgumentParser:
         "--series",
         default=",".join(DEFAULT_FRED_SERIES),
         help="Comma-separated FRED series IDs. Defaults to DGS10,T10YIE,DTWEXBGS.",
+    )
+    full_parser = ingest_subparsers.add_parser("full", help="Discover a broad AKShare universe and ingest history")
+    full_parser.add_argument("--db", type=Path, default=Path("data/investment_forecasting.sqlite3"))
+    full_parser.add_argument("--start-date", required=True, help="Start date in YYYYMMDD format.")
+    full_parser.add_argument("--end-date", required=True, help="End date in YYYYMMDD format.")
+    full_parser.add_argument(
+        "--asset-types",
+        default="stock,etf,fund",
+        help="Comma-separated asset types to discover from AKShare: stock,etf,fund.",
+    )
+    full_parser.add_argument(
+        "--max-assets",
+        type=int,
+        help="Optional cap for dry runs or staged ingestion. Omit to ingest the discovered universe.",
     )
 
     features_parser = subparsers.add_parser("features", help="Feature calculation operations")
@@ -219,6 +233,24 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Ingested {total} macro observations into {args.db}: {summary}")
         return 0
 
+    if args.command == "ingest" and args.ingest_command == "full":
+        try:
+            asset_types = _parse_asset_types(args.asset_types)
+            universe = discover_akshare_universe(
+                asset_types=asset_types,
+                max_assets=args.max_assets,
+            )
+            summary = ingest_mvp_universe(args.db, start_date=args.start_date, end_date=args.end_date, universe=universe)
+        except argparse.ArgumentTypeError as exc:
+            print(f"Invalid full universe options: {exc}", file=sys.stderr)
+            return 2
+        except ProviderDataError as exc:
+            print(f"Full universe ingestion failed: {exc}", file=sys.stderr)
+            return 1
+        total = sum(summary.values())
+        print(f"Ingested {total} rows for {len(summary)} discovered assets into {args.db}")
+        return 0
+
     if args.command == "features" and args.features_command == "calculate":
         try:
             summary = calculate_features_for_db(args.db, start_date=args.start_date, end_date=args.end_date)
@@ -362,6 +394,17 @@ def _parse_series(value: str) -> tuple[str, ...]:
     if not series_ids:
         raise argparse.ArgumentTypeError("At least one FRED series id is required")
     return series_ids
+
+
+def _parse_asset_types(value: str) -> tuple[str, ...]:
+    asset_types = tuple(part.strip().lower() for part in value.split(",") if part.strip())
+    allowed = {"stock", "etf", "fund"}
+    invalid = set(asset_types) - allowed
+    if invalid:
+        raise argparse.ArgumentTypeError(f"Unsupported asset type(s): {', '.join(sorted(invalid))}")
+    if not asset_types:
+        raise argparse.ArgumentTypeError("At least one asset type is required")
+    return asset_types
 
 
 if __name__ == "__main__":

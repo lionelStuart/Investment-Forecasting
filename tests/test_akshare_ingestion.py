@@ -2,7 +2,12 @@ from __future__ import annotations
 
 import pytest
 
-from investment_forecasting.data.ingestion import MVP_UNIVERSE, RESEARCH_UNIVERSE, ingest_mvp_universe
+from investment_forecasting.data.ingestion import (
+    MVP_UNIVERSE,
+    RESEARCH_UNIVERSE,
+    discover_akshare_universe,
+    ingest_mvp_universe,
+)
 from investment_forecasting.db import connect
 from investment_forecasting.providers.akshare_provider import (
     ProviderDataError,
@@ -53,6 +58,18 @@ class FakeProviderWithFundInfo(FakeProvider):
         }
 
 
+class FakeDiscoveryProvider:
+    def asset_universe(self, asset_types=("stock", "etf", "fund")):
+        rows = []
+        if "stock" in asset_types:
+            rows.append({"code": "600000", "name": "浦发银行", "asset_type": "stock", "market": "CN", "provider_symbol": "sh600000"})
+        if "etf" in asset_types:
+            rows.append({"code": "510050", "name": "上证50ETF", "asset_type": "etf", "market": "CN", "provider_symbol": "sh510050"})
+        if "fund" in asset_types:
+            rows.append({"code": "000001", "name": "华夏成长混合", "asset_type": "fund", "market": "CN"})
+        return rows
+
+
 class FailingProvider:
     def history(self, asset, start_date: str, end_date: str):
         raise ProviderDataError("changed columns")
@@ -99,6 +116,17 @@ class FlakyAkModule:
         if self.calls == 1:
             raise RuntimeError("temporary")
         return [{"净值日期": "2026-05-20", "单位净值": "1.0"}]
+
+
+class FakeAkModuleWithUniverse:
+    def stock_zh_a_spot_em(self):
+        return [{"代码": "600000", "名称": "浦发银行"}]
+
+    def fund_etf_spot_em(self):
+        return [{"代码": "510050", "名称": "上证50ETF"}]
+
+    def fund_open_fund_rank_em(self, symbol: str):
+        return [{"基金代码": "000001", "基金简称": "华夏成长混合"}]
 
 
 def test_normalize_index_rows_from_akshare_columns():
@@ -221,6 +249,14 @@ def test_research_universe_extends_mvp_coverage():
     assert {asset.asset_type for asset in RESEARCH_UNIVERSE} >= {"index", "etf", "fund", "stock"}
 
 
+def test_discover_akshare_universe_keeps_core_indices_and_dynamic_assets():
+    universe = discover_akshare_universe(provider=FakeDiscoveryProvider(), asset_types=("stock", "etf"), max_assets=2)
+
+    assert any(asset.code == "000300" and asset.asset_type == "index" for asset in universe)
+    assert any(asset.code == "600000" and asset.provider_symbol == "sh600000" for asset in universe)
+    assert any(asset.code == "510050" and asset.asset_type == "etf" for asset in universe)
+
+
 def test_ingest_failure_writes_task_log(tmp_path):
     db_path = tmp_path / "ingest.sqlite3"
 
@@ -263,6 +299,18 @@ def test_provider_falls_back_for_stock_history():
     assert len(rows) == 1
     assert rows[0]["trade_date"] == "2026-05-20"
     assert rows[0]["close"] == 10.5
+
+
+def test_provider_discovers_stock_etf_and_fund_universe():
+    provider = AkshareProvider(ak_module=FakeAkModuleWithUniverse())
+
+    rows = provider.asset_universe(asset_types=("stock", "etf", "fund"))
+
+    assert rows == [
+        {"code": "600000", "name": "浦发银行", "asset_type": "stock", "market": "CN", "provider_symbol": "sh600000"},
+        {"code": "510050", "name": "上证50ETF", "asset_type": "etf", "market": "CN", "provider_symbol": "sh510050"},
+        {"code": "000001", "name": "华夏成长混合", "asset_type": "fund", "market": "CN", "provider_symbol": None},
+    ]
 
 
 def test_provider_retries_transient_failures():
