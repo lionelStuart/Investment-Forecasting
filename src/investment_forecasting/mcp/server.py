@@ -77,6 +77,42 @@ def create_mcp_server(db_path: str | Path | None = None) -> FastMCP:
     def generate_daily_advice(date: str | None = None) -> dict[str, Any]:
         return call_tool(resolved_db_path, "generate_daily_advice", {"date": date} if date else {})
 
+    @mcp.tool(name="list_experts", description="List expert committee roster records and lifecycle state.")
+    def list_experts(state: str | None = None) -> dict[str, Any]:
+        return call_tool(resolved_db_path, "list_experts", {"state": state} if state else {})
+
+    @mcp.tool(name="get_expert_plans", description="Return persisted expert plans for a date or latest plans.")
+    def get_expert_plans(date: str | None = None) -> dict[str, Any]:
+        return call_tool(resolved_db_path, "get_expert_plans", {"date": date} if date else {})
+
+    @mcp.tool(name="run_expert_plans", description="Run expert daily planning and simulated execution.")
+    def run_expert_plans(date: str | None = None) -> dict[str, Any]:
+        return call_tool(resolved_db_path, "run_expert_plans", {"date": date} if date else {})
+
+    @mcp.tool(name="get_expert_portfolios", description="Return expert-owned virtual portfolio state.")
+    def get_expert_portfolios() -> dict[str, Any]:
+        return call_tool(resolved_db_path, "get_expert_portfolios", {})
+
+    @mcp.tool(name="score_experts", description="Score experts and review lifecycle status.")
+    def score_experts(
+        date: str | None = None,
+        window_days: int = 20,
+        min_valuations: int = 3,
+    ) -> dict[str, Any]:
+        return call_tool(
+            resolved_db_path,
+            "score_experts",
+            {"date": date, "window_days": window_days, "min_valuations": min_valuations},
+        )
+
+    @mcp.tool(name="get_expert_scorecards", description="Return expert scorecards and lifecycle reviews.")
+    def get_expert_scorecards(date: str | None = None) -> dict[str, Any]:
+        return call_tool(resolved_db_path, "get_expert_scorecards", {"date": date} if date else {})
+
+    @mcp.tool(name="get_expert_lessons", description="Return structured expert lifecycle and hiring lessons.")
+    def get_expert_lessons(lesson_type: str | None = None) -> dict[str, Any]:
+        return call_tool(resolved_db_path, "get_expert_lessons", {"lesson_type": lesson_type} if lesson_type else {})
+
     return mcp
 
 
@@ -100,4 +136,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

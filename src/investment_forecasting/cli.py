@@ -7,10 +7,19 @@ from pathlib import Path
 
 from investment_forecasting.advice.generator import AdviceGenerationError, generate_daily_advice
 from investment_forecasting.advice.scoring import AdviceScoringError, score_matured_advice
-from investment_forecasting.data.ingestion import UNIVERSES, discover_akshare_universe, ingest_mvp_universe
+from investment_forecasting.data.ingestion import (
+    UNIVERSES,
+    discover_akshare_universe,
+    filter_existing_universe_assets,
+    ingest_mvp_universe,
+)
 from investment_forecasting.data.macro import DEFAULT_FRED_SERIES, ingest_fred_macro
-from investment_forecasting.db import init_db
+from investment_forecasting.db import active_user_preference, connect, init_db, list_user_preferences, upsert_user_preference
+from investment_forecasting.experts.planning import ExpertPlanningError, run_expert_daily_plans
+from investment_forecasting.experts.roster import initialize_default_experts, list_roster
+from investment_forecasting.experts.scoring import ExpertScoringError, score_and_review_experts
 from investment_forecasting.mcp.tools import call_tool, list_tools
+from investment_forecasting.portfolio.accounting import DEFAULT_EXPERT_INITIAL_CAPITAL, ensure_expert_portfolios
 from investment_forecasting.mcp.server import main as run_mcp_server_main
 from investment_forecasting.providers.akshare_provider import ProviderDataError
 from investment_forecasting.providers.fred_provider import FredDataError
@@ -58,6 +67,11 @@ def build_parser() -> argparse.ArgumentParser:
         default="mvp",
         help="Asset universe to ingest. Use research for broader stock/ETF/fund coverage.",
     )
+    mvp_parser.add_argument(
+        "--continue-on-error",
+        action="store_true",
+        help="Keep ingesting remaining universe assets if one provider call fails.",
+    )
 
     macro_parser = ingest_subparsers.add_parser("macro", help="Ingest free macro observations from FRED")
     macro_parser.add_argument("--db", type=Path, default=Path("data/investment_forecasting.sqlite3"))
@@ -82,6 +96,22 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         help="Optional cap for dry runs or staged ingestion. Omit to ingest the discovered universe.",
     )
+    full_parser.add_argument(
+        "--max-assets-per-type",
+        type=int,
+        help="Optional cap per asset type before applying --max-assets, useful for balanced stock/ETF/fund samples.",
+    )
+    full_parser.add_argument(
+        "--offset-per-type",
+        type=int,
+        default=0,
+        help="Skip this many discovered assets in each requested type before applying caps.",
+    )
+    full_parser.add_argument(
+        "--skip-existing-assets",
+        action="store_true",
+        help="Only fetch assets that are not already present in the local assets table.",
+    )
 
     features_parser = subparsers.add_parser("features", help="Feature calculation operations")
     features_subparsers = features_parser.add_subparsers(dest="features_command", required=True)
@@ -95,6 +125,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     calculate_parser.add_argument("--start-date", help="Optional start date in YYYYMMDD or YYYY-MM-DD format.")
     calculate_parser.add_argument("--end-date", help="Optional end date in YYYYMMDD or YYYY-MM-DD format.")
+    calculate_parser.add_argument(
+        "--continue-on-error",
+        action="store_true",
+        help="Skip assets with invalid price history and continue calculating the rest.",
+    )
 
     forecast_parser = subparsers.add_parser("forecast", help="Forecast operations")
     forecast_subparsers = forecast_parser.add_subparsers(dest="forecast_command", required=True)
@@ -132,6 +167,45 @@ def build_parser() -> argparse.ArgumentParser:
     score_parser = advice_subparsers.add_parser("score-outcomes", help="Score matured advice outcomes")
     score_parser.add_argument("--db", type=Path, default=Path("data/investment_forecasting.sqlite3"))
     score_parser.add_argument("--horizon-days", type=int, default=20)
+
+    prefs_parser = subparsers.add_parser("prefs", help="User risk preference operations")
+    prefs_subparsers = prefs_parser.add_subparsers(dest="prefs_command", required=True)
+    prefs_list_parser = prefs_subparsers.add_parser("list", help="List stored user preferences")
+    prefs_list_parser.add_argument("--db", type=Path, default=Path("data/investment_forecasting.sqlite3"))
+    prefs_set_parser = prefs_subparsers.add_parser("set", help="Create or update the active user preference")
+    prefs_set_parser.add_argument("--db", type=Path, default=Path("data/investment_forecasting.sqlite3"))
+    prefs_set_parser.add_argument("--name", default="默认账户")
+    prefs_set_parser.add_argument("--risk-profile", choices=["aggressive", "balanced", "conservative"], default="balanced")
+    prefs_set_parser.add_argument("--horizon-days", type=int, default=20)
+    prefs_set_parser.add_argument("--max-equity-pct", type=float, default=0.6)
+    prefs_set_parser.add_argument("--min-cash-pct", type=float, default=0.1)
+    prefs_set_parser.add_argument("--notes", default="")
+
+    experts_parser = subparsers.add_parser("experts", help="Expert committee roster operations")
+    experts_subparsers = experts_parser.add_subparsers(dest="experts_command", required=True)
+    experts_init_parser = experts_subparsers.add_parser("init", help="Initialize the default three active experts")
+    experts_init_parser.add_argument("--db", type=Path, default=Path("data/investment_forecasting.sqlite3"))
+    experts_portfolios_parser = experts_subparsers.add_parser(
+        "init-portfolios",
+        help="Create one virtual portfolio for each active expert",
+    )
+    experts_portfolios_parser.add_argument("--db", type=Path, default=Path("data/investment_forecasting.sqlite3"))
+    experts_portfolios_parser.add_argument("--initial-capital", type=float, default=DEFAULT_EXPERT_INITIAL_CAPITAL)
+    experts_list_parser = experts_subparsers.add_parser("list", help="List expert roster records")
+    experts_list_parser.add_argument("--db", type=Path, default=Path("data/investment_forecasting.sqlite3"))
+    experts_list_parser.add_argument(
+        "--state",
+        choices=["candidate", "active", "probation", "retired"],
+        help="Optional lifecycle state filter.",
+    )
+    experts_run_parser = experts_subparsers.add_parser("run-plans", help="Run daily expert plans and simulated execution")
+    experts_run_parser.add_argument("--db", type=Path, default=Path("data/investment_forecasting.sqlite3"))
+    experts_run_parser.add_argument("--date", help="Plan date in YYYYMMDD or YYYY-MM-DD format.")
+    experts_score_parser = experts_subparsers.add_parser("score", help="Score experts and review lifecycle status")
+    experts_score_parser.add_argument("--db", type=Path, default=Path("data/investment_forecasting.sqlite3"))
+    experts_score_parser.add_argument("--date", help="Review date in YYYYMMDD or YYYY-MM-DD format.")
+    experts_score_parser.add_argument("--window-days", type=int, default=20)
+    experts_score_parser.add_argument("--min-valuations", type=int, default=3)
 
     mcp_parser = subparsers.add_parser("mcp", help="MCP-compatible tool operations")
     mcp_subparsers = mcp_parser.add_subparsers(dest="mcp_command", required=True)
@@ -215,6 +289,7 @@ def main(argv: list[str] | None = None) -> int:
                 start_date=args.start_date,
                 end_date=args.end_date,
                 universe=UNIVERSES[args.universe],
+                continue_on_error=args.continue_on_error,
             )
         except ProviderDataError as exc:
             print(f"Ingestion failed: {exc}", file=sys.stderr)
@@ -236,10 +311,17 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "ingest" and args.ingest_command == "full":
         try:
             asset_types = _parse_asset_types(args.asset_types)
+            if args.offset_per_type < 0:
+                raise argparse.ArgumentTypeError("--offset-per-type must be zero or positive")
             universe = discover_akshare_universe(
                 asset_types=asset_types,
                 max_assets=args.max_assets,
+                max_assets_per_type=args.max_assets_per_type,
+                offset_per_type=args.offset_per_type,
             )
+            discovered_count = len(universe)
+            if args.skip_existing_assets:
+                universe = filter_existing_universe_assets(args.db, universe)
             summary = ingest_mvp_universe(
                 args.db,
                 start_date=args.start_date,
@@ -255,12 +337,20 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         total = sum(summary.values())
         skipped = sum(1 for rows in summary.values() if rows == 0)
-        print(f"Ingested {total} rows for {len(summary)} discovered assets into {args.db}; skipped {skipped} failed/empty assets")
+        print(
+            f"Ingested {total} rows for {len(summary)} assets into {args.db}; "
+            f"discovered {discovered_count}; skipped {discovered_count - len(summary)} existing and {skipped} failed/empty assets"
+        )
         return 0
 
     if args.command == "features" and args.features_command == "calculate":
         try:
-            summary = calculate_features_for_db(args.db, start_date=args.start_date, end_date=args.end_date)
+            summary = calculate_features_for_db(
+                args.db,
+                start_date=args.start_date,
+                end_date=args.end_date,
+                continue_on_error=args.continue_on_error,
+            )
         except FeatureCalculationError as exc:
             print(f"Feature calculation failed: {exc}", file=sys.stderr)
             return 1
@@ -302,6 +392,76 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Advice outcome scoring failed: {exc}", file=sys.stderr)
             return 1
         print(json.dumps({"scored": scored}, ensure_ascii=False, indent=2))
+        return 0
+
+    if args.command == "prefs" and args.prefs_command == "list":
+        init_db(args.db)
+        with connect(args.db) as conn:
+            preferences = [dict(row) for row in list_user_preferences(conn)]
+            active = active_user_preference(conn)
+        print(json.dumps({"active": dict(active) if active else None, "preferences": preferences}, ensure_ascii=False, indent=2))
+        return 0
+
+    if args.command == "prefs" and args.prefs_command == "set":
+        init_db(args.db)
+        if args.horizon_days <= 0:
+            print("--horizon-days must be positive", file=sys.stderr)
+            return 2
+        if not 0 <= args.max_equity_pct <= 1 or not 0 <= args.min_cash_pct <= 1:
+            print("--max-equity-pct and --min-cash-pct must be decimals between 0 and 1", file=sys.stderr)
+            return 2
+        with connect(args.db) as conn:
+            preference_id = upsert_user_preference(
+                conn,
+                {
+                    "profile_name": args.name,
+                    "risk_profile": args.risk_profile,
+                    "investment_horizon_days": args.horizon_days,
+                    "max_equity_pct": args.max_equity_pct,
+                    "min_cash_pct": args.min_cash_pct,
+                    "notes": args.notes,
+                    "is_active": 1,
+                },
+            )
+        print(f"Saved active user preference id={preference_id} in {args.db}")
+        return 0
+
+    if args.command == "experts" and args.experts_command == "init":
+        experts = initialize_default_experts(args.db)
+        print(json.dumps({"active_count": len(experts), "experts": experts}, ensure_ascii=False, indent=2))
+        return 0
+
+    if args.command == "experts" and args.experts_command == "init-portfolios":
+        portfolios = ensure_expert_portfolios(args.db, initial_capital=args.initial_capital)
+        print(json.dumps({"portfolio_count": len(portfolios), "portfolios": portfolios}, ensure_ascii=False, indent=2))
+        return 0
+
+    if args.command == "experts" and args.experts_command == "list":
+        experts = list_roster(args.db, lifecycle_state=args.state)
+        print(json.dumps({"count": len(experts), "experts": experts}, ensure_ascii=False, indent=2))
+        return 0
+
+    if args.command == "experts" and args.experts_command == "run-plans":
+        try:
+            plans = run_expert_daily_plans(args.db, plan_date=args.date)
+        except ExpertPlanningError as exc:
+            print(f"Expert planning failed: {exc}", file=sys.stderr)
+            return 1
+        print(json.dumps({"plan_count": len(plans), "plans": plans}, ensure_ascii=False, indent=2))
+        return 0
+
+    if args.command == "experts" and args.experts_command == "score":
+        try:
+            result = score_and_review_experts(
+                args.db,
+                review_date=args.date,
+                window_days=args.window_days,
+                min_valuations=args.min_valuations,
+            )
+        except ExpertScoringError as exc:
+            print(f"Expert scoring failed: {exc}", file=sys.stderr)
+            return 1
+        print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0
 
     if args.command == "mcp" and args.mcp_command == "list-tools":

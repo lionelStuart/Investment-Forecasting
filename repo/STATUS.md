@@ -2,8 +2,24 @@
 
 ## Current Focus
 
-- README MVP goal achieved for the representative local-first slice. Remaining
-  work is enhancement backlog, not a blocker for the current goal.
+- Data coverage has been expanded and ingestion channels have been hardened.
+  The first productized research-flow slice is now in place through the run
+  timeline, category navigation, and fund screening presets. The expert
+  committee foundation has started with a persisted three-expert roster,
+  structured styles, focus weights, risk limits, allowed asset categories,
+  cash buffers, review cadence, lifecycle state, and one CNY 500,000 virtual
+  portfolio per active expert. Experts can now produce one evidence-backed
+  daily plan per date and simulate execution into those virtual portfolios.
+  Expert scorecards, lifecycle reviews, retirement lessons, and replacement
+  hiring are now persisted from virtual portfolio records. The expert
+  committee is inspectable in WebUI through `/experts`, including active,
+  probation, retired, plans, scorecards, reviews, and lessons. Expert roster,
+  planning, portfolios, scoring, reviews, and lessons are now exposed to
+  MCP/Agent workflows with task logs. Next iteration should return to product
+  workbench polish (`TASK-031`/`TASK-032`/`TASK-033`/`TASK-035`) or start the
+  separate phone communication phase. The next newly requested phase is local Mac-to-phone
+  communication through an adapter layer, with iMessage as the first outbound
+  channel.
 
 ## Last Completed
 
@@ -46,6 +62,46 @@
   2023-2025 expanded-universe calibration report.
 - `TASK-018`: Added FRED macro observation ingestion, persistence, CLI command,
   and market snapshot evidence integration.
+- `TASK-019`: Added daily-advice history selection and focus-asset links to
+  product data pages.
+- `TASK-020`: Added dashboard database status and restart-time row-count health
+  output.
+- `TASK-021`: Added persisted user risk preferences, CLI/WebUI settings, and
+  preference-aware daily advice generation.
+- `TASK-027`: Expanded default data coverage to 63 assets and hardened
+  research/full ingestion controls.
+- `TASK-034`: Measured the AKShare full candidate universe at 23,952 assets,
+  added resumable balanced full-ingestion batches, skipped existing assets,
+  isolated fund detail and feature-history failures, and expanded the default
+  database to 476 assets / 153,175 price rows.
+- `TASK-028`: Added a WebUI research timeline that connects advice, market
+  snapshots, prediction coverage, backtest evidence, task health, source links,
+  and missing-stage recovery hints.
+- `TASK-029`: Added product category navigation, dashboard category drill-in,
+  category summaries, and a selected-asset-first `/data` view with the raw
+  asset list moved into secondary technical details.
+- `TASK-030`: Upgraded `/funds` into a practical screening workflow with
+  metadata/metric filters, conservative/balanced/aggressive presets,
+  suitability explanations, and product-language missing metadata states.
+- `TASK-036`: Added persisted expert roster architecture with the three
+  default active experts, structured configuration, lifecycle state,
+  idempotent initialization, CLI inspection, and tests.
+- `TASK-037`: Added shared simulated portfolio accounting and created one CNY
+  500,000 virtual portfolio per active expert with cash ledger, positions,
+  transactions, no-trade/unfilled records, and stored-price valuation.
+- `TASK-038`: Added expert daily planning and simulated execution from stored
+  predictions, features, market snapshots, focus weights, risk checks, and
+  portfolio cash, with idempotent one-plan-per-expert-per-day persistence.
+- `TASK-039`: Added expert scorecards, lifecycle reviews, structured lessons,
+  warning/probation/retirement progression, and style-diverse replacement
+  hiring that restores three active experts.
+- `TASK-040`: Added `/experts` WebUI for expert roster, virtual portfolios,
+  current capital/cash/return/drawdown/score, latest plans, lifecycle reviews,
+  retired/probation states, equity/benchmark comparison, lessons, and
+  secondary technical details.
+- `TASK-041`: Added expert MCP/Agent tools for roster, plans, virtual
+  portfolios, scoring, scorecards/reviews, lessons, daily planning, and
+  scoring execution with task logs.
 
 ## Current Constraints
 
@@ -56,21 +112,227 @@
 - MVP should start with AKShare and SQLite.
 - Investment advice must remain research support and must include risk and
   uncertainty.
+- Residential broadband access to AKShare-backed public data should be treated
+  as low-frequency personal research only; future ingestion work must minimize
+  temporary ban or anti-bot risk with rate limits, jitter, incremental updates,
+  and clear throttling diagnostics.
 
 ## Open Issues
 
-- The MVP tracked universe is intentionally representative, not exhaustive: 4
-  indices, 3 ETFs, 2 public funds, and 1 individual A-share.
+- Current UI is still table/list heavy despite expanded coverage: timeline,
+  category-first screening, asset-level forecast grouping, and consistent
+  red/green market semantics are not yet implemented.
+- Raw tables, evidence JSON, saved-setting fields, and task logs are still
+  primary on several pages (`/data`, `/funds`, `/predictions`, `/backtests`,
+  `/advice`, `/settings`, `/logs`) before users see decision summaries.
 - Daily 08:00 scheduling must account for China market data availability: the
   morning run mainly uses previous trading-day data.
+- Expert committee planning/execution work must reuse the new persisted expert
+  roster plus existing advice, forecast, backtest, scoring, portfolio, daily
+  workflow, MCP, and WebUI capabilities instead of creating a parallel
+  investment engine.
+- Phone communication must be opt-in, allowlisted, auditable, and safe.
+  iMessage is the first adapter, but investment, expert, workflow, and WebUI
+  logic must call a channel-neutral communication service instead of directly
+  invoking Messages or AppleScript.
 
 ## Next Steps
 
-1. Optional enhancement: add Chinese macro series when a stable free provider
-   is selected.
-2. Optional enhancement: add fund-peer or 偏股基金指数 benchmark scoring.
-3. Optional enhancement: expand the tracked universe beyond the representative
-   MVP assets.
+1. `TASK-031`: Add red/green market visual semantics.
+2. `TASK-032`: Add asset-level prediction cards.
+3. `TASK-033`: Add dashboard daily brief and run-health summary.
+4. `TASK-035`: Apply progressive disclosure to raw tables, evidence JSON,
+   saved-setting fields, and operational logs across table-heavy pages.
+5. `TASK-022`: Add simulated portfolio tracking after the research flow is more
+   productized.
+6. `TASK-042`: Add communication adapter architecture and outbound message
+   persistence.
+7. `TASK-043`: Implement the first iMessage outbound adapter for allowlisted
+   Mac-to-phone notifications.
+
+## Round Evaluation
+
+- Date: 2026-05-23
+- Scope: `TASK-041` expert Agent workflow and MCP integration.
+- Judge: `python3 -m pytest tests/test_mcp_tools.py tests/test_mcp_server.py`.
+- Score: 92/100
+- Reasoning: Expert committee operations are now available through structured
+  MCP tools and the FastMCP stdio server. Agents can inspect experts, plans,
+  virtual portfolios, scorecards, reviews, and lessons, and can trigger expert
+  planning/scoring without direct SQL edits. Planning and scoring write task
+  logs. Remaining expert polish is richer WebUI charts and future automation
+  scheduling, not core accessibility.
+
+## Round Evaluation
+
+- Date: 2026-05-23
+- Scope: `TASK-040` expert committee WebUI.
+- Judge: `python3 -m pytest tests/test_web_app.py`.
+- Score: 91/100
+- Reasoning: `/experts` now makes expert status inspectable without reading raw
+  tables first: lifecycle state, style, current virtual capital, cash, return,
+  drawdown, score, latest plan/execution, review rationale, lessons, and
+  technical score/review details are all visible. Remaining expert integration
+  belongs to MCP/Agent workflow exposure.
+
+## Round Evaluation
+
+- Date: 2026-05-23
+- Scope: `TASK-039` expert scoring, retirement, and replacement hiring.
+- Judge: `python3 -m pytest tests/test_expert_scoring.py tests/test_experts.py
+  tests/test_portfolio.py tests/test_db.py` and real database `experts score`
+  smoke run.
+- Score: 90/100
+- Reasoning: Scorecards are now reproducible from persisted virtual valuations,
+  transactions, and plans. Lifecycle review requires maturity, moves weak
+  experts through warn/probation before retirement, writes structured lessons,
+  and creates a style-diverse replacement with a virtual portfolio to restore
+  three active experts. The live database currently has immature scorecards
+  because no valuation history exists yet, so no expert is punished.
+
+## Round Evaluation
+
+- Date: 2026-05-23
+- Scope: `TASK-038` expert daily planning and simulated execution.
+- Judge: Expert planning tests and real database CLI execution for
+  `experts run-plans --date 2026-05-23`.
+- Score: 90/100
+- Reasoning: Each active expert can now produce at most one stored plan per
+  date, with action/no-trade, target asset/amount, rationale, evidence links,
+  risk checks, warnings, and execution status. Executions reuse virtual
+  portfolio accounting, so buys update cash/positions and no-trade decisions
+  are persisted. Remaining maturity is scoring, lifecycle review, and WebUI.
+
+## Round Evaluation
+
+- Date: 2026-05-23
+- Scope: `TASK-037` expert virtual portfolio foundation.
+- Judge: `python3 -m pytest tests/test_portfolio.py tests/test_db.py` and
+  real database CLI bootstrap for expert portfolios.
+- Score: 91/100
+- Reasoning: Each active expert now has an independent CNY 500,000 virtual
+  portfolio on the shared simulated-accounting path. The system can record
+  filled buy/sell orders, no-trade decisions, unfilled missing-price orders,
+  cash ledger entries, positions, and daily valuations from stored prices.
+  Remaining value comes from `TASK-038` daily expert planning and execution.
+
+## Round Evaluation
+
+- Date: 2026-05-23
+- Scope: `TASK-036` expert architecture and roster model.
+- Judge: Expert spec/task audit, `python3 -m pytest tests/test_experts.py
+  tests/test_db.py`, and CLI smoke initialization.
+- Score: 92/100
+- Reasoning: The expert committee is now grounded in persisted structured
+  records instead of UI-only personas. Three active experts can be initialized
+  idempotently and queried by lifecycle state. Remaining expert value depends
+  on `TASK-037` virtual portfolios and later plan/execution/scoring loops.
+
+## Round Evaluation
+
+- Date: 2026-05-23
+- Scope: `TASK-030` fund screening filters and presets.
+- Judge: `python3 -m pytest`, WebUI `/funds` smoke check, and route/content
+  review.
+- Score: 93/100
+- Reasoning: The fund page now supports practical screening by metadata,
+  risk/return metrics, fee completeness, market state, and risk-profile
+  presets. Results explain why a fund appears and whether data is incomplete,
+  reducing raw-table friction. Remaining product polish is visual semantics and
+  asset-level forecast presentation.
+
+## Round Evaluation
+
+- Date: 2026-05-23
+- Scope: `TASK-029` product category navigation.
+- Judge: `python3 -m pytest`, WebUI route smoke checks, and route/content
+  review.
+- Score: 92/100
+- Reasoning: The workbench now supports product-first browsing through
+  user-facing categories, dashboard drill-in, category summaries, peer links,
+  and a `/data` page that starts with selected-asset context instead of raw rows.
+  Remaining category depth belongs in `TASK-030`, where fund filters and presets
+  should make the category views more actionable.
+
+## Round Evaluation
+
+- Date: 2026-05-23
+- Scope: `TASK-028` product timeline and run history.
+- Judge: `python3 -m pytest`, WebUI route smoke check, and route/content review.
+- Score: 93/100
+- Reasoning: The workbench now has a dedicated research timeline and dashboard
+  entry point that connect advice, market snapshots, predictions, backtests, and
+  task health into date-based run history. Missing stages have explicit recovery
+  hints and rows link back to source evidence pages. Remaining polish belongs to
+  the next productization tasks: categories, filters, market semantics, and
+  asset-level forecast cards.
+
+## Round Evaluation
+
+- Date: 2026-05-23
+- Scope: Product progress review and next-phase planning after `TASK-021` and
+  `TASK-027`.
+- Judge: Browser inspection of dashboard, settings, funds, predictions, advice,
+  and logs plus review of `repo/STATUS.md`, `repo/INDEX.md`, and product
+  acceptance documentation.
+- Score: 88/100
+- Reasoning: The product now has broader data, fresher predictions, market
+  snapshots, active risk preferences, and preference-aware advice. The next
+  bottleneck is product experience: the UI still relies on raw tables and
+  repeated lists, so the next phase should prioritize timeline, categories,
+  filters, market color semantics, asset-level prediction grouping, and
+  dashboard/run-health summaries before adding deeper portfolio optimization.
+
+## Round Evaluation
+
+- Date: 2026-05-23
+- Scope: `TASK-027` data expansion and channel hardening.
+- Judge: `python3 -m pytest`, live AKShare/FRED ingestion, row-count audit, and
+  WebUI restart health output.
+- Score: 94/100
+- Reasoning: The default database now has materially broader coverage and all
+  core derived artifacts were recomputed. `research` ingestion can continue on
+  individual failures, and `full` ingestion can cap per type to avoid one asset
+  class dominating a staged pull. Remaining depth comes from more provider
+  diversity and portfolio-level evaluation.
+6. `TASK-027`: Add polite provider access controls for residential-network-safe
+   ingestion.
+
+## Round Evaluation
+
+- Date: 2026-05-23
+- Scope: `TASK-021` user risk preferences.
+- Judge: `python3 -m pytest`, CLI preference smoke test, and WebUI settings
+  rendering.
+- Score: 92/100
+- Reasoning: The roadmap backlog is now translated into concrete tasks, and the
+  first personalization task is implemented end to end: persistence, CLI,
+  WebUI, and advice generation all use the active preference. Remaining product
+  depth comes from portfolio tracking and allocation optimization.
+
+## Round Evaluation
+
+- Date: 2026-05-23
+- Scope: `TASK-020` data status and service health.
+- Judge: `python3 -m pytest`, `scripts/restart_web.sh`, and HTTP check of
+  dashboard content.
+- Score: 93/100
+- Reasoning: The dashboard now shows the active database path, key row counts,
+  latest data dates, and empty-database guidance. The restart script prints
+  row-count health after the service is up, making DB_PATH/data mixups visible
+  immediately.
+
+## Round Evaluation
+
+- Date: 2026-05-23
+- Scope: `TASK-019` advice history and product links.
+- Judge: `python3 -m pytest` plus HTTP smoke against local WebUI route
+  `/advice`.
+- Score: 94/100
+- Reasoning: The WebUI now supports selecting historical advice by id, shows a
+  history table, and links focus asset cards to `/data?asset_id=...` for the
+  corresponding product curve/history page. Tests cover both behaviors and an
+  HTTP smoke followed a real focus link to a product page.
 
 ## Round Evaluation
 

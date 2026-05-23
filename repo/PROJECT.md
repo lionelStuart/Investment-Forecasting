@@ -26,12 +26,20 @@ capital protection, guaranteed returns, or direct instructions to buy or sell.
 - Provide a WebUI for data inspection, model predictions, historical advice,
   scores, risks, and task logs.
 - Use historical data windows for forecast calibration and model improvement.
+- Run a virtual expert committee where distinct expert styles create simulated
+  investment plans, manage virtual capital, are scored over time, and can be
+  retired or replaced based on evidence.
+- Connect the local Mac workbench to the user's phone through safe,
+  adapter-based communication, starting with iMessage notifications.
 
 ## Non-Goals
 
 - Do not build a high-frequency trading system.
 - Do not guarantee returns or produce deterministic investment conclusions.
 - Do not start with a complex live trading or brokerage integration.
+- Do not treat virtual expert plans as real-money execution instructions.
+- Do not let phone communication trigger real-money trades or bypass local
+  audit, allowlist, and safety controls.
 - Do not optimize for a marketing landing page; the WebUI is an operating
   workbench.
 - Do not add advanced ML models before simple reproducible baselines and
@@ -70,6 +78,16 @@ capital protection, guaranteed returns, or direct instructions to buy or sell.
   each prediction timestamp.
 - `Daily Advice`: The stored daily output containing market view, risk state,
   risk-profile-specific allocation guidance, assumptions, and scores.
+- `Expert`: A persisted virtual investment persona with style, model/data
+  focus, risk limits, lifecycle state, and an auditable simulated portfolio.
+- `Expert Plan`: A daily expert decision to buy, sell, rebalance, hold, or stay
+  in cash, backed by stored evidence and risk checks.
+- `Expert Scorecard`: A rolling evaluation of an expert's virtual return,
+  drawdown, benchmark excess, evidence quality, and mandate adherence.
+- `Communication Adapter`: A channel implementation that delivers controlled
+  research notifications, starting with local iMessage on macOS.
+- `Outbound Message`: An auditable send attempt with channel, recipient,
+  rendered summary, status, idempotency key, timestamps, and errors.
 - `MCP Tool`: A structured callable interface used by AI agents to retrieve data
   or run system capabilities.
 

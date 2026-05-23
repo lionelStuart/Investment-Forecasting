@@ -8,9 +8,10 @@ from investment_forecasting.data.ingestion import (
     MVP_UNIVERSE,
     RESEARCH_UNIVERSE,
     discover_akshare_universe,
+    filter_existing_universe_assets,
     ingest_mvp_universe,
 )
-from investment_forecasting.db import connect
+from investment_forecasting.db import connect, init_db, upsert_asset
 from investment_forecasting.providers.akshare_provider import (
     ProviderDataError,
     RetryConfig,
@@ -60,6 +61,11 @@ class FakeProviderWithFundInfo(FakeProvider):
         }
 
 
+class FakeProviderWithFailingFundInfo(FakeProvider):
+    def fund_info(self, asset):
+        raise ProviderDataError("fund detail shape changed")
+
+
 class FakeDiscoveryProvider:
     def asset_universe(self, asset_types=("stock", "etf", "fund")):
         rows = []
@@ -69,6 +75,33 @@ class FakeDiscoveryProvider:
             rows.append({"code": "510050", "name": "上证50ETF", "asset_type": "etf", "market": "CN", "provider_symbol": "sh510050"})
         if "fund" in asset_types:
             rows.append({"code": "000001", "name": "华夏成长混合", "asset_type": "fund", "market": "CN"})
+        return rows
+
+
+class FakeWideDiscoveryProvider:
+    def asset_universe(self, asset_types=("stock", "etf", "fund")):
+        rows = []
+        if "stock" in asset_types:
+            rows.extend(
+                [
+                    {"code": "600000", "name": "浦发银行", "asset_type": "stock", "market": "CN", "provider_symbol": "sh600000"},
+                    {"code": "600001", "name": "邯郸钢铁", "asset_type": "stock", "market": "CN", "provider_symbol": "sh600001"},
+                ]
+            )
+        if "etf" in asset_types:
+            rows.extend(
+                [
+                    {"code": "510050", "name": "上证50ETF", "asset_type": "etf", "market": "CN", "provider_symbol": "sh510050"},
+                    {"code": "510300", "name": "沪深300ETF", "asset_type": "etf", "market": "CN", "provider_symbol": "sh510300"},
+                ]
+            )
+        if "fund" in asset_types:
+            rows.extend(
+                [
+                    {"code": "000001", "name": "华夏成长混合", "asset_type": "fund", "market": "CN"},
+                    {"code": "000002", "name": "华夏成长混合二号", "asset_type": "fund", "market": "CN"},
+                ]
+            )
         return rows
 
 
@@ -274,6 +307,32 @@ def test_ingest_mvp_universe_writes_fund_info_when_provider_supports_it(tmp_path
     assert row["purchase_fee"] == 0.15
 
 
+def test_ingest_can_continue_after_fund_info_failure(tmp_path):
+    db_path = tmp_path / "ingest.sqlite3"
+    fund = next(asset for asset in MVP_UNIVERSE if asset.asset_type == "fund")
+
+    summary = ingest_mvp_universe(
+        db_path,
+        "20260520",
+        "20260521",
+        provider=FakeProviderWithFailingFundInfo(),
+        universe=[fund],
+        continue_on_error=True,
+    )
+
+    with connect(db_path) as conn:
+        prices = conn.execute("SELECT COUNT(*) AS count FROM price_daily").fetchone()["count"]
+        warning = conn.execute(
+            "SELECT status, warnings_json FROM data_quality_reports WHERE scope = ?",
+            (f"ingest:fund:{fund.code}",),
+        ).fetchone()
+
+    assert summary == {f"fund:{fund.code}": 1}
+    assert prices == 1
+    assert warning["status"] == "warning"
+    assert "fund detail shape changed" in warning["warnings_json"]
+
+
 def test_research_universe_extends_mvp_coverage():
     assert len(RESEARCH_UNIVERSE) > len(MVP_UNIVERSE)
     assert {asset.asset_type for asset in RESEARCH_UNIVERSE} >= {"index", "etf", "fund", "stock"}
@@ -285,6 +344,61 @@ def test_discover_akshare_universe_keeps_core_indices_and_dynamic_assets():
     assert any(asset.code == "000300" and asset.asset_type == "index" for asset in universe)
     assert any(asset.code == "600000" and asset.provider_symbol == "sh600000" for asset in universe)
     assert any(asset.code == "510050" and asset.asset_type == "etf" for asset in universe)
+
+
+def test_discover_akshare_universe_can_cap_each_asset_type():
+    universe = discover_akshare_universe(
+        provider=FakeDiscoveryProvider(),
+        asset_types=("stock", "etf", "fund"),
+        max_assets_per_type=1,
+        include_core_indices=False,
+    )
+
+    counts = {asset_type: sum(1 for asset in universe if asset.asset_type == asset_type) for asset_type in {"stock", "etf", "fund"}}
+    assert counts == {"stock": 1, "etf": 1, "fund": 1}
+
+
+def test_discover_akshare_universe_can_offset_each_asset_type():
+    universe = discover_akshare_universe(
+        provider=FakeWideDiscoveryProvider(),
+        asset_types=("stock", "etf", "fund"),
+        max_assets_per_type=1,
+        offset_per_type=1,
+        include_core_indices=False,
+    )
+
+    assert [(asset.asset_type, asset.code) for asset in universe] == [
+        ("stock", "600001"),
+        ("etf", "510300"),
+        ("fund", "000002"),
+    ]
+
+
+def test_filter_existing_universe_assets_skips_assets_already_in_db(tmp_path):
+    db_path = tmp_path / "ingest.sqlite3"
+    init_db(db_path)
+    universe = discover_akshare_universe(
+        provider=FakeWideDiscoveryProvider(),
+        asset_types=("stock",),
+        include_core_indices=False,
+    )
+    with connect(db_path) as conn:
+        upsert_asset(
+            conn,
+            {
+                "code": "600000",
+                "name": "浦发银行",
+                "asset_type": "stock",
+                "market": "CN",
+                "currency": "CNY",
+                "status": "active",
+                "source": "akshare",
+            },
+        )
+
+    filtered = filter_existing_universe_assets(db_path, universe)
+
+    assert [asset.code for asset in filtered] == ["600001"]
 
 
 def test_ingest_failure_writes_task_log(tmp_path):

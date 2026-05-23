@@ -35,6 +35,13 @@ async def test_mcp_stdio_lists_tools_and_calls_read_and_workflow_tools(tmp_path)
         "run_backtest",
         "get_daily_advice",
         "generate_daily_advice",
+        "list_experts",
+        "get_expert_plans",
+        "run_expert_plans",
+        "get_expert_portfolios",
+        "score_experts",
+        "get_expert_scorecards",
+        "get_expert_lessons",
     } == tool_names
 
     snapshot_payload = getattr(snapshot, "structuredContent")
@@ -51,4 +58,3 @@ async def test_mcp_stdio_lists_tools_and_calls_read_and_workflow_tools(tmp_path)
         "result": None,
         "error": {"message": "Unknown asset: NOPE/CN/akshare"},
     }
-

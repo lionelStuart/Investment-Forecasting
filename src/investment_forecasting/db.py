@@ -465,6 +465,124 @@ def upsert_data_quality_report(conn: sqlite3.Connection, report: dict[str, Any])
     return int(cursor.fetchone()["id"])
 
 
+def upsert_user_preference(conn: sqlite3.Connection, preference: dict[str, Any]) -> int:
+    if int(preference.get("is_active", 0)):
+        conn.execute("UPDATE user_preferences SET is_active = 0, updated_at = datetime('now') WHERE is_active = 1")
+    cursor = conn.execute(
+        """
+        INSERT INTO user_preferences(
+            profile_name, risk_profile, investment_horizon_days,
+            max_equity_pct, min_cash_pct, notes, is_active
+        )
+        VALUES (
+            :profile_name, :risk_profile, :investment_horizon_days,
+            :max_equity_pct, :min_cash_pct, :notes, :is_active
+        )
+        ON CONFLICT(profile_name) DO UPDATE SET
+            risk_profile = excluded.risk_profile,
+            investment_horizon_days = excluded.investment_horizon_days,
+            max_equity_pct = excluded.max_equity_pct,
+            min_cash_pct = excluded.min_cash_pct,
+            notes = excluded.notes,
+            is_active = excluded.is_active,
+            updated_at = datetime('now')
+        RETURNING id
+        """,
+        preference,
+    )
+    return int(cursor.fetchone()["id"])
+
+
+def active_user_preference(conn: sqlite3.Connection) -> sqlite3.Row | None:
+    return conn.execute(
+        """
+        SELECT *
+        FROM user_preferences
+        WHERE is_active = 1
+        ORDER BY updated_at DESC, id DESC
+        LIMIT 1
+        """
+    ).fetchone()
+
+
+def list_user_preferences(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    return conn.execute(
+        """
+        SELECT *
+        FROM user_preferences
+        ORDER BY is_active DESC, updated_at DESC, id DESC
+        """
+    ).fetchall()
+
+
+def upsert_expert(conn: sqlite3.Connection, expert: dict[str, Any]) -> int:
+    cursor = conn.execute(
+        """
+        INSERT INTO experts(
+            expert_key, name, short_description, style_label, focus_weights_json,
+            risk_budget_pct, max_drawdown_tolerance, allowed_asset_categories_json,
+            default_cash_buffer_pct, review_cadence_days, lifecycle_state,
+            mandate, source
+        )
+        VALUES (
+            :expert_key, :name, :short_description, :style_label, :focus_weights_json,
+            :risk_budget_pct, :max_drawdown_tolerance, :allowed_asset_categories_json,
+            :default_cash_buffer_pct, :review_cadence_days, :lifecycle_state,
+            :mandate, :source
+        )
+        ON CONFLICT(expert_key) DO UPDATE SET
+            name = excluded.name,
+            short_description = excluded.short_description,
+            style_label = excluded.style_label,
+            focus_weights_json = excluded.focus_weights_json,
+            risk_budget_pct = excluded.risk_budget_pct,
+            max_drawdown_tolerance = excluded.max_drawdown_tolerance,
+            allowed_asset_categories_json = excluded.allowed_asset_categories_json,
+            default_cash_buffer_pct = excluded.default_cash_buffer_pct,
+            review_cadence_days = excluded.review_cadence_days,
+            lifecycle_state = excluded.lifecycle_state,
+            mandate = excluded.mandate,
+            source = excluded.source,
+            updated_at = datetime('now')
+        RETURNING id
+        """,
+        expert,
+    )
+    return int(cursor.fetchone()["id"])
+
+
+def list_experts(conn: sqlite3.Connection, lifecycle_state: str | None = None) -> list[sqlite3.Row]:
+    if lifecycle_state:
+        return conn.execute(
+            """
+            SELECT *
+            FROM experts
+            WHERE lifecycle_state = ?
+            ORDER BY expert_key
+            """,
+            (lifecycle_state,),
+        ).fetchall()
+    return conn.execute(
+        """
+        SELECT *
+        FROM experts
+        ORDER BY
+            CASE lifecycle_state
+                WHEN 'active' THEN 0
+                WHEN 'probation' THEN 1
+                WHEN 'candidate' THEN 2
+                WHEN 'retired' THEN 3
+                ELSE 4
+            END,
+            expert_key
+        """
+    ).fetchall()
+
+
+def get_expert(conn: sqlite3.Connection, expert_key: str) -> sqlite3.Row | None:
+    return conn.execute("SELECT * FROM experts WHERE expert_key = ?", (expert_key,)).fetchone()
+
+
 def upsert_advice_outcome_score(conn: sqlite3.Connection, score: dict[str, Any]) -> int:
     cursor = conn.execute(
         """

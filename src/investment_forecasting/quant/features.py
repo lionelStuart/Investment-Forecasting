@@ -33,9 +33,15 @@ class PricePoint:
     value: float
 
 
-def calculate_features_for_db(db_path: str | Path, start_date: str | None = None, end_date: str | None = None) -> dict[int, int]:
+def calculate_features_for_db(
+    db_path: str | Path,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    continue_on_error: bool = False,
+) -> dict[int, int]:
     init_db(db_path)
     summary: dict[int, int] = {}
+    failures: dict[int, str] = {}
 
     with connect(db_path) as conn:
         log_id = start_task_log(
@@ -54,7 +60,14 @@ def calculate_features_for_db(db_path: str | Path, start_date: str | None = None
                     )
                     for row in list_price_history(conn, asset_id=int(asset["id"]))
                 ]
-                features = calculate_asset_features(prices)
+                try:
+                    features = calculate_asset_features(prices)
+                except Exception as exc:
+                    if not continue_on_error:
+                        raise
+                    failures[int(asset["id"])] = str(exc)
+                    summary[int(asset["id"])] = 0
+                    continue
                 written = 0
                 for feature in features:
                     if start_date and feature["feature_date"] < _date_text(start_date):
@@ -64,7 +77,10 @@ def calculate_features_for_db(db_path: str | Path, start_date: str | None = None
                     upsert_feature_daily(conn, feature)
                     written += 1
                 summary[int(asset["id"])] = written
-            complete_task_log(conn, log_id, status="success", message=f"Calculated {sum(summary.values())} feature rows")
+            message = f"Calculated {sum(summary.values())} feature rows"
+            if failures:
+                message = f"{message}; skipped {len(failures)} assets with invalid price history"
+            complete_task_log(conn, log_id, status="success", message=message)
         except Exception as exc:
             complete_task_log(conn, log_id, status="failed", error=str(exc))
             conn.commit()

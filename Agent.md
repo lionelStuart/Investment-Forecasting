@@ -8,3 +8,5 @@ Agents should start from `repo/AGENTS.md`, then follow the active task listed in
 The README defines the product goal. The `repo/` directory translates that goal
 into durable specs, executable tasks, acceptance criteria, and write-back rules.
 
+After completing any task, agents must restart the background WebUI service with
+`scripts/restart_web.sh` so the running local app reflects the latest changes.

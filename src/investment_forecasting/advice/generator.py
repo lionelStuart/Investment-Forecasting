@@ -7,6 +7,7 @@ from statistics import mean
 from typing import Any
 
 from investment_forecasting.db import (
+    active_user_preference,
     complete_task_log,
     connect,
     init_db,
@@ -55,12 +56,19 @@ def generate_daily_advice(db_path: str | Path, advice_date: str | None = None) -
             predictions = latest_model_predictions(conn)
             backtest_runs = latest_backtest_runs(conn)
             market_snapshot = latest_market_snapshot(conn)
+            user_preference = active_user_preference(conn)
             if not predictions:
                 raise AdviceGenerationError("Cannot generate advice without model_predictions evidence")
             if not backtest_runs:
                 raise AdviceGenerationError("Cannot generate advice without backtest_runs evidence")
 
-            record = build_daily_advice_record(target_date, predictions, backtest_runs, market_snapshot=market_snapshot)
+            record = build_daily_advice_record(
+                target_date,
+                predictions,
+                backtest_runs,
+                market_snapshot=market_snapshot,
+                user_preference=user_preference,
+            )
             check_compliance(
                 " ".join(
                     [
@@ -87,6 +95,7 @@ def build_daily_advice_record(
     predictions: list[Any],
     backtest_runs: list[Any],
     market_snapshot: Any | None = None,
+    user_preference: Any | None = None,
 ) -> dict[str, Any]:
     avg_expected = mean(float(row["expected_return"]) for row in predictions if row["expected_return"] is not None)
     avg_downside = mean(float(row["downside_risk"]) for row in predictions if row["downside_risk"] is not None)
@@ -96,10 +105,13 @@ def build_daily_advice_record(
 
     risk_level = _risk_level(avg_expected, avg_downside, backtest_score)
     policy = _allocation_policy(risk_level)
+    preferred_horizon = int(user_preference["investment_horizon_days"]) if user_preference else 20
+    if user_preference:
+        policy = _apply_user_constraints(policy, user_preference)
     source_prediction_ids = [int(row["id"]) for row in predictions]
     backtest_run_ids = [int(row["id"]) for row in backtest_runs]
     latest_prediction_date = max(row["prediction_date"] for row in predictions)
-    ranked_predictions = _rank_predictions(predictions)
+    ranked_predictions = _rank_predictions(predictions, preferred_horizon=preferred_horizon)
     focus_assets = ranked_predictions[:3]
     cautious_assets = sorted(
         ranked_predictions,
@@ -117,6 +129,12 @@ def build_daily_advice_record(
             f"宽度为 {_fmt_pct(market_snapshot['breadth'])}，"
             f"流动性热度为 {_fmt_num(market_snapshot['liquidity_heat'])}。"
         )
+    if user_preference:
+        market_summary += (
+            f" 当前活跃风险设置为 {user_preference['profile_name']}，"
+            f"偏好为 {_risk_profile_label(user_preference['risk_profile'])}，"
+            f"关注周期 {preferred_horizon} 天。"
+        )
     assumptions = (
         "本记录仅使用已入库的行情、特征、预测和回测结果；上午运行时通常反映上一交易日数据。"
         f" 平均模型置信度为 {avg_confidence:.2%}，历史回测综合分为 "
@@ -124,6 +142,11 @@ def build_daily_advice_record(
         "本记录仅使用已入库的行情、特征、预测和回测结果；上午运行时通常反映上一交易日数据。"
         f" 平均模型置信度为 {avg_confidence:.2%}，历史回测综合分暂不可用。"
     )
+    if user_preference:
+        assumptions += (
+            f" 仓位区间已应用用户约束：权益上限 {float(user_preference['max_equity_pct']):.0%}，"
+            f"现金下限 {float(user_preference['min_cash_pct']):.0%}。"
+        )
     risk_warnings = (
         "本系统输出是投资研究和辅助决策参考，不构成直接买卖指令。市场可能受政策、流动性、"
         "行业事件和数据延迟影响，预测区间和仓位范围需要结合个人风险承受能力复核。"
@@ -142,6 +165,7 @@ def build_daily_advice_record(
             "backtest_run_ids": backtest_run_ids,
             "market_snapshot_id": int(market_snapshot["id"]) if market_snapshot else None,
         },
+        "user_preference": _preference_payload(user_preference),
         "focus_assets": focus_assets,
         "cautious_assets": cautious_assets,
     }
@@ -200,6 +224,39 @@ def _allocation_policy(risk_level: str) -> dict[str, dict[str, str]]:
     }
 
 
+def _apply_user_constraints(policy: dict[str, dict[str, str]], user_preference: Any) -> dict[str, dict[str, str]]:
+    constrained = json.loads(json.dumps(policy))
+    max_equity = float(user_preference["max_equity_pct"])
+    min_cash = float(user_preference["min_cash_pct"])
+    for profile_policy in constrained.values():
+        profile_policy["equity"] = _cap_range(profile_policy["equity"], upper_cap=max_equity)
+        profile_policy["cash"] = _floor_range(profile_policy["cash"], lower_floor=min_cash)
+    return constrained
+
+
+def _cap_range(value: str, upper_cap: float) -> str:
+    low, high = _parse_pct_range(value)
+    high = min(high, upper_cap)
+    low = min(low, high)
+    return _pct_range(low, high)
+
+
+def _floor_range(value: str, lower_floor: float) -> str:
+    low, high = _parse_pct_range(value)
+    low = max(low, lower_floor)
+    high = max(high, low)
+    return _pct_range(low, high)
+
+
+def _parse_pct_range(value: str) -> tuple[float, float]:
+    low_text, high_text = value.replace("%", "").split("-")
+    return float(low_text) / 100.0, float(high_text) / 100.0
+
+
+def _pct_range(low: float, high: float) -> str:
+    return f"{low:.0%}-{high:.0%}"
+
+
 def _profile_text(profile: str, allocation: dict[str, str], posture: str, focus_assets: list[dict[str, Any]]) -> str:
     focus_text = _focus_text(focus_assets)
     return (
@@ -210,10 +267,10 @@ def _profile_text(profile: str, allocation: dict[str, str], posture: str, focus_
     )
 
 
-def _rank_predictions(predictions: list[Any]) -> list[dict[str, Any]]:
+def _rank_predictions(predictions: list[Any], preferred_horizon: int = 20) -> list[dict[str, Any]]:
     latest_by_asset: dict[int, Any] = {}
     for row in predictions:
-        if int(row["horizon_days"]) != 20:
+        if int(row["horizon_days"]) != preferred_horizon:
             continue
         latest_by_asset[int(row["asset_id"])] = row
     if not latest_by_asset:
@@ -241,6 +298,23 @@ def _rank_predictions(predictions: list[Any]) -> list[dict[str, Any]]:
             }
         )
     return sorted(ranked, key=lambda item: item["score"], reverse=True)
+
+
+def _preference_payload(user_preference: Any | None) -> dict[str, Any] | None:
+    if not user_preference:
+        return None
+    return {
+        "id": int(user_preference["id"]),
+        "profile_name": user_preference["profile_name"],
+        "risk_profile": user_preference["risk_profile"],
+        "investment_horizon_days": int(user_preference["investment_horizon_days"]),
+        "max_equity_pct": float(user_preference["max_equity_pct"]),
+        "min_cash_pct": float(user_preference["min_cash_pct"]),
+    }
+
+
+def _risk_profile_label(value: str) -> str:
+    return {"aggressive": "激进", "balanced": "中等", "conservative": "保守"}.get(value, value)
 
 
 def _focus_text(focus_assets: list[dict[str, Any]]) -> str:

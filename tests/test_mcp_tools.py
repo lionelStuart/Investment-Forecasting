@@ -4,7 +4,11 @@ import json
 
 from investment_forecasting.advice.generator import generate_daily_advice
 from investment_forecasting.db import connect, upsert_asset, upsert_fund_info, upsert_price_daily
+from investment_forecasting.experts.planning import run_expert_daily_plans
+from investment_forecasting.experts.roster import initialize_default_experts
+from investment_forecasting.experts.scoring import score_and_review_experts
 from investment_forecasting.mcp.tools import call_tool, list_tools
+from investment_forecasting.portfolio.accounting import ensure_expert_portfolios
 from investment_forecasting.quant.backtest import run_backtest, run_latest_forecasts
 from investment_forecasting.quant.features import calculate_features_for_db
 from investment_forecasting.quant.market import calculate_market_snapshot
@@ -78,6 +82,10 @@ def prepare_tool_db(tmp_path):
     run_latest_forecasts(db_path, horizons=(5, 20, 60))
     run_backtest(db_path, horizons=(2,), lookback_days=3)
     generate_daily_advice(db_path, advice_date="20260523")
+    initialize_default_experts(db_path)
+    ensure_expert_portfolios(db_path)
+    run_expert_daily_plans(db_path, plan_date="20260107")
+    score_and_review_experts(db_path, review_date="20260107", min_valuations=1)
     return db_path
 
 
@@ -93,6 +101,13 @@ def test_list_tools_includes_spec_tools():
         "run_backtest",
         "get_daily_advice",
         "generate_daily_advice",
+        "list_experts",
+        "get_expert_plans",
+        "run_expert_plans",
+        "get_expert_portfolios",
+        "score_experts",
+        "get_expert_scorecards",
+        "get_expert_lessons",
     }.issubset(names)
 
 
@@ -133,6 +148,40 @@ def test_snapshot_forecast_backtest_and_advice_tools(tmp_path):
     assert json.loads(advice["result"]["advice"]["evidence_json"])["source_prediction_ids"]
     assert generated["ok"] is True
     assert generated["result"]["advice"]["advice_date"] == "2026-05-24"
+
+
+def test_expert_mcp_tools_and_task_logs(tmp_path):
+    db_path = prepare_tool_db(tmp_path)
+
+    experts = call_tool(db_path, "list_experts", {"state": "active"})
+    plans = call_tool(db_path, "get_expert_plans", {})
+    portfolios = call_tool(db_path, "get_expert_portfolios", {})
+    score = call_tool(db_path, "score_experts", {"date": "20260107", "min_valuations": 1})
+    scorecards = call_tool(db_path, "get_expert_scorecards", {"date": "20260107"})
+    lessons = call_tool(db_path, "get_expert_lessons", {})
+    rerun_plans = call_tool(db_path, "run_expert_plans", {"date": "20260107"})
+
+    with connect(db_path) as conn:
+        log_names = {
+            row["task_name"]
+            for row in conn.execute("SELECT task_name FROM task_logs WHERE task_name LIKE 'expert_%'").fetchall()
+        }
+
+    assert experts["ok"] is True
+    assert experts["result"]["count"] == 3
+    assert plans["ok"] is True
+    assert plans["result"]["count"] == 3
+    assert portfolios["ok"] is True
+    assert portfolios["result"]["count"] == 3
+    assert score["ok"] is True
+    assert score["result"]["reviewed"]
+    assert scorecards["ok"] is True
+    assert scorecards["result"]["scorecards"]
+    assert lessons["ok"] is True
+    assert lessons["result"]["lessons"] == []
+    assert rerun_plans["ok"] is True
+    assert rerun_plans["result"]["virtual_research_only"] is True
+    assert {"expert_daily_planning", "expert_scoring_review"}.issubset(log_names)
 
 
 def test_tool_errors_are_structured(tmp_path):

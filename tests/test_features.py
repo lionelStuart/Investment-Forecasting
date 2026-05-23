@@ -156,3 +156,50 @@ def test_calculate_features_for_db_records_missing_data_failure(tmp_path):
     assert log["status"] == "failed"
     assert "Large date gap" in log["error"]
 
+
+def test_calculate_features_for_db_can_continue_after_asset_failure(tmp_path):
+    db_path = tmp_path / "features.sqlite3"
+    good_asset_id = seed_asset_with_prices(db_path, [100, 101, 102])
+    with connect(db_path) as conn:
+        bad_asset_id = upsert_asset(
+            conn,
+            {
+                "code": "GAP",
+                "name": "Gap Asset",
+                "asset_type": "index",
+                "market": "CN",
+                "currency": "CNY",
+                "status": "active",
+                "source": "test",
+            },
+        )
+        for trade_date, value in [("2026-01-01", 100), ("2026-01-20", 101)]:
+            upsert_price_daily(
+                conn,
+                asset_id=bad_asset_id,
+                source="test",
+                price={
+                    "trade_date": trade_date,
+                    "open": value,
+                    "high": value,
+                    "low": value,
+                    "close": value,
+                    "volume": None,
+                    "amount": None,
+                    "pct_change": None,
+                    "adjusted_close": value,
+                    "nav": None,
+                    "accumulated_nav": None,
+                    "raw_payload": None,
+                },
+            )
+
+    summary = calculate_features_for_db(db_path, continue_on_error=True)
+
+    with connect(db_path) as conn:
+        log = conn.execute("SELECT status, message FROM task_logs ORDER BY id DESC LIMIT 1").fetchone()
+
+    assert summary[good_asset_id] == 2
+    assert summary[bad_asset_id] == 0
+    assert log["status"] == "success"
+    assert "skipped 1 assets" in log["message"]

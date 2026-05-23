@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from investment_forecasting.db import (
@@ -84,7 +84,7 @@ def ingest_mvp_universe(
     provider = provider or AkshareProvider()
     assets = list(universe or MVP_UNIVERSE)
     summary: dict[str, int] = {}
-    run_date = datetime.now(UTC).date().isoformat()
+    run_date = datetime.now(timezone.utc).date().isoformat()
 
     with connect(db_path) as conn:
         log_id = start_task_log(
@@ -132,6 +132,19 @@ def ingest_mvp_universe(
                     summary[asset_key] = 0
                     continue
                 warnings = validate_price_records(prices, asset_key=asset_key)
+                rows = 0
+                for price in prices:
+                    upsert_price_daily(conn, asset_id=asset_id, source=universe_asset.source, price=price)
+                    rows += 1
+                if universe_asset.asset_type == "fund" and hasattr(provider, "fund_info"):
+                    try:
+                        info = provider.fund_info(universe_asset)
+                    except Exception as exc:
+                        if not continue_on_error:
+                            raise
+                        warnings.append(f"{asset_key}: fund info fetch failed: {exc}")
+                    else:
+                        upsert_fund_info(conn, asset_id=asset_id, source=universe_asset.source, info=info)
                 upsert_data_quality_report(
                     conn,
                     build_quality_report(
@@ -147,13 +160,6 @@ def ingest_mvp_universe(
                         },
                     ),
                 )
-                rows = 0
-                for price in prices:
-                    upsert_price_daily(conn, asset_id=asset_id, source=universe_asset.source, price=price)
-                    rows += 1
-                if universe_asset.asset_type == "fund" and hasattr(provider, "fund_info"):
-                    info = provider.fund_info(universe_asset)
-                    upsert_fund_info(conn, asset_id=asset_id, source=universe_asset.source, info=info)
                 summary[asset_key] = rows
             complete_task_log(conn, log_id, status="success", message=f"Ingested {sum(summary.values())} rows")
         except Exception as exc:
@@ -168,21 +174,47 @@ def discover_akshare_universe(
     provider: AkshareProvider | None = None,
     asset_types: tuple[str, ...] = ("stock", "etf", "fund"),
     max_assets: int | None = None,
+    max_assets_per_type: int | None = None,
+    offset_per_type: int = 0,
     include_core_indices: bool = True,
 ) -> list[UniverseAsset]:
     provider = provider or AkshareProvider()
-    discovered = [
-        UniverseAsset(
-            code=str(item["code"]),
-            name=str(item["name"]),
-            asset_type=str(item["asset_type"]),
-            market=str(item.get("market") or "CN"),
-            provider_symbol=item.get("provider_symbol"),
+    discovered = []
+    per_type_counts: dict[str, int] = {}
+    per_type_offsets: dict[str, int] = {}
+    for item in provider.asset_universe(asset_types=asset_types):
+        asset_type = str(item["asset_type"])
+        if offset_per_type and per_type_offsets.get(asset_type, 0) < offset_per_type:
+            per_type_offsets[asset_type] = per_type_offsets.get(asset_type, 0) + 1
+            continue
+        if max_assets_per_type is not None and per_type_counts.get(asset_type, 0) >= max_assets_per_type:
+            continue
+        discovered.append(
+            UniverseAsset(
+                code=str(item["code"]),
+                name=str(item["name"]),
+                asset_type=asset_type,
+                market=str(item.get("market") or "CN"),
+                provider_symbol=item.get("provider_symbol"),
+            )
         )
-        for item in provider.asset_universe(asset_types=asset_types)
-    ]
+        per_type_counts[asset_type] = per_type_counts.get(asset_type, 0) + 1
     if max_assets is not None:
         discovered = discovered[:max_assets]
     if include_core_indices:
         return [*CORE_INDEX_UNIVERSE, *discovered]
     return discovered
+
+
+def filter_existing_universe_assets(db_path: str | Path, universe: list[UniverseAsset]) -> list[UniverseAsset]:
+    init_db(db_path)
+    with connect(db_path) as conn:
+        existing = {
+            (row["code"], row["asset_type"], row["market"], row["source"])
+            for row in conn.execute("SELECT code, asset_type, market, source FROM assets")
+        }
+    return [
+        asset
+        for asset in universe
+        if (asset.code, asset.asset_type, asset.market, asset.source) not in existing
+    ]

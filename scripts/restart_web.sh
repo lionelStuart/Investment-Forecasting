@@ -26,6 +26,48 @@ health_check() {
   return 1
 }
 
+print_db_summary() {
+  DB_PATH="$DB_PATH" "$PYTHON_BIN" - <<'PY' || true
+import os
+import sqlite3
+from pathlib import Path
+
+db_path = Path(os.environ["DB_PATH"])
+tables = [
+    "assets",
+    "price_daily",
+    "features_daily",
+    "model_predictions",
+    "daily_advice",
+    "market_snapshots",
+    "macro_observations",
+]
+
+if not db_path.exists():
+    print(f"db_status=missing path={db_path}")
+    raise SystemExit(0)
+
+with sqlite3.connect(db_path) as conn:
+    counts = {}
+    for table in tables:
+        try:
+            counts[table] = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        except sqlite3.Error:
+            counts[table] = "n/a"
+    latest_advice = None
+    try:
+        latest_advice = conn.execute("SELECT MAX(advice_date) FROM daily_advice").fetchone()[0]
+    except sqlite3.Error:
+        pass
+
+print("db_status=" + " ".join(f"{key}={value}" for key, value in counts.items()))
+if latest_advice:
+    print(f"latest_advice={latest_advice}")
+if counts.get("assets") == 0 or counts.get("price_daily") == 0:
+    print("warning=database_has_no_assets_or_prices")
+PY
+}
+
 stop_port_listener() {
   local pids
   pids="$(lsof -tiTCP:"$PORT" -sTCP:LISTEN 2>/dev/null || true)"
@@ -93,6 +135,7 @@ restart_with_launchctl() {
   echo "url=http://$HOST:$PORT"
   echo "db=$DB_PATH"
   echo "log=$LOG_FILE"
+  print_db_summary
 }
 
 restart_with_nohup() {
@@ -124,6 +167,7 @@ restart_with_nohup() {
   echo "url=http://$HOST:$PORT"
   echo "db=$DB_PATH"
   echo "log=$LOG_FILE"
+  print_db_summary
 }
 
 if command -v launchctl >/dev/null 2>&1 && [[ "$(uname -s)" == "Darwin" ]]; then

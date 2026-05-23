@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 
-from investment_forecasting.db import connect, get_asset, init_db, upsert_asset
+from investment_forecasting.db import active_user_preference, connect, get_asset, init_db, upsert_asset, upsert_user_preference
 
 
 REQUIRED_TABLES = {
@@ -15,6 +15,18 @@ REQUIRED_TABLES = {
     "backtest_results",
     "daily_advice",
     "task_logs",
+    "user_preferences",
+    "experts",
+    "virtual_portfolios",
+    "virtual_positions",
+    "virtual_transactions",
+    "virtual_cash_ledger",
+    "virtual_valuations",
+    "expert_plans",
+    "expert_plan_items",
+    "expert_scorecards",
+    "expert_reviews",
+    "expert_lessons",
 }
 
 
@@ -89,3 +101,40 @@ def test_asset_upsert_is_idempotent(tmp_path):
     assert row is not None
     assert row["name"] == "沪深300指数"
     assert count == 1
+
+
+def test_user_preference_upsert_tracks_single_active_profile(tmp_path):
+    db_path = init_db(tmp_path / "test.sqlite3")
+
+    with connect(db_path) as conn:
+        first_id = upsert_user_preference(
+            conn,
+            {
+                "profile_name": "稳健账户",
+                "risk_profile": "conservative",
+                "investment_horizon_days": 60,
+                "max_equity_pct": 0.3,
+                "min_cash_pct": 0.25,
+                "notes": "低波动优先",
+                "is_active": 1,
+            },
+        )
+        second_id = upsert_user_preference(
+            conn,
+            {
+                "profile_name": "成长账户",
+                "risk_profile": "aggressive",
+                "investment_horizon_days": 20,
+                "max_equity_pct": 0.75,
+                "min_cash_pct": 0.05,
+                "notes": "可接受较大波动",
+                "is_active": 1,
+            },
+        )
+        active = active_user_preference(conn)
+        active_count = conn.execute("SELECT COUNT(*) AS count FROM user_preferences WHERE is_active = 1").fetchone()["count"]
+
+    assert first_id != second_id
+    assert active["profile_name"] == "成长账户"
+    assert active["risk_profile"] == "aggressive"
+    assert active_count == 1

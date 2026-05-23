@@ -221,6 +221,19 @@ CREATE TABLE IF NOT EXISTS data_quality_reports (
   UNIQUE (report_date, scope)
 );
 
+CREATE TABLE IF NOT EXISTS user_preferences (
+  id INTEGER PRIMARY KEY,
+  profile_name TEXT NOT NULL UNIQUE,
+  risk_profile TEXT NOT NULL CHECK (risk_profile IN ('aggressive', 'balanced', 'conservative')),
+  investment_horizon_days INTEGER NOT NULL CHECK (investment_horizon_days > 0),
+  max_equity_pct REAL NOT NULL CHECK (max_equity_pct >= 0 AND max_equity_pct <= 1),
+  min_cash_pct REAL NOT NULL CHECK (min_cash_pct >= 0 AND min_cash_pct <= 1),
+  notes TEXT,
+  is_active INTEGER NOT NULL DEFAULT 0 CHECK (is_active IN (0, 1)),
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 CREATE TABLE IF NOT EXISTS advice_outcome_scores (
   id INTEGER PRIMARY KEY,
   advice_id INTEGER NOT NULL REFERENCES daily_advice(id) ON DELETE CASCADE,
@@ -240,13 +253,188 @@ CREATE TABLE IF NOT EXISTS advice_outcome_scores (
   UNIQUE (advice_id, horizon_days)
 );
 
+CREATE TABLE IF NOT EXISTS experts (
+  id INTEGER PRIMARY KEY,
+  expert_key TEXT NOT NULL UNIQUE,
+  name TEXT NOT NULL,
+  short_description TEXT NOT NULL,
+  style_label TEXT NOT NULL,
+  focus_weights_json TEXT NOT NULL,
+  risk_budget_pct REAL NOT NULL CHECK (risk_budget_pct >= 0 AND risk_budget_pct <= 1),
+  max_drawdown_tolerance REAL NOT NULL CHECK (max_drawdown_tolerance >= 0 AND max_drawdown_tolerance <= 1),
+  allowed_asset_categories_json TEXT NOT NULL,
+  default_cash_buffer_pct REAL NOT NULL CHECK (default_cash_buffer_pct >= 0 AND default_cash_buffer_pct <= 1),
+  review_cadence_days INTEGER NOT NULL CHECK (review_cadence_days > 0),
+  lifecycle_state TEXT NOT NULL CHECK (lifecycle_state IN ('candidate', 'active', 'probation', 'retired')),
+  mandate TEXT NOT NULL,
+  source TEXT NOT NULL DEFAULT 'system',
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS virtual_portfolios (
+  id INTEGER PRIMARY KEY,
+  owner_type TEXT NOT NULL CHECK (owner_type IN ('user', 'expert', 'system')),
+  owner_id INTEGER,
+  name TEXT NOT NULL,
+  initial_capital REAL NOT NULL CHECK (initial_capital >= 0),
+  cash REAL NOT NULL CHECK (cash >= 0),
+  currency TEXT NOT NULL DEFAULT 'CNY',
+  status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'closed')),
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+  UNIQUE (owner_type, owner_id)
+);
+
+CREATE TABLE IF NOT EXISTS virtual_positions (
+  id INTEGER PRIMARY KEY,
+  portfolio_id INTEGER NOT NULL REFERENCES virtual_portfolios(id) ON DELETE CASCADE,
+  asset_id INTEGER NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
+  quantity REAL NOT NULL CHECK (quantity >= 0),
+  average_cost REAL NOT NULL DEFAULT 0,
+  updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+  UNIQUE (portfolio_id, asset_id)
+);
+
+CREATE TABLE IF NOT EXISTS virtual_transactions (
+  id INTEGER PRIMARY KEY,
+  portfolio_id INTEGER NOT NULL REFERENCES virtual_portfolios(id) ON DELETE CASCADE,
+  asset_id INTEGER REFERENCES assets(id) ON DELETE SET NULL,
+  trade_date TEXT NOT NULL,
+  side TEXT NOT NULL CHECK (side IN ('buy', 'sell', 'hold', 'no_trade', 'unfilled')),
+  quantity REAL NOT NULL DEFAULT 0 CHECK (quantity >= 0),
+  price REAL,
+  price_date TEXT,
+  gross_amount REAL NOT NULL DEFAULT 0,
+  fee REAL NOT NULL DEFAULT 0,
+  cash_delta REAL NOT NULL DEFAULT 0,
+  status TEXT NOT NULL CHECK (status IN ('filled', 'unfilled', 'no_trade')),
+  reason TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS virtual_cash_ledger (
+  id INTEGER PRIMARY KEY,
+  portfolio_id INTEGER NOT NULL REFERENCES virtual_portfolios(id) ON DELETE CASCADE,
+  transaction_id INTEGER REFERENCES virtual_transactions(id) ON DELETE SET NULL,
+  ledger_date TEXT NOT NULL,
+  amount REAL NOT NULL,
+  balance_after REAL NOT NULL,
+  reason TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS virtual_valuations (
+  id INTEGER PRIMARY KEY,
+  portfolio_id INTEGER NOT NULL REFERENCES virtual_portfolios(id) ON DELETE CASCADE,
+  valuation_date TEXT NOT NULL,
+  cash REAL NOT NULL,
+  positions_value REAL NOT NULL,
+  total_value REAL NOT NULL,
+  missing_prices_json TEXT NOT NULL,
+  details_json TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+  UNIQUE (portfolio_id, valuation_date)
+);
+
+CREATE TABLE IF NOT EXISTS expert_plans (
+  id INTEGER PRIMARY KEY,
+  expert_id INTEGER NOT NULL REFERENCES experts(id) ON DELETE CASCADE,
+  portfolio_id INTEGER NOT NULL REFERENCES virtual_portfolios(id) ON DELETE CASCADE,
+  plan_date TEXT NOT NULL,
+  action TEXT NOT NULL CHECK (action IN ('buy', 'sell', 'rebalance', 'hold', 'no_trade')),
+  target_asset_id INTEGER REFERENCES assets(id) ON DELETE SET NULL,
+  target_weight REAL CHECK (target_weight IS NULL OR (target_weight >= 0 AND target_weight <= 1)),
+  target_amount REAL CHECK (target_amount IS NULL OR target_amount >= 0),
+  rationale TEXT NOT NULL,
+  evidence_json TEXT NOT NULL,
+  risk_checks_json TEXT NOT NULL,
+  risk_warnings TEXT NOT NULL,
+  execution_status TEXT NOT NULL CHECK (execution_status IN ('pending', 'filled', 'unfilled', 'no_trade')),
+  transaction_id INTEGER REFERENCES virtual_transactions(id) ON DELETE SET NULL,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+  UNIQUE (expert_id, plan_date)
+);
+
+CREATE TABLE IF NOT EXISTS expert_plan_items (
+  id INTEGER PRIMARY KEY,
+  plan_id INTEGER NOT NULL REFERENCES expert_plans(id) ON DELETE CASCADE,
+  asset_id INTEGER REFERENCES assets(id) ON DELETE SET NULL,
+  action TEXT NOT NULL CHECK (action IN ('buy', 'sell', 'rebalance', 'hold', 'no_trade')),
+  target_weight REAL CHECK (target_weight IS NULL OR (target_weight >= 0 AND target_weight <= 1)),
+  target_amount REAL CHECK (target_amount IS NULL OR target_amount >= 0),
+  rationale TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS expert_scorecards (
+  id INTEGER PRIMARY KEY,
+  expert_id INTEGER NOT NULL REFERENCES experts(id) ON DELETE CASCADE,
+  portfolio_id INTEGER NOT NULL REFERENCES virtual_portfolios(id) ON DELETE CASCADE,
+  score_date TEXT NOT NULL,
+  window_days INTEGER NOT NULL CHECK (window_days > 0),
+  valuation_count INTEGER NOT NULL DEFAULT 0,
+  mature_enough INTEGER NOT NULL CHECK (mature_enough IN (0, 1)),
+  portfolio_return REAL,
+  benchmark_return REAL,
+  benchmark_excess REAL,
+  max_drawdown REAL,
+  volatility REAL,
+  cash_drag REAL,
+  turnover REAL,
+  win_rate REAL,
+  evidence_completeness REAL,
+  mandate_adherence REAL,
+  overall_score REAL,
+  details_json TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+  UNIQUE (expert_id, score_date, window_days)
+);
+
+CREATE TABLE IF NOT EXISTS expert_reviews (
+  id INTEGER PRIMARY KEY,
+  expert_id INTEGER NOT NULL REFERENCES experts(id) ON DELETE CASCADE,
+  scorecard_id INTEGER REFERENCES expert_scorecards(id) ON DELETE SET NULL,
+  review_date TEXT NOT NULL,
+  decision TEXT NOT NULL CHECK (decision IN ('keep', 'warn', 'probation', 'retire', 'hire_replacement')),
+  previous_lifecycle_state TEXT,
+  new_lifecycle_state TEXT,
+  rationale TEXT NOT NULL,
+  evidence_json TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS expert_lessons (
+  id INTEGER PRIMARY KEY,
+  expert_id INTEGER REFERENCES experts(id) ON DELETE SET NULL,
+  review_id INTEGER REFERENCES expert_reviews(id) ON DELETE SET NULL,
+  lesson_date TEXT NOT NULL,
+  lesson_type TEXT NOT NULL CHECK (lesson_type IN ('failure', 'success', 'hiring')),
+  summary TEXT NOT NULL,
+  overweighted_signals TEXT NOT NULL,
+  ignored_signals TEXT NOT NULL,
+  failed_controls TEXT NOT NULL,
+  avoid_hiring_patterns TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 CREATE INDEX IF NOT EXISTS idx_price_daily_asset_date ON price_daily(asset_id, trade_date);
 CREATE INDEX IF NOT EXISTS idx_features_daily_asset_date ON features_daily(asset_id, feature_date);
 CREATE INDEX IF NOT EXISTS idx_model_predictions_date ON model_predictions(prediction_date, horizon_days);
 CREATE INDEX IF NOT EXISTS idx_daily_advice_date ON daily_advice(advice_date);
 CREATE INDEX IF NOT EXISTS idx_task_logs_name_date ON task_logs(task_name, run_date);
+CREATE INDEX IF NOT EXISTS idx_experts_lifecycle ON experts(lifecycle_state, expert_key);
+CREATE INDEX IF NOT EXISTS idx_virtual_transactions_portfolio_date ON virtual_transactions(portfolio_id, trade_date);
+CREATE INDEX IF NOT EXISTS idx_virtual_valuations_portfolio_date ON virtual_valuations(portfolio_id, valuation_date);
+CREATE INDEX IF NOT EXISTS idx_expert_plans_date ON expert_plans(plan_date, expert_id);
+CREATE INDEX IF NOT EXISTS idx_expert_scorecards_date ON expert_scorecards(score_date, expert_id);
+CREATE INDEX IF NOT EXISTS idx_expert_reviews_date ON expert_reviews(review_date, expert_id);
 CREATE INDEX IF NOT EXISTS idx_model_calibration_reports_date ON model_calibration_reports(report_date);
 CREATE INDEX IF NOT EXISTS idx_market_snapshots_date ON market_snapshots(snapshot_date);
 CREATE INDEX IF NOT EXISTS idx_macro_observations_series_date ON macro_observations(series_id, observation_date);
 CREATE INDEX IF NOT EXISTS idx_data_quality_reports_date ON data_quality_reports(report_date);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_user_preferences_active ON user_preferences(is_active) WHERE is_active = 1;
 CREATE INDEX IF NOT EXISTS idx_advice_outcome_scores_advice ON advice_outcome_scores(advice_id);

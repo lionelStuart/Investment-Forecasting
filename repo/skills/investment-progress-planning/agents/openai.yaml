@@ -1,0 +1,4 @@
+interface:
+  display_name: "Investment Progress Planning"
+  short_description: "Audit project progress and update product plans."
+  default_prompt: "Use $investment-progress-planning to inspect current code and WebUI progress, then update the Investment Forecasting roadmap, goals, design direction, specs, and task breakdown."

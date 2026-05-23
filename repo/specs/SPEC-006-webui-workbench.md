@@ -29,6 +29,7 @@ predictions, backtests, daily advice, scores, risks, and task logs.
   - Predictions
   - Backtests
   - Daily Advice
+  - Risk Settings
   - Task Logs
 
 ## Constraints
@@ -37,6 +38,7 @@ predictions, backtests, daily advice, scores, risks, and task logs.
 - Visual claims must show supporting fields: date, source, model version,
   confidence, risk, and historical score.
 - Advice display must preserve the aggressive/balanced/conservative distinction.
+- User risk settings must be persisted before they influence advice generation.
 - Tables and charts should make stale or failed data visible.
 
 ## Error Cases
@@ -55,9 +57,9 @@ predictions, backtests, daily advice, scores, risks, and task logs.
 - User can inspect backtest performance, max drawdown, benchmark comparison, and
   scores.
 - User can inspect daily task logs and failure reasons.
+- User can set the active risk preference and investment horizon in the WebUI.
 
 ## Related Context
 
 - `ARCHITECTURE.md`
 - `tasks/TASK-008-webui-workbench.md`
-

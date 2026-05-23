@@ -1,0 +1,4 @@
+interface:
+  display_name: "Investment Evaluation Audit"
+  short_description: "Audit prediction quality, data health, and UI defects."
+  default_prompt: "Use $investment-evaluation-audit to inspect the WebUI and SQLite data, evaluate prediction accuracy, backtests, advice scores, regressions, and page design defects."
