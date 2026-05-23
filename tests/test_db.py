@@ -36,6 +36,37 @@ def test_init_db_creates_required_tables(tmp_path):
         assert migration is not None
 
 
+def test_init_db_adds_missing_fund_info_columns_to_legacy_database(tmp_path):
+    db_path = tmp_path / "legacy.sqlite3"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """
+            CREATE TABLE fund_info (
+              id INTEGER PRIMARY KEY,
+              asset_id INTEGER NOT NULL,
+              fund_type TEXT,
+              manager TEXT,
+              management_fee REAL,
+              custody_fee REAL,
+              scale REAL,
+              inception_date TEXT,
+              source TEXT NOT NULL,
+              raw_payload TEXT,
+              created_at TEXT NOT NULL DEFAULT (datetime('now')),
+              updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+              UNIQUE (asset_id, source)
+            )
+            """
+        )
+
+    init_db(db_path)
+
+    with connect(db_path) as conn:
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(fund_info)").fetchall()}
+
+    assert {"fund_company", "custodian", "purchase_fee", "benchmark", "strategy", "objective", "stage_returns_json"}.issubset(columns)
+
+
 def test_asset_upsert_is_idempotent(tmp_path):
     db_path = init_db(tmp_path / "test.sqlite3")
     asset = {
@@ -58,4 +89,3 @@ def test_asset_upsert_is_idempotent(tmp_path):
     assert row is not None
     assert row["name"] == "沪深300指数"
     assert count == 1
-

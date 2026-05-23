@@ -21,12 +21,32 @@ def init_db(db_path: str | Path) -> Path:
     schema = resources.files("investment_forecasting").joinpath("migrations/001_init.sql").read_text()
     with connect(path) as conn:
         conn.executescript(schema)
+        _ensure_legacy_columns(conn)
         conn.execute(
             "INSERT OR IGNORE INTO schema_migrations(version, applied_at) "
             "VALUES (?, datetime('now'))",
             ("001_init",),
         )
     return path
+
+
+def _ensure_legacy_columns(conn: sqlite3.Connection) -> None:
+    fund_info_columns = {
+        row["name"]
+        for row in conn.execute("PRAGMA table_info(fund_info)").fetchall()
+    }
+    expected_fund_info_columns = {
+        "fund_company": "TEXT",
+        "custodian": "TEXT",
+        "purchase_fee": "REAL",
+        "benchmark": "TEXT",
+        "strategy": "TEXT",
+        "objective": "TEXT",
+        "stage_returns_json": "TEXT",
+    }
+    for column, column_type in expected_fund_info_columns.items():
+        if column not in fund_info_columns:
+            conn.execute(f"ALTER TABLE fund_info ADD COLUMN {column} {column_type}")
 
 
 def upsert_asset(conn: sqlite3.Connection, asset: dict[str, Any]) -> int:
