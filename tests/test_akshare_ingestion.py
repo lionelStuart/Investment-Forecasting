@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 import pytest
 
 from investment_forecasting.data.ingestion import (
@@ -127,6 +129,27 @@ class FakeAkModuleWithUniverse:
 
     def fund_open_fund_rank_em(self, symbol: str):
         return [{"基金代码": "000001", "基金简称": "华夏成长混合"}]
+
+
+class FakeAkModuleWithStockUniverseFallback(FakeAkModuleWithUniverse):
+    def stock_zh_a_spot_em(self):
+        raise RuntimeError("eastmoney spot unavailable")
+
+    def stock_info_a_code_name(self):
+        return [{"code": "000001", "name": "平安银行"}]
+
+
+class ProxySensitiveAkModule:
+    def __init__(self):
+        self.calls = 0
+
+    def fund_open_fund_info_em(self, symbol: str, indicator: str):
+        import os
+
+        self.calls += 1
+        if os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy"):
+            raise RuntimeError("proxy disconnected")
+        return [{"净值日期": "2026-05-20", "单位净值": "1.0"}]
 
 
 def test_normalize_index_rows_from_akshare_columns():
@@ -313,6 +336,16 @@ def test_provider_discovers_stock_etf_and_fund_universe():
     ]
 
 
+def test_provider_falls_back_to_code_name_for_stock_universe():
+    provider = AkshareProvider(ak_module=FakeAkModuleWithStockUniverseFallback(), retry_config=RetryConfig(attempts=1))
+
+    rows = provider.asset_universe(asset_types=("stock",))
+
+    assert rows == [
+        {"code": "000001", "name": "平安银行", "asset_type": "stock", "market": "CN", "provider_symbol": "sz000001"}
+    ]
+
+
 def test_provider_retries_transient_failures():
     ak_module = FlakyAkModule()
     provider = AkshareProvider(ak_module=ak_module, retry_config=RetryConfig(attempts=2))
@@ -322,6 +355,20 @@ def test_provider_retries_transient_failures():
 
     assert ak_module.calls == 2
     assert rows[0]["trade_date"] == "2026-05-20"
+
+
+def test_provider_falls_back_to_direct_when_proxy_env_fails(monkeypatch):
+    monkeypatch.setenv("HTTPS_PROXY", "http://broken.proxy:7890")
+    monkeypatch.setenv("https_proxy", "http://broken.proxy:7890")
+    ak_module = ProxySensitiveAkModule()
+    provider = AkshareProvider(ak_module=ak_module, retry_config=RetryConfig(attempts=1))
+    asset = next(asset for asset in MVP_UNIVERSE if asset.asset_type == "fund")
+
+    rows = provider.history(asset, start_date="20260520", end_date="20260520")
+
+    assert ak_module.calls == 2
+    assert rows[0]["trade_date"] == "2026-05-20"
+    assert os.environ["HTTPS_PROXY"] == "http://broken.proxy:7890"
 
 
 def test_mvp_universe_has_representative_assets():

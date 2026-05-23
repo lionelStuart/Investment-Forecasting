@@ -35,6 +35,8 @@ python3 -m pytest
 DB_PATH=data/investment_forecasting.sqlite3 HOST=127.0.0.1 PORT=8765 scripts/restart_web.sh
 ```
 
+AKShare 数据抓取会自动依次尝试当前网络环境、强制直连和本地代理 `127.0.0.1:7890`。如果 `ingest full` 的东方财富股票列表接口不可用，系统会回退到 AKShare 的 A 股代码/名称列表接口继续发现股票池。
+
 ## 项目目标
 
 当前阶段的目标不是做一个演示页面，而是把系统推进到可给真实用户试用的投资研究工作台：

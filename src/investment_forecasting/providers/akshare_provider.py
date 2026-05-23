@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import json
+import os
+from collections.abc import Iterator
 from collections.abc import Iterable, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
 
@@ -13,6 +16,8 @@ class ProviderDataError(RuntimeError):
 @dataclass(frozen=True)
 class RetryConfig:
     attempts: int = 2
+    fallback_to_direct: bool = True
+    fallback_to_local_proxy: bool = True
 
 
 class AkshareProvider:
@@ -79,7 +84,10 @@ class AkshareProvider:
         return assets
 
     def _stock_universe(self) -> list[dict[str, Any]]:
-        raw = self._with_retry("stock:universe", lambda: self.ak.stock_zh_a_spot_em())
+        try:
+            raw = self._with_retry("stock:universe:spot_em", lambda: self.ak.stock_zh_a_spot_em())
+        except ProviderDataError:
+            raw = self._with_retry("stock:universe:code_name", lambda: self.ak.stock_info_a_code_name())
         assets = []
         for row in _records(raw):
             raw_code = _value(row, "代码", "code")
@@ -190,12 +198,19 @@ class AkshareProvider:
 
     def _with_retry(self, label: str, fetch: Any) -> Any:
         last_error: Exception | None = None
-        for _ in range(max(1, self.retry_config.attempts)):
-            try:
-                return fetch()
-            except Exception as exc:
-                last_error = exc
-        raise ProviderDataError(f"{label} failed after {self.retry_config.attempts} attempt(s): {last_error}")
+        errors = []
+        for profile_name, proxy_env in _network_profiles(self.retry_config):
+            with _temporary_proxy_env(proxy_env):
+                for _ in range(max(1, self.retry_config.attempts)):
+                    try:
+                        return fetch()
+                    except Exception as exc:
+                        last_error = exc
+                errors.append(f"{profile_name}: {last_error}")
+        raise ProviderDataError(
+            f"{label} failed after {self.retry_config.attempts} attempt(s) across "
+            f"{len(errors)} network profile(s): {' | '.join(errors)}"
+        )
 
 
 def normalize_price_rows(raw_rows: Any, asset_type: str) -> list[dict[str, Any]]:
@@ -305,6 +320,60 @@ def _find_rank_row(raw_rank: Any, code: str) -> Mapping[str, Any]:
 def _provider_symbol(code: str) -> str:
     prefix = "sh" if code.startswith(("5", "6", "9")) else "sz"
     return f"{prefix}{code}"
+
+
+PROXY_ENV_KEYS = (
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+    "no_proxy",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "NO_PROXY",
+)
+
+
+LOCAL_PROXY_ENV = {
+    "https_proxy": "http://127.0.0.1:7890",
+    "http_proxy": "http://127.0.0.1:7890",
+    "all_proxy": "socks5://127.0.0.1:7890",
+    "HTTPS_PROXY": "http://127.0.0.1:7890",
+    "HTTP_PROXY": "http://127.0.0.1:7890",
+    "ALL_PROXY": "socks5://127.0.0.1:7890",
+}
+
+
+def _network_profiles(retry_config: RetryConfig) -> list[tuple[str, dict[str, str | None]]]:
+    profiles: list[tuple[str, dict[str, str | None]]] = [("environment", {})]
+    if retry_config.fallback_to_direct:
+        profiles.append(("direct", {**{key: None for key in PROXY_ENV_KEYS}, "NO_PROXY": "*", "no_proxy": "*"}))
+    if retry_config.fallback_to_local_proxy and not _is_local_proxy_env():
+        profiles.append(("local_proxy_127.0.0.1:7890", LOCAL_PROXY_ENV))
+    return profiles
+
+
+def _is_local_proxy_env() -> bool:
+    proxy_values = {os.environ.get(key, "") for key in PROXY_ENV_KEYS}
+    return any("127.0.0.1:7890" in value or "localhost:7890" in value for value in proxy_values)
+
+
+@contextmanager
+def _temporary_proxy_env(proxy_env: dict[str, str | None]) -> Iterator[None]:
+    original = {key: os.environ.get(key) for key in PROXY_ENV_KEYS}
+    try:
+        for key, value in proxy_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        yield
+    finally:
+        for key, value in original.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
 
 
 def _records(raw_rows: Any) -> list[Mapping[str, Any]]:
