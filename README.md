@@ -24,8 +24,15 @@ investment-forecasting mcp call get_market_snapshot --db data/investment_forecas
 investment-forecasting-mcp --db data/investment_forecasting.sqlite3
 investment-forecasting daily run --db data/investment_forecasting.sqlite3 --date 20260523 --horizons 5,20,60 --lookback-days 60
 investment-forecasting web run --db data/investment_forecasting.sqlite3 --host 127.0.0.1 --port 8765
+scripts/restart_web.sh
 investment-forecasting calibration run --db data/investment_forecasting.sqlite3 --date 20260523 --horizons 5,20,60 --lookback-days 60
 python3 -m pytest
+```
+
+`scripts/restart_web.sh` 是推荐的后台服务重启命令。macOS 下会使用 `launchctl` 注册常驻后台服务；其他环境回退到 `nohup`。可通过环境变量覆盖参数：
+
+```bash
+DB_PATH=data/investment_forecasting.sqlite3 HOST=127.0.0.1 PORT=8765 scripts/restart_web.sh
 ```
 
 ## 项目目标
