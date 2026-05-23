@@ -78,6 +78,7 @@ def ingest_mvp_universe(
     end_date: str,
     provider: AkshareProvider | None = None,
     universe: list[UniverseAsset] | tuple[UniverseAsset, ...] | None = None,
+    continue_on_error: bool = False,
 ) -> dict[str, int]:
     init_db(db_path)
     provider = provider or AkshareProvider()
@@ -106,8 +107,30 @@ def ingest_mvp_universe(
                         "source": universe_asset.source,
                     },
                 )
-                prices = provider.history(universe_asset, start_date=start_date, end_date=end_date)
                 asset_key = f"{universe_asset.asset_type}:{universe_asset.code}"
+                try:
+                    prices = provider.history(universe_asset, start_date=start_date, end_date=end_date)
+                except Exception as exc:
+                    if not continue_on_error:
+                        raise
+                    upsert_data_quality_report(
+                        conn,
+                        build_quality_report(
+                            report_date=run_date,
+                            scope=f"ingest:{asset_key}",
+                            warnings=[f"{asset_key}: provider fetch failed: {exc}"],
+                            metadata={
+                                "asset": universe_asset.__dict__,
+                                "row_count": 0,
+                                "start_date": start_date,
+                                "end_date": end_date,
+                                "provider": provider.__class__.__name__,
+                                "error": str(exc),
+                            },
+                        ),
+                    )
+                    summary[asset_key] = 0
+                    continue
                 warnings = validate_price_records(prices, asset_key=asset_key)
                 upsert_data_quality_report(
                     conn,

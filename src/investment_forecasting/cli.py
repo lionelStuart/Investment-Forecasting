@@ -240,7 +240,13 @@ def main(argv: list[str] | None = None) -> int:
                 asset_types=asset_types,
                 max_assets=args.max_assets,
             )
-            summary = ingest_mvp_universe(args.db, start_date=args.start_date, end_date=args.end_date, universe=universe)
+            summary = ingest_mvp_universe(
+                args.db,
+                start_date=args.start_date,
+                end_date=args.end_date,
+                universe=universe,
+                continue_on_error=True,
+            )
         except argparse.ArgumentTypeError as exc:
             print(f"Invalid full universe options: {exc}", file=sys.stderr)
             return 2
@@ -248,7 +254,8 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Full universe ingestion failed: {exc}", file=sys.stderr)
             return 1
         total = sum(summary.values())
-        print(f"Ingested {total} rows for {len(summary)} discovered assets into {args.db}")
+        skipped = sum(1 for rows in summary.values() if rows == 0)
+        print(f"Ingested {total} rows for {len(summary)} discovered assets into {args.db}; skipped {skipped} failed/empty assets")
         return 0
 
     if args.command == "features" and args.features_command == "calculate":

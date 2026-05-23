@@ -77,6 +77,13 @@ class FailingProvider:
         raise ProviderDataError("changed columns")
 
 
+class PartiallyFailingProvider(FakeProvider):
+    def history(self, asset, start_date: str, end_date: str):
+        if asset.code == "000818":
+            raise ProviderDataError("sina dns failed")
+        return super().history(asset, start_date, end_date)
+
+
 class FakeAkModule:
     def fund_open_fund_info_em(self, symbol: str, indicator: str):
         return [
@@ -291,6 +298,35 @@ def test_ingest_failure_writes_task_log(tmp_path):
 
     assert log["status"] == "failed"
     assert log["error"] == "changed columns"
+
+
+def test_ingest_can_continue_after_asset_fetch_failure(tmp_path):
+    db_path = tmp_path / "ingest.sqlite3"
+    universe = [
+        MVP_UNIVERSE[0],
+        MVP_UNIVERSE[0].__class__(code="000818", name="航锦科技", asset_type="stock", market="CN", provider_symbol="sz000818"),
+    ]
+
+    summary = ingest_mvp_universe(
+        db_path,
+        "20260520",
+        "20260521",
+        provider=PartiallyFailingProvider(),
+        universe=universe,
+        continue_on_error=True,
+    )
+
+    with connect(db_path) as conn:
+        warning = conn.execute(
+            "SELECT status, warnings_json FROM data_quality_reports WHERE scope = 'ingest:stock:000818'"
+        ).fetchone()
+        log = conn.execute("SELECT status, message FROM task_logs ORDER BY id DESC LIMIT 1").fetchone()
+
+    assert summary["index:000300"] == 1
+    assert summary["stock:000818"] == 0
+    assert warning["status"] == "warning"
+    assert "sina dns failed" in warning["warnings_json"]
+    assert log["status"] == "success"
 
 
 def test_provider_filters_fund_history_to_requested_dates():
