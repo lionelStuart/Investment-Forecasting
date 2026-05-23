@@ -10,7 +10,7 @@ def test_daily_workflow_skip_ingest_is_idempotent(tmp_path):
     seed_asset_with_prices(db_path, [100, 101, 102, 103, 104, 105, 106])
     config = default_daily_config(
         db_path=db_path,
-        run_date="20260523",
+        run_date="20260103",
         start_date="20260101",
         end_date="20260107",
         horizons=(2,),
@@ -28,13 +28,16 @@ def test_daily_workflow_skip_ingest_is_idempotent(tmp_path):
         workflow_success_count = conn.execute(
             "SELECT COUNT(*) AS count FROM task_logs WHERE task_name = 'daily_workflow' AND status = 'success'"
         ).fetchone()["count"]
+        advice_score_count = conn.execute("SELECT COUNT(*) AS count FROM advice_outcome_scores").fetchone()["count"]
 
     assert first["ok"] is True
     assert second["ok"] is True
     assert first["steps"]["ingest"] == {"skipped": True}
+    assert "advice_outcome_scores" in first["steps"]
     assert advice_count == 1
     assert prediction_count == 1
     assert backtest_result_count == 3
+    assert advice_score_count == 1
     assert workflow_success_count == 2
 
 

@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from investment_forecasting.advice.generator import generate_daily_advice
+from investment_forecasting.advice.scoring import score_matured_advice
 from investment_forecasting.data.ingestion import ingest_mvp_universe
 from investment_forecasting.db import complete_task_log, connect, init_db, start_task_log
 from investment_forecasting.quant.backtest import run_backtest, run_latest_forecasts
@@ -58,6 +59,10 @@ def run_daily_workflow(config: DailyWorkflowConfig) -> dict[str, Any]:
             lookback_days=config.lookback_days,
         )
         completed_steps["advice"] = {"advice_id": generate_daily_advice(config.db_path, advice_date=config.run_date)}
+        completed_steps["advice_outcome_scores"] = score_matured_advice(
+            config.db_path,
+            horizon_days=min(config.horizons) if config.horizons else 20,
+        )
 
         with connect(config.db_path) as conn:
             complete_task_log(
