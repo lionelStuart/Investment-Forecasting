@@ -8,7 +8,7 @@ completed
 
 Evaluate expert performance over time, identify experts that are failing their
 mandate, record lessons, retire underperforming experts, and hire replacement
-experts when active count falls below three.
+experts when active count falls below four.
 
 ## Scope
 
@@ -40,7 +40,7 @@ experts when active count falls below three.
 - A bad expert can enter warning/probation before retirement.
 - Retirement writes a structured lesson explaining failure causes and avoided
   future hiring patterns.
-- Hiring restores the active expert count to three.
+- Hiring restores the active expert count to four.
 - Replacement experts improve committee diversity instead of cloning the
   retired expert's failed pattern.
 
@@ -65,7 +65,7 @@ experts when active count falls below three.
   hire_replacement decisions.
 - Retirement writes a structured failure lesson with overweighted signals,
   ignored signals, failed controls, and future hiring patterns to avoid.
-- Replacement hiring restores the active expert count to three and creates a
+- Replacement hiring restores the active expert count to four and creates a
   virtual portfolio for the replacement expert.
 - Added `experts score` CLI for explicit scoring and lifecycle review.
 

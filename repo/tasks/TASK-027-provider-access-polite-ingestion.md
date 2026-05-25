@@ -2,7 +2,7 @@
 
 ## Status
 
-pending
+completed
 
 ## Source
 
@@ -62,3 +62,24 @@ research workflows.
   downloads.
 - Simulated provider throttling/empty-response tests that produce actionable
   task-log warnings.
+
+## Implementation Notes
+
+- Added `ProviderAccessPolicy` and request diagnostics to the AKShare provider.
+- Live AKShare usage is sequential by default, with configurable minimum delay,
+  optional jitter, retry attempts, and exponential backoff caps.
+- Provider diagnostics record request count, retry count, request labels,
+  network profiles, and likely throttling/anti-bot warnings.
+- Ingestion now checks local `price_daily` before each asset pull and resumes
+  from the day after the latest local price; if local data already covers the
+  requested range, the asset is skipped without a provider call.
+- CLI `ingest mvp` and `ingest full` expose provider delay/jitter/retry/backoff
+  controls while keeping AKShare as the free default provider.
+- Per-asset quality metadata records requested/effective date ranges and
+  incremental action. Task-log messages now include provider diagnostics and
+  empty/throttling warnings.
+
+## Verification
+
+- `python3 -m pytest tests/test_akshare_ingestion.py tests/test_daily_workflow.py`
+- `python3 -m investment_forecasting.cli ingest mvp --help`

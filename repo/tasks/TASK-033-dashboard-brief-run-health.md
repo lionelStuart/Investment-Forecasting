@@ -2,7 +2,7 @@
 
 ## Status
 
-pending
+completed
 
 ## Source
 
@@ -32,3 +32,20 @@ understand today's stance and whether the system is reliable.
   run-health ownership, or reusable product-experience helpers are introduced.
 - Tests and WebUI restart/smoke check validate the dashboard brief and run
   health section.
+
+## Completion Notes
+
+- Added a dashboard daily brief with a Chinese one-line stance, three reasons,
+  one watch condition, and the active risk settings inline.
+- Added grouped run-health cards for data ingest, feature calculation, market
+  snapshot, forecast, backtest, daily advice, and monitoring. Missing and
+  failed stages show user-facing impact and recovery hints.
+- Removed the duplicated raw expert equity/benchmark scoring table from the
+  expert overview so the overview stays focused on compact cards, the
+  multi-expert return curve, latest plans, and lessons.
+- Added WebUI regression coverage for dashboard brief/run-health content and
+  failed-stage surfacing.
+
+## Verification
+
+- `python3 -m pytest tests/test_web_app.py`

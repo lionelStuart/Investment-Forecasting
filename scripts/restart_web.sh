@@ -5,7 +5,11 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 HOST="${HOST:-127.0.0.1}"
 PORT="${PORT:-8765}"
 DB_PATH="${DB_PATH:-$ROOT_DIR/data/investment_forecasting.sqlite3}"
-PYTHON_BIN="${PYTHON_BIN:-python3}"
+DEFAULT_PYTHON_BIN="python3"
+if [[ -x "/Library/Frameworks/Python.framework/Versions/3.14/bin/python3" ]]; then
+  DEFAULT_PYTHON_BIN="/Library/Frameworks/Python.framework/Versions/3.14/bin/python3"
+fi
+PYTHON_BIN="${PYTHON_BIN:-$DEFAULT_PYTHON_BIN}"
 PYTHON_BIN="$(command -v "$PYTHON_BIN")"
 LOG_DIR="${LOG_DIR:-$ROOT_DIR/.runtime}"
 PID_FILE="$LOG_DIR/web.pid"
@@ -36,11 +40,13 @@ db_path = Path(os.environ["DB_PATH"])
 tables = [
     "assets",
     "price_daily",
+    "fund_holdings",
     "features_daily",
     "model_predictions",
     "daily_advice",
     "market_snapshots",
     "macro_observations",
+    "capital_flow_observations",
 ]
 
 if not db_path.exists():

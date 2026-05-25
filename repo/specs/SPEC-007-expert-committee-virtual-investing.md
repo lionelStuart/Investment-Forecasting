@@ -12,7 +12,7 @@ preferences, model focus, risk constraints, virtual capital account, daily
 investment plan, execution record, scorecard, review history, and lifecycle
 state.
 
-The first product target is three active experts, each starting with virtual
+The first product target is four active experts, each starting with virtual
 capital such as CNY 500,000. Every day, each expert reviews stored research
 evidence, decides whether to invest, hold, reduce, or stay in cash, then writes
 a traceable plan and simulated execution. Over time, the system evaluates each
@@ -27,7 +27,7 @@ expert using historical lessons and a different style gap.
   one generic advice voice.
 - Evaluate investment plans as virtual portfolios with capital, positions,
   cash, transactions, and equity curves.
-- Keep at least three active experts in parallel so users can compare style,
+- Keep at least four active experts in parallel so users can compare style,
   behavior, and outcomes.
 - Retain lessons from failed experts and use those lessons when hiring new
   experts.
@@ -61,7 +61,7 @@ expert using historical lessons and a different style gap.
 
 ### Expert Roster
 
-- The system must support exactly three active experts by default.
+- The system must support exactly four active experts by default.
 - Each expert must have:
   - name and short description;
   - style label;
@@ -71,6 +71,9 @@ expert using historical lessons and a different style gap.
   - default cash buffer;
   - lifecycle state: candidate, active, probation, retired.
 - Experts must be persisted, not hardcoded only in UI.
+- Expert names should use durable persona names, such as historical names.
+  Investing style is stored as a field, but should not be used as the fixed
+  expert identity or display name.
 - Expert prompts or plan templates may exist, but structured fields are the
   source of truth.
 
@@ -85,6 +88,27 @@ expert using historical lessons and a different style gap.
   limits.
 - Plans must be generated from data already available for the run date; no
   future market data may influence the plan.
+
+### Expert AI Analysis
+
+- Each expert should have an independent AI analysis step before the final
+  structured plan is persisted.
+- The AI analysis must receive an expert-specific evidence packet derived from
+  the expert's style, focus weights, risk limits, model preferences, portfolio
+  state, and allowed asset categories.
+- The AI output must be captured as structured analysis, not only prose:
+  thesis, watched signals, selected candidates, rejected candidates, risk
+  objections, confidence, and proposed action.
+- The persisted record must include an evidence packet, output JSON,
+  validation JSON, source/version/status, and one idempotent
+  expert/date/version identity.
+- The expert plan must be derived from the persisted structured analysis and
+  then validated by deterministic safety checks before simulated execution.
+- Expert plans must store the `ai_analysis_id` that was used for finalization.
+- AI analysis may explain style-specific reasoning, but it must not invent
+  market facts, hidden prices, unsupported predictions, or untraceable evidence.
+- If the AI analysis fails, the expert should record a skipped or fallback plan
+  with the failure reason instead of silently producing an unsupported trade.
 
 ### Virtual Execution
 
@@ -119,7 +143,7 @@ expert using historical lessons and a different style gap.
   what happened, what signals were overweighted or ignored, what risk controls
   failed, and what future hiring should avoid.
 - The system must hire a new candidate when active expert count falls below
-  three.
+  four.
 - Replacement hiring should reference historical expert lessons and prefer a
   style or focus that improves committee diversity.
 
@@ -128,8 +152,10 @@ expert using historical lessons and a different style gap.
 - The WebUI must provide an expert-committee view with:
   - active expert roster and lifecycle state;
   - each expert's current capital, cash, positions, return, drawdown, and score;
-  - today's expert plans and whether orders executed;
-  - equity curves and comparison against benchmark;
+  - an overview-level multi-expert virtual return comparison curve, without a
+    duplicate raw equity/benchmark or plan/execution table;
+  - expert detail pages that can show today's expert plans, execution status,
+    each expert's equity curve, and benchmark context when drilling in;
   - warnings, probation, retired experts, and lessons learned.
 - The UI must not frame a top expert as guaranteed to keep winning.
 
@@ -154,32 +180,41 @@ expert using historical lessons and a different style gap.
 
 ## Suggested Initial Expert Roster
 
-1. `稳健防守专家`
+1. `管仲`
    - Style: defensive income and drawdown control.
    - Focus: volatility, max drawdown, cash buffer, market snapshot risk,
      conservative fund metadata.
    - Behavior: can choose no trade frequently; penalized less for cash drag in
      high-risk market states.
 
-2. `趋势进攻专家`
+2. `白圭`
    - Style: momentum and growth participation.
    - Focus: 20/60-day momentum, up probability, expected return, confidence,
      improving market breadth.
    - Behavior: accepts higher volatility but must reduce exposure after
      drawdown or confidence deterioration.
 
-3. `均衡轮动专家`
+3. `范蠡`
    - Style: category rotation and risk-adjusted balance.
    - Focus: Sharpe, Calmar, benchmark excess, category diversification,
      model/backtest quality.
    - Behavior: prefers partial rebalancing and avoids concentration.
 
+4. `桑弘羊`
+   - Style: macro allocation and liquidity observation.
+   - Focus: market snapshot risk, market breadth, benchmark excess,
+     confidence, cash buffer, volatility, and category diversification.
+   - Behavior: adjusts category exposure from macro and liquidity evidence,
+     and avoids concentration from a single asset signal.
+
 ## Acceptance Criteria
 
-- Three active experts can be created from structured configuration.
+- Four active experts can be created from structured configuration.
 - Each expert can receive CNY 500,000 virtual initial capital.
 - Each active expert can create a daily plan with explicit `trade` or
   `no_trade` action and evidence links.
+- Each active expert can persist an independent AI analysis record before or
+  alongside the daily plan.
 - Simulated execution records transactions, cash, positions, and valuation
   using stored prices only.
 - Expert scorecards compare return, drawdown, benchmark, and mandate adherence

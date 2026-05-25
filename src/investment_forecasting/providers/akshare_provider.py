@@ -2,11 +2,15 @@ from __future__ import annotations
 
 import json
 import os
+import random
+import subprocess
+import time
 from collections.abc import Iterator
 from collections.abc import Iterable, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import urlencode
 
 
 class ProviderDataError(RuntimeError):
@@ -18,12 +22,53 @@ class RetryConfig:
     attempts: int = 2
     fallback_to_direct: bool = True
     fallback_to_local_proxy: bool = True
+    backoff_base_seconds: float = 0.5
+    max_backoff_seconds: float = 5.0
+
+
+@dataclass(frozen=True)
+class ProviderAccessPolicy:
+    min_delay_seconds: float = 0.25
+    jitter_seconds: float = 0.25
+
+
+@dataclass
+class ProviderRequestStats:
+    request_count: int = 0
+    retry_count: int = 0
+    labels: list[str] | None = None
+    network_profiles: list[str] | None = None
+    throttling_warnings: list[str] | None = None
+
+    def __post_init__(self) -> None:
+        self.labels = [] if self.labels is None else self.labels
+        self.network_profiles = [] if self.network_profiles is None else self.network_profiles
+        self.throttling_warnings = [] if self.throttling_warnings is None else self.throttling_warnings
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "request_count": self.request_count,
+            "retry_count": self.retry_count,
+            "labels": list(self.labels or []),
+            "network_profiles": list(self.network_profiles or []),
+            "throttling_warnings": list(self.throttling_warnings or []),
+        }
 
 
 class AkshareProvider:
     source = "akshare"
 
-    def __init__(self, ak_module: Any | None = None, retry_config: RetryConfig | None = None) -> None:
+    def __init__(
+        self,
+        ak_module: Any | None = None,
+        retry_config: RetryConfig | None = None,
+        access_policy: ProviderAccessPolicy | None = None,
+        sleep_func: Any | None = None,
+        monotonic_func: Any | None = None,
+        random_func: Any | None = None,
+        curl_runner: Any | None = None,
+    ) -> None:
+        live_module = ak_module is None
         if ak_module is None:
             try:
                 import akshare as ak_module
@@ -31,6 +76,23 @@ class AkshareProvider:
                 raise RuntimeError("AKShare is required for live ingestion. Install project dependencies.") from exc
         self.ak = ak_module
         self.retry_config = retry_config or RetryConfig()
+        self.access_policy = access_policy or (ProviderAccessPolicy() if live_module else ProviderAccessPolicy(min_delay_seconds=0.0, jitter_seconds=0.0))
+        self._sleep = sleep_func or time.sleep
+        self._monotonic = monotonic_func or time.monotonic
+        self._random = random_func or random.random
+        self._curl_runner = curl_runner or _run_curl_json
+        self._last_request_at: float | None = None
+        self.stats = ProviderRequestStats()
+
+    def diagnostics(self) -> dict[str, Any]:
+        return {
+            **self.stats.as_dict(),
+            "min_delay_seconds": self.access_policy.min_delay_seconds,
+            "jitter_seconds": self.access_policy.jitter_seconds,
+            "attempts": self.retry_config.attempts,
+            "backoff_base_seconds": self.retry_config.backoff_base_seconds,
+            "max_backoff_seconds": self.retry_config.max_backoff_seconds,
+        }
 
     def history(self, asset: Any, start_date: str, end_date: str) -> list[dict[str, Any]]:
         try:
@@ -196,21 +258,137 @@ class AkshareProvider:
             raise ProviderDataError(f"AKShare fund info fetch failed for fund:{asset.code}: {exc}") from exc
         return normalize_fund_info(basic, rank, code=asset.code)
 
+    def fund_stock_holdings(self, code: str, year: str) -> list[dict[str, Any]]:
+        normalized_code = str(code).zfill(6)
+        try:
+            raw = self._with_retry(
+                f"fund:{normalized_code}:stock_holdings:{year}",
+                lambda: self.ak.fund_portfolio_hold_em(symbol=normalized_code, date=str(year)),
+            )
+        except Exception as exc:
+            raise ProviderDataError(f"AKShare fund holdings fetch failed for fund:{normalized_code}: {exc}") from exc
+        return normalize_fund_stock_holding_rows(raw, fund_code=normalized_code)
+
+    def stock_capital_flow(self, code: str) -> list[dict[str, Any]]:
+        normalized_code = str(code).zfill(6)
+        market = _fund_flow_market(normalized_code)
+        try:
+            raw = self._with_retry(
+                f"stock:{normalized_code}:capital_flow",
+                lambda: self.ak.stock_individual_fund_flow(stock=normalized_code, market=market),
+            )
+        except Exception as exc:
+            try:
+                raw = self._eastmoney_capital_flow(
+                    label=f"stock:{normalized_code}:capital_flow:curl",
+                    secid=f"{_eastmoney_market_id(market)}.{normalized_code}",
+                    market_scope="stock",
+                )
+            except Exception as fallback_exc:
+                raise ProviderDataError(
+                    f"AKShare capital flow fetch failed for stock:{normalized_code}: {exc}; "
+                    f"curl fallback failed: {fallback_exc}"
+                ) from fallback_exc
+        return normalize_capital_flow_rows(raw, scope="stock", subject_code=normalized_code, subject_name=normalized_code)
+
+    def market_capital_flow(self) -> list[dict[str, Any]]:
+        try:
+            raw = self._with_retry("market:capital_flow", lambda: self.ak.stock_market_fund_flow())
+        except Exception as exc:
+            try:
+                raw = self._eastmoney_capital_flow(
+                    label="market:capital_flow:curl",
+                    secid="1.000001",
+                    secid2="0.399001",
+                    market_scope="market",
+                )
+            except Exception as fallback_exc:
+                raise ProviderDataError(
+                    f"AKShare market capital flow fetch failed: {exc}; curl fallback failed: {fallback_exc}"
+                ) from fallback_exc
+        return normalize_capital_flow_rows(raw, scope="market", subject_code="CN_A", subject_name="A股市场")
+
+    def _eastmoney_capital_flow(
+        self,
+        *,
+        label: str,
+        secid: str,
+        market_scope: str,
+        secid2: str | None = None,
+    ) -> list[dict[str, Any]]:
+        self._apply_rate_limit()
+        self.stats.request_count += 1
+        self.stats.labels.append(label)
+        self.stats.network_profiles.append("curl_fallback")
+        payload = self._curl_runner(_eastmoney_capital_flow_url(secid=secid, secid2=secid2))
+        rows = _eastmoney_capital_flow_records(payload, market_scope=market_scope)
+        if not rows:
+            raise ProviderDataError(f"Eastmoney returned no capital flow rows for {secid}")
+        return rows
+
     def _with_retry(self, label: str, fetch: Any) -> Any:
         last_error: Exception | None = None
         errors = []
         for profile_name, proxy_env in _network_profiles(self.retry_config):
+            self.stats.network_profiles.append(profile_name)
             with _temporary_proxy_env(proxy_env):
-                for _ in range(max(1, self.retry_config.attempts)):
+                for attempt_index in range(max(1, self.retry_config.attempts)):
                     try:
+                        self._apply_rate_limit()
+                        self.stats.request_count += 1
+                        self.stats.labels.append(label)
                         return fetch()
                     except Exception as exc:
                         last_error = exc
+                        if attempt_index < max(1, self.retry_config.attempts) - 1:
+                            self.stats.retry_count += 1
+                            if _looks_like_throttling(exc):
+                                self.stats.throttling_warnings.append(f"{label}: likely throttling or anti-bot response: {exc}")
+                            self._sleep(_backoff_seconds(self.retry_config, attempt_index))
                 errors.append(f"{profile_name}: {last_error}")
         raise ProviderDataError(
             f"{label} failed after {self.retry_config.attempts} attempt(s) across "
             f"{len(errors)} network profile(s): {' | '.join(errors)}"
         )
+
+    def _apply_rate_limit(self) -> None:
+        min_delay = max(0.0, self.access_policy.min_delay_seconds)
+        jitter = max(0.0, self.access_policy.jitter_seconds)
+        target_delay = min_delay + (self._random() * jitter if jitter else 0.0)
+        now = self._monotonic()
+        if self._last_request_at is not None:
+            elapsed = now - self._last_request_at
+            if elapsed < target_delay:
+                self._sleep(target_delay - elapsed)
+                now = self._monotonic()
+        self._last_request_at = now
+
+
+def _backoff_seconds(retry_config: RetryConfig, attempt_index: int) -> float:
+    base = max(0.0, retry_config.backoff_base_seconds)
+    return min(max(0.0, retry_config.max_backoff_seconds), base * (2**attempt_index))
+
+
+def _looks_like_throttling(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return any(
+        marker in text
+        for marker in (
+            "429",
+            "403",
+            "anti",
+            "captcha",
+            "forbidden",
+            "too many",
+            "too frequent",
+            "rate limit",
+            "temporarily blocked",
+            "访问过于频繁",
+            "禁止访问",
+            "限流",
+            "验证码",
+        )
+    )
 
 
 def normalize_price_rows(raw_rows: Any, asset_type: str) -> list[dict[str, Any]]:
@@ -310,6 +488,70 @@ def normalize_fund_info(raw_basic: Any, raw_rank: Any | None, code: str) -> dict
     }
 
 
+def normalize_capital_flow_rows(
+    raw_rows: Any,
+    scope: str,
+    subject_code: str,
+    subject_name: str,
+) -> list[dict[str, Any]]:
+    normalized = []
+    for row in _records(raw_rows):
+        raw_date = _value(row, "日期", "交易日期", "date", "trade_date")
+        if raw_date in (None, ""):
+            continue
+        flow_date = _date_text(raw_date)
+        current_code = _value(row, "代码", "股票代码", "symbol", "code") or subject_code
+        current_name = _value(row, "名称", "股票简称", "name") or subject_name
+        normalized.append(
+            {
+                "flow_date": flow_date,
+                "scope": scope,
+                "subject_code": _capital_flow_subject_code(scope, current_code),
+                "subject_name": str(current_name),
+                "asset_id": None,
+                "close": _number(_value(row, "收盘价", "最新价", "close")),
+                "pct_change": _percent_ratio(_value(row, "涨跌幅", "pct_change")),
+                "main_net_inflow": _number(_value(row, "主力净流入-净额", "主力净流入净额", "净额", "主力净额")),
+                "main_net_inflow_pct": _percent_ratio(_value(row, "主力净流入-净占比", "主力净流入净占比", "净占比")),
+                "super_large_net_inflow": _number(_value(row, "超大单净流入-净额", "超大单净额")),
+                "super_large_net_inflow_pct": _percent_ratio(_value(row, "超大单净流入-净占比", "超大单净占比")),
+                "large_net_inflow": _number(_value(row, "大单净流入-净额", "大单净额")),
+                "large_net_inflow_pct": _percent_ratio(_value(row, "大单净流入-净占比", "大单净占比")),
+                "medium_net_inflow": _number(_value(row, "中单净流入-净额", "中单净额")),
+                "medium_net_inflow_pct": _percent_ratio(_value(row, "中单净流入-净占比", "中单净占比")),
+                "small_net_inflow": _number(_value(row, "小单净流入-净额", "小单净额")),
+                "small_net_inflow_pct": _percent_ratio(_value(row, "小单净流入-净占比", "小单净占比")),
+                "raw_payload": json.dumps(dict(row), ensure_ascii=False, default=str),
+            }
+        )
+    return normalized
+
+
+def normalize_fund_stock_holding_rows(raw_rows: Any, fund_code: str) -> list[dict[str, Any]]:
+    normalized = []
+    for row in _records(raw_rows):
+        holding_code = _value(row, "股票代码", "代码", "stock_code")
+        if holding_code in (None, ""):
+            continue
+        quarter = _value(row, "季度", "报告期", "report_period")
+        normalized.append(
+            {
+                "fund_code": str(fund_code).zfill(6),
+                "report_period": str(quarter or ""),
+                "holding_type": "stock",
+                "holding_code": str(holding_code).zfill(6) if str(holding_code).isdigit() else str(holding_code),
+                "holding_name": str(_value(row, "股票名称", "名称", "stock_name") or holding_code),
+                "holding_asset_id": None,
+                "weight_pct": _percent_ratio(_value(row, "占净值比例", "持仓占比", "weight_pct")),
+                "shares": _ten_thousand_unit(_value(row, "持股数", "持股数量", "shares")),
+                "market_value": _ten_thousand_unit(_value(row, "持仓市值", "市值", "market_value")),
+                "rank": int(_number(_value(row, "序号", "排名", "rank")) or 0) or None,
+                "raw_payload": json.dumps(dict(row), ensure_ascii=False, default=str),
+            }
+        )
+    return normalized
+
+
 def _find_rank_row(raw_rank: Any, code: str) -> Mapping[str, Any]:
     for row in _records(raw_rank):
         if str(_value(row, "基金代码", "code")) == code:
@@ -320,6 +562,127 @@ def _find_rank_row(raw_rank: Any, code: str) -> Mapping[str, Any]:
 def _provider_symbol(code: str) -> str:
     prefix = "sh" if code.startswith(("5", "6", "9")) else "sz"
     return f"{prefix}{code}"
+
+
+def _fund_flow_market(code: str) -> str:
+    normalized_code = str(code).zfill(6)
+    if normalized_code.startswith(("60", "68", "90")):
+        return "sh"
+    if normalized_code.startswith(("8", "4")):
+        return "bj"
+    return "sz"
+
+
+def _eastmoney_market_id(market: str) -> str:
+    return "1" if market == "sh" else "0"
+
+
+def _eastmoney_capital_flow_url(*, secid: str, secid2: str | None = None) -> str:
+    params = {
+        "lmt": "0",
+        "klt": "101",
+        "secid": secid,
+        "fields1": "f1,f2,f3,f7",
+        "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61,f62,f63,f64,f65",
+        "ut": "b2884a393a59ad64002292a3e90d46a5",
+        "_": str(int(time.time() * 1000)),
+    }
+    if secid2:
+        params["secid2"] = secid2
+    return f"https://push2his.eastmoney.com/api/qt/stock/fflow/daykline/get?{urlencode(params)}"
+
+
+def _run_curl_json(url: str) -> dict[str, Any]:
+    base_command = [
+        "curl",
+        "-L",
+        "--fail",
+        "--silent",
+        "--show-error",
+        "--max-time",
+        "20",
+        "--compressed",
+        "-H",
+        "Accept: application/json,text/plain,*/*",
+        "-H",
+        "Referer: https://data.eastmoney.com/",
+        "-A",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/81.0.4044.138 Safari/537.36",
+    ]
+    profiles = [
+        ("curl_no_proxy", [*base_command, "--noproxy", "*", url], None),
+        ("curl_local_proxy_127.0.0.1:7890", [*base_command, url], {**os.environ, **LOCAL_PROXY_ENV}),
+    ]
+    errors = []
+    for profile_name, command, env in profiles:
+        for attempt in range(3):
+            try:
+                result = subprocess.run(command, check=True, capture_output=True, text=True, env=env)
+            except FileNotFoundError as exc:
+                raise ProviderDataError("curl is required for Eastmoney capital flow fallback") from exc
+            except subprocess.CalledProcessError as exc:
+                detail = (exc.stderr or exc.stdout or str(exc)).strip()
+                errors.append(f"{profile_name} attempt {attempt + 1}: {detail}")
+                time.sleep(1 + attempt)
+                continue
+            try:
+                payload = json.loads(result.stdout)
+            except json.JSONDecodeError:
+                errors.append(f"{profile_name} attempt {attempt + 1}: invalid JSON {result.stdout[:200]}")
+                time.sleep(1 + attempt)
+                continue
+            if isinstance(payload, dict):
+                return payload
+            errors.append(f"{profile_name} attempt {attempt + 1}: response must be a JSON object")
+    raise ProviderDataError(f"curl request failed: {' | '.join(errors)}")
+
+
+def _eastmoney_capital_flow_records(payload: Mapping[str, Any], *, market_scope: str) -> list[dict[str, Any]]:
+    data = payload.get("data")
+    if not isinstance(data, Mapping):
+        return []
+    klines = data.get("klines")
+    if not isinstance(klines, list):
+        return []
+    rows = []
+    for item in klines:
+        parts = str(item).split(",")
+        if len(parts) < 13:
+            continue
+        base = {
+            "日期": parts[0],
+            "主力净流入-净额": parts[1],
+            "小单净流入-净额": parts[2],
+            "中单净流入-净额": parts[3],
+            "大单净流入-净额": parts[4],
+            "超大单净流入-净额": parts[5],
+            "主力净流入-净占比": parts[6],
+            "小单净流入-净占比": parts[7],
+            "中单净流入-净占比": parts[8],
+            "大单净流入-净占比": parts[9],
+            "超大单净流入-净占比": parts[10],
+        }
+        if market_scope == "market":
+            base.update(
+                {
+                    "上证-收盘价": parts[11],
+                    "上证-涨跌幅": parts[12],
+                    "深证-收盘价": parts[13] if len(parts) > 13 else None,
+                    "深证-涨跌幅": parts[14] if len(parts) > 14 else None,
+                }
+            )
+        else:
+            base.update({"收盘价": parts[11], "涨跌幅": parts[12]})
+        rows.append(base)
+    return rows
+
+
+def _capital_flow_subject_code(scope: str, value: Any) -> str:
+    text = str(value).strip()
+    if scope == "stock" and text.isdigit():
+        return text.zfill(6)
+    return text
 
 
 PROXY_ENV_KEYS = (
@@ -398,6 +761,18 @@ def _number(value: Any) -> float | None:
     if text in {"", "-", "nan", "None"}:
         return None
     return float(text)
+
+
+def _percent_ratio(value: Any) -> float | None:
+    number = _number(value)
+    if number is None:
+        return None
+    return number / 100 if abs(number) > 1 else number
+
+
+def _ten_thousand_unit(value: Any) -> float | None:
+    number = _number(value)
+    return number * 10_000 if number is not None else None
 
 
 def _scale_yi(value: Any) -> float | None:

@@ -7,7 +7,7 @@ from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 
-from investment_forecasting.mcp.tools import call_tool
+from investment_forecasting.mcp.tools import call_agent_tool, call_tool
 
 
 DEFAULT_DB_PATH = Path("data/investment_forecasting.sqlite3")
@@ -58,15 +58,29 @@ def create_mcp_server(db_path: str | Path | None = None) -> FastMCP:
         return call_tool(resolved_db_path, "get_market_snapshot", {})
 
     @mcp.tool(name="run_forecast", description="Run latest baseline forecasts.")
-    def run_forecast(horizons: list[int] | None = None) -> dict[str, Any]:
-        return call_tool(resolved_db_path, "run_forecast", {"horizons": horizons or [5, 20, 60]})
+    def run_forecast(horizons: list[int] | None = None, model_versions: list[str] | None = None) -> dict[str, Any]:
+        return call_tool(
+            resolved_db_path,
+            "run_forecast",
+            {"horizons": horizons or [5, 20, 60], "model_versions": model_versions or ["baseline_mean_v1"]},
+        )
 
     @mcp.tool(name="run_backtest", description="Run rolling baseline backtests.")
-    def run_backtest(horizons: list[int] | None = None, lookback_days: int = 60) -> dict[str, Any]:
+    def run_backtest(
+        horizons: list[int] | None = None,
+        lookback_days: int = 60,
+        embargo_days: int = 0,
+        model_versions: list[str] | None = None,
+    ) -> dict[str, Any]:
         return call_tool(
             resolved_db_path,
             "run_backtest",
-            {"horizons": horizons or [5, 20, 60], "lookback_days": lookback_days},
+            {
+                "horizons": horizons or [5, 20, 60],
+                "lookback_days": lookback_days,
+                "embargo_days": embargo_days,
+                "model_versions": model_versions or ["baseline_mean_v1"],
+            },
         )
 
     @mcp.tool(name="get_daily_advice", description="Return stored daily advice for a date or the latest advice.")
@@ -76,6 +90,53 @@ def create_mcp_server(db_path: str | Path | None = None) -> FastMCP:
     @mcp.tool(name="generate_daily_advice", description="Generate and store daily advice from stored evidence.")
     def generate_daily_advice(date: str | None = None) -> dict[str, Any]:
         return call_tool(resolved_db_path, "generate_daily_advice", {"date": date} if date else {})
+
+    @mcp.tool(name="get_jarvis_daily_brief", description="Return a structured Jarvis daily brief for a date or the latest brief.")
+    def get_jarvis_daily_brief(date: str | None = None, version: str | None = None) -> dict[str, Any]:
+        arguments: dict[str, Any] = {}
+        if date:
+            arguments["date"] = date
+        if version:
+            arguments["version"] = version
+        return call_tool(resolved_db_path, "get_jarvis_daily_brief", arguments)
+
+    @mcp.tool(name="generate_jarvis_daily_brief", description="Generate and store a Jarvis daily brief from persisted evidence.")
+    def generate_jarvis_daily_brief(date: str | None = None) -> dict[str, Any]:
+        return call_tool(resolved_db_path, "generate_jarvis_daily_brief", {"date": date} if date else {})
+
+    @mcp.tool(name="search_news_evidence", description="Search bounded financial news evidence. Results are context only, not buy/sell advice.")
+    def search_news_evidence(
+        source: str | list[str] | None = None,
+        start_datetime: str | None = None,
+        end_datetime: str | None = None,
+        asset_id: int | None = None,
+        asset_code: str | None = None,
+        theme: str | None = None,
+        event_type: str | None = None,
+        sentiment: str | None = None,
+        keyword: str | None = None,
+        max_results: int = 10,
+        dedupe: str = "content_hash",
+        sort: str = "recency",
+    ) -> dict[str, Any]:
+        return call_tool(
+            resolved_db_path,
+            "search_news_evidence",
+            {
+                "source": source,
+                "start_datetime": start_datetime,
+                "end_datetime": end_datetime,
+                "asset_id": asset_id,
+                "asset_code": asset_code,
+                "theme": theme,
+                "event_type": event_type,
+                "sentiment": sentiment,
+                "keyword": keyword,
+                "max_results": max_results,
+                "dedupe": dedupe,
+                "sort": sort,
+            },
+        )
 
     @mcp.tool(name="list_experts", description="List expert committee roster records and lifecycle state.")
     def list_experts(state: str | None = None) -> dict[str, Any]:
@@ -112,6 +173,46 @@ def create_mcp_server(db_path: str | Path | None = None) -> FastMCP:
     @mcp.tool(name="get_expert_lessons", description="Return structured expert lifecycle and hiring lessons.")
     def get_expert_lessons(lesson_type: str | None = None) -> dict[str, Any]:
         return call_tool(resolved_db_path, "get_expert_lessons", {"lesson_type": lesson_type} if lesson_type else {})
+
+    @mcp.tool(name="get_agent_tool_manifest", description="Return allowed tools and skills for a role-scoped Codex agent run.")
+    def get_agent_tool_manifest(role_type: str, role_key: str | None = None) -> dict[str, Any]:
+        return call_tool(resolved_db_path, "get_agent_tool_manifest", {"role_type": role_type, "role_key": role_key})
+
+    @mcp.tool(name="validate_agent_output", description="Validate a structured expert/Jarvis agent output preview.")
+    def validate_agent_output(agent_run_id: int, role_type: str, role_key: str, output: dict[str, Any]) -> dict[str, Any]:
+        return call_agent_tool(
+            resolved_db_path,
+            "validate_agent_output",
+            {"agent_run_id": agent_run_id, "role_type": role_type, "role_key": role_key, "output": output},
+        )
+
+    @mcp.tool(name="submit_expert_virtual_action", description="Submit one expert virtual action envelope for system validation.")
+    def submit_expert_virtual_action(agent_run_id: int, role_key: str, idempotency_key: str, payload: dict[str, Any]) -> dict[str, Any]:
+        return call_agent_tool(
+            resolved_db_path,
+            "submit_expert_virtual_action",
+            {
+                "agent_run_id": agent_run_id,
+                "role_type": "expert",
+                "role_key": role_key,
+                "idempotency_key": idempotency_key,
+                "payload": payload,
+            },
+        )
+
+    @mcp.tool(name="submit_jarvis_daily_brief", description="Submit one Jarvis daily brief envelope for system validation.")
+    def submit_jarvis_daily_brief(agent_run_id: int, idempotency_key: str, payload: dict[str, Any]) -> dict[str, Any]:
+        return call_agent_tool(
+            resolved_db_path,
+            "submit_jarvis_daily_brief",
+            {
+                "agent_run_id": agent_run_id,
+                "role_type": "jarvis",
+                "role_key": "jarvis",
+                "idempotency_key": idempotency_key,
+                "payload": payload,
+            },
+        )
 
     return mcp
 

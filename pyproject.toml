@@ -19,6 +19,9 @@ dev = [
   "pytest>=8.0",
   "pytest-asyncio>=1.0",
 ]
+tushare = [
+  "tushare>=1.4",
+]
 
 [project.scripts]
 investment-forecasting = "investment_forecasting.cli:main"

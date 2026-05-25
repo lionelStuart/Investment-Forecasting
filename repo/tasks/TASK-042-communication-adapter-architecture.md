@@ -2,7 +2,7 @@
 
 ## Status
 
-pending
+completed
 
 ## Purpose
 
@@ -44,6 +44,31 @@ investment, expert, daily workflow, or WebUI logic.
 - Recipient allowlist is enforced before adapter execution.
 - Duplicate idempotency keys do not send duplicate messages.
 - Failed sends persist structured error status.
+
+## Completion Notes
+
+- Added communication persistence:
+  - `communication_recipients`
+  - `communication_adapter_configs`
+  - `outbound_messages`
+- Added channel-neutral communication service in
+  `src/investment_forecasting/communication/service.py` with dry-run support,
+  allowlist enforcement, severity/rate-limit policy checks, idempotency keys,
+  and structured adapter results.
+- Added safe placeholder adapters for this foundation phase:
+  - `DryRunAdapter`
+  - `FailingAdapter`
+- Added CLI inspection/configuration commands:
+  - `investment-forecasting communication configure-adapter`
+  - `investment-forecasting communication upsert-recipient`
+  - `investment-forecasting communication list-recipients`
+  - `investment-forecasting communication send-test`
+  - `investment-forecasting communication list-messages`
+- Actual iMessage sending remains out of scope for `TASK-043`.
+
+## Verification
+
+- `python3 -m pytest tests/test_communication.py tests/test_db.py`
 
 ## Depends On
 

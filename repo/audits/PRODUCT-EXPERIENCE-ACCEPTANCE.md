@@ -41,6 +41,45 @@ key gaps, and the next iteration target.
 
 当前阶段目标不是扩张成完整投顾平台，而是把已有 WebUI 从“技术工作台”升级为“可信研究驾驶舱”的第一版。
 
+## Jarvis Consumer IA Acceptance: 2026-05-23
+
+Status: accepted.
+
+The WebUI first-level navigation now contains exactly five consumer entries:
+今日简报, 机会池, 专家团, 证据, 设置. The default `/` page is no longer a generic
+module dashboard; it is organized around the Jarvis daily decision questions:
+今天怎么看, 为什么, 能不能信, 关注哪些资产, 专家是否一致, and 风险边界/观察条件.
+
+Acceptance evidence:
+
+- `/` renders `今日简报` with the six question sections and links onward to
+  `/opportunities` and `/evidence`.
+- `/opportunities` consolidates product categories, themes, fund candidates,
+  holding look-through, and asset-level prediction cards.
+- `/experts` remains the consumer expert panel and drill-down surface.
+- `/evidence` consolidates predictions, backtests/model health,
+  market/macro/capital-flow evidence, data coverage, and collapsed raw rows.
+- `/settings` consolidates risk preferences, communication health, data update
+  state, system health, and task-log guidance.
+- Legacy routes such as `/timeline`, `/market`, `/categories`, `/themes`,
+  `/data`, `/funds`, `/predictions`, `/backtests`, `/advice`,
+  `/communication`, and `/logs` remain reachable for drill-downs and agents,
+  but are no longer first-level navigation.
+
+Remaining UI risks:
+
+- The 今日简报 page is structurally aligned, but copy quality still depends on
+  deterministic Jarvis synthesis until `TASK-062` and provider-backed follow-up
+  tasks improve prompt and evidence discipline.
+- Prediction values can still look overconfident if later AI/provider work does
+  not add confidence gates and outlier wording.
+- Expert performance remains early-stage; the page exposes sample limitations,
+  but future copy should keep avoiding mature ranking language.
+
+Decision: resume `TASK-062` next. Do not return to data expansion,
+rebalancing, additional experts, or phone-command expansion before the AI
+prompt/evidence schema is frozen.
+
 ### Current Target 1: Make The Daily Brief Human-Readable
 
 用户问题：我今天应该更进攻、更防守，还是继续观察？
@@ -821,8 +860,8 @@ which styles work under which market conditions.
 
 Scope:
 
-- Three active virtual experts with different styles, preferences, model focus,
-  and risk budgets.
+- Four active virtual experts with durable persona names, different styles,
+  preferences, model focus, and risk budgets.
 - Initial virtual capital such as CNY 500,000 per expert.
 - Daily expert plans that can buy, sell, rebalance, hold, or choose no trade.
 - Simulated execution, positions, cash, transactions, and valuation.
@@ -833,10 +872,10 @@ Scope:
 
 Exit criteria:
 
-- 用户可以看到 3 位专家各自的风格、今日计划、虚拟持仓、收益、回撤和评分。
+- 用户可以看到 4 位专家各自的人名、风格、今日计划、虚拟持仓、收益、回撤和评分。
 - 专家计划都能追溯到入库预测、回测、市场快照、基金元数据或历史建议。
 - 投资失败专家不会被简单删除，而是沉淀失败经验、清退原因和未来招聘禁忌。
-- 清退后系统能基于历史经验补充一位新专家，并保持 3 位活跃专家并行。
+- 清退后系统能基于历史经验补充一位新专家，并保持 4 位活跃专家并行。
 - 所有专家输出都明确是虚拟研究模拟，不构成真实买卖指令。
 
 ### Phase 6: Local Phone Communication
@@ -864,6 +903,29 @@ Exit criteria:
 - 所有发送都有状态、错误、幂等键和审计记录。
 - 消息内容是摘要和风险提示，不直接倾倒 raw JSON。
 - 手机回复类能力先完成安全设计，不直接进入真实交易或自动执行。
+
+### Phase 7: Jarvis AI Investment Assistant
+
+Primary outcome: Jarvis becomes the simple daily interface for the whole
+investment system.
+
+Scope:
+
+- Jarvis daily brief persistence.
+- Jarvis synthesis over system market information, prediction model output,
+  backtest/model quality, expert plans, expert scores, expert current virtual
+  returns, and active user preferences.
+- First-screen WebUI experience.
+- MCP/Agent access to Jarvis structured output.
+- Phone summary template through the communication adapter layer.
+
+Exit criteria:
+
+- 用户每天先看到贾维斯，而不是先读市场表格、模型表格或专家日志。
+- 贾维斯输出当天关注方向、一句话结论、模型预测、每位专家的预测/动作/分数/当前收益和风险提示。
+- 贾维斯能解释模型和专家分歧，而不是只给一个黑盒结论。
+- 所有贾维斯建议都能追溯到市场快照、预测、回测、专家计划、专家评分和任务日志。
+- 贾维斯可以生成适合手机通知的简短摘要，但不直接触发真实交易。
 
 ## Future Phase Template
 

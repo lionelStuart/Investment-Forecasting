@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 from investment_forecasting.db import (
@@ -82,6 +83,7 @@ def ingest_mvp_universe(
 ) -> dict[str, int]:
     init_db(db_path)
     provider = provider or AkshareProvider()
+    provider_source = str(getattr(provider, "source", "akshare"))
     assets = list(universe or MVP_UNIVERSE)
     summary: dict[str, int] = {}
     run_date = datetime.now(timezone.utc).date().isoformat()
@@ -93,6 +95,7 @@ def ingest_mvp_universe(
             run_date=run_date,
             message=f"Ingesting {len(assets)} assets from {start_date} to {end_date}",
         )
+        ingest_warnings: list[str] = []
         try:
             for universe_asset in assets:
                 asset_id = upsert_asset(
@@ -104,13 +107,41 @@ def ingest_mvp_universe(
                         "market": universe_asset.market,
                         "currency": "CNY",
                         "status": "active",
-                        "source": universe_asset.source,
+                        "source": provider_source,
                     },
                 )
                 asset_key = f"{universe_asset.asset_type}:{universe_asset.code}"
+                effective_start_date, incremental_metadata = _incremental_start_date(
+                    conn,
+                    asset_id=asset_id,
+                    source=provider_source,
+                    requested_start_date=start_date,
+                    requested_end_date=end_date,
+                )
+                if effective_start_date is None:
+                    upsert_data_quality_report(
+                        conn,
+                        build_quality_report(
+                            report_date=run_date,
+                            scope=f"ingest:{asset_key}",
+                            warnings=[],
+                            metadata={
+                                "asset": universe_asset.__dict__,
+                                "row_count": 0,
+                                "requested_start_date": start_date,
+                                "requested_end_date": end_date,
+                                "provider": provider.__class__.__name__,
+                                **incremental_metadata,
+                            },
+                        ),
+                    )
+                    summary[asset_key] = 0
+                    continue
                 try:
-                    prices = provider.history(universe_asset, start_date=start_date, end_date=end_date)
+                    prices = provider.history(universe_asset, start_date=effective_start_date, end_date=end_date)
                 except Exception as exc:
+                    provider_warning = _provider_warning(asset_key, exc)
+                    ingest_warnings.extend(provider_warning)
                     if not continue_on_error:
                         raise
                     upsert_data_quality_report(
@@ -118,14 +149,16 @@ def ingest_mvp_universe(
                         build_quality_report(
                             report_date=run_date,
                             scope=f"ingest:{asset_key}",
-                            warnings=[f"{asset_key}: provider fetch failed: {exc}"],
+                            warnings=[f"{asset_key}: provider fetch failed: {exc}", *provider_warning],
                             metadata={
                                 "asset": universe_asset.__dict__,
                                 "row_count": 0,
-                                "start_date": start_date,
-                                "end_date": end_date,
+                                "requested_start_date": start_date,
+                                "requested_end_date": end_date,
+                                "effective_start_date": effective_start_date,
                                 "provider": provider.__class__.__name__,
                                 "error": str(exc),
+                                **incremental_metadata,
                             },
                         ),
                     )
@@ -134,7 +167,7 @@ def ingest_mvp_universe(
                 warnings = validate_price_records(prices, asset_key=asset_key)
                 rows = 0
                 for price in prices:
-                    upsert_price_daily(conn, asset_id=asset_id, source=universe_asset.source, price=price)
+                    upsert_price_daily(conn, asset_id=asset_id, source=provider_source, price=price)
                     rows += 1
                 if universe_asset.asset_type == "fund" and hasattr(provider, "fund_info"):
                     try:
@@ -144,7 +177,7 @@ def ingest_mvp_universe(
                             raise
                         warnings.append(f"{asset_key}: fund info fetch failed: {exc}")
                     else:
-                        upsert_fund_info(conn, asset_id=asset_id, source=universe_asset.source, info=info)
+                        upsert_fund_info(conn, asset_id=asset_id, source=provider_source, info=info)
                 upsert_data_quality_report(
                     conn,
                     build_quality_report(
@@ -154,16 +187,54 @@ def ingest_mvp_universe(
                         metadata={
                             "asset": universe_asset.__dict__,
                             "row_count": len(prices),
-                            "start_date": start_date,
-                            "end_date": end_date,
+                            "requested_start_date": start_date,
+                            "requested_end_date": end_date,
+                            "effective_start_date": effective_start_date,
                             "provider": provider.__class__.__name__,
+                            **incremental_metadata,
                         },
                     ),
                 )
                 summary[asset_key] = rows
-            complete_task_log(conn, log_id, status="success", message=f"Ingested {sum(summary.values())} rows")
+            provider_diagnostics = _provider_diagnostics(provider)
+            ingest_warnings.extend(provider_diagnostics.get("throttling_warnings", []))
+            complete_task_log(
+                conn,
+                log_id,
+                status="success",
+                message=json.dumps(
+                    {
+                        "rows": sum(summary.values()),
+                        "assets": len(assets),
+                        "requested_start_date": start_date,
+                        "requested_end_date": end_date,
+                        "provider": provider.__class__.__name__,
+                        "provider_diagnostics": provider_diagnostics,
+                        "warnings": ingest_warnings,
+                    },
+                    ensure_ascii=False,
+                ),
+            )
         except Exception as exc:
-            complete_task_log(conn, log_id, status="failed", error=str(exc))
+            provider_diagnostics = _provider_diagnostics(provider)
+            complete_task_log(
+                conn,
+                log_id,
+                status="failed",
+                message=json.dumps(
+                    {
+                        "rows": sum(summary.values()),
+                        "assets": len(assets),
+                        "requested_start_date": start_date,
+                        "requested_end_date": end_date,
+                        "provider": provider.__class__.__name__,
+                        "provider_diagnostics": provider_diagnostics,
+                        "warnings": [*ingest_warnings, *provider_diagnostics.get("throttling_warnings", [])],
+                    },
+                    ensure_ascii=False,
+                ),
+                error=str(exc),
+            )
             conn.commit()
             raise
 
@@ -218,3 +289,70 @@ def filter_existing_universe_assets(db_path: str | Path, universe: list[Universe
         for asset in universe
         if (asset.code, asset.asset_type, asset.market, asset.source) not in existing
     ]
+
+
+def _incremental_start_date(
+    conn,
+    asset_id: int,
+    source: str,
+    requested_start_date: str,
+    requested_end_date: str,
+) -> tuple[str | None, dict[str, object]]:
+    requested_start = _parse_date(requested_start_date)
+    requested_end = _parse_date(requested_end_date)
+    latest = conn.execute(
+        """
+        SELECT MAX(trade_date) AS latest_trade_date
+        FROM price_daily
+        WHERE asset_id = ? AND source = ?
+        """,
+        (asset_id, source),
+    ).fetchone()["latest_trade_date"]
+    metadata: dict[str, object] = {
+        "incremental": True,
+        "latest_local_trade_date": latest,
+    }
+    if not latest:
+        metadata["incremental_action"] = "full_requested_range"
+        return _compact_date(requested_start), metadata
+    next_date = _parse_date(str(latest)) + timedelta(days=1)
+    effective_start = max(requested_start, next_date)
+    if effective_start > requested_end:
+        metadata["incremental_action"] = "skip_already_current"
+        metadata["effective_start_date"] = None
+        return None, metadata
+    metadata["incremental_action"] = "resume_after_latest_local_date"
+    metadata["effective_start_date"] = _compact_date(effective_start)
+    return _compact_date(effective_start), metadata
+
+
+def _provider_diagnostics(provider: object) -> dict[str, object]:
+    diagnostics = getattr(provider, "diagnostics", None)
+    if callable(diagnostics):
+        try:
+            value = diagnostics()
+        except Exception as exc:
+            return {"diagnostics_error": str(exc)}
+        if isinstance(value, dict):
+            return value
+    return {}
+
+
+def _provider_warning(asset_key: str, exc: Exception) -> list[str]:
+    text = str(exc).lower()
+    warnings = []
+    if "returned no history" in text or "no history" in text or "empty" in text:
+        warnings.append(f"{asset_key}: provider returned an empty response; use incremental retry instead of repeated full-history downloads")
+    if any(marker in text for marker in ("429", "403", "too many", "rate limit", "captcha", "anti", "访问过于频繁", "限流", "验证码")):
+        warnings.append(f"{asset_key}: possible provider throttling or anti-bot response; slow down before retrying")
+    return warnings
+
+
+def _parse_date(value: str) -> date:
+    text = str(value)
+    fmt = "%Y-%m-%d" if "-" in text else "%Y%m%d"
+    return datetime.strptime(text, fmt).date()
+
+
+def _compact_date(value) -> str:
+    return value.strftime("%Y%m%d")

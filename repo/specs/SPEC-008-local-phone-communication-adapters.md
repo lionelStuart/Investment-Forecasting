@@ -43,6 +43,10 @@ prompts from the local Mac to an allowlisted phone identity.
 - `Inbound Command`: A future optional phone-originated instruction. First
   implementation should prefer outbound-only notifications; inbound commands
   require explicit security and confirmation gates.
+- `Command Nonce`: A short-lived single-use token that binds a phone command to
+  one outbound prompt or local WebUI confirmation.
+- `Command Audit Record`: A persisted record of a parsed inbound command,
+  validation result, confirmation state, execution status, and any error.
 
 ## Requirements
 
@@ -82,26 +86,69 @@ prompts from the local Mac to an allowlisted phone identity.
 - Initial implementation should be outbound-only. Any inbound command support
   must require an allowlist, command parser, confirmation flow, and audit log.
 
+### Inbound Command Design
+
+- iMessage is approved for outbound notifications only. It is not an approved
+  inbound command transport for this system because macOS Messages history is
+  private, broad, brittle to parse safely, and does not provide strong
+  application-level authentication or nonce guarantees.
+- Future inbound commands must use a safer purpose-built channel, such as a
+  local WebUI confirmation flow or future app bridge, before any execution
+  path is added.
+- Allowed future command families are limited to non-trading operations:
+  acknowledgement of a warning, request to regenerate a Jarvis report with
+  existing settings, status/report resend, pause/resume non-critical
+  notifications, and local WebUI follow-up/reminder creation.
+- Forbidden command families include live trading, real-money buy/sell/rebalance
+  or transfer, risk-limit or user-preference changes without local WebUI
+  confirmation, model/expert promotion changes, recipient/allowlist changes,
+  safety/audit disabling, arbitrary shell/SQL/Python/AppleScript/MCP/agent
+  execution, private Messages history scraping, and broad contact discovery.
+- Every future inbound command must pass:
+  - sender allowlist check;
+  - channel and device trust check;
+  - command parser whitelist;
+  - short freshness window;
+  - single-use nonce or challenge binding;
+  - rate limit;
+  - explicit confirmation for any side effect beyond acknowledgement;
+  - persisted command audit before execution.
+- The command audit record must include sender key, channel, raw command
+  summary, normalized command type, nonce hash, received timestamp, validation
+  status, confirmation status, execution status, linked outbound message or
+  prompt, and structured error details.
+- Inbound command failure must be fail-closed and must never change investment
+  state, communication allowlists, safety settings, or local execution
+  permissions.
+
 ### Use Cases
 
 - Daily workflow completed: send a concise market stance, top watch condition,
   and link/path back to WebUI.
 - Daily workflow failed: send failed stage, user-facing impact, and recovery
   command.
-- Expert plan ready: send three expert stances and whether each expert traded
+- Expert plan ready: send four expert stances and whether each expert traded
   or stayed in cash.
 - Expert warning/retirement: send score, drawdown, failure lesson, and
   replacement status.
 - Data provider blocked: send throttling/provider warning and next retry
   guidance.
+- Notification templates must render from stored evidence and route through the
+  channel-neutral communication service so idempotency, allowlist, dry-run, and
+  send audit behavior stay consistent across daily and expert workflows.
+- Jarvis daily summaries should use the same template and service path,
+  rendering only concise focus, stance, model, expert, risk, and local WebUI
+  inspection hints from persisted Jarvis evidence.
 
 ### WebUI And CLI
 
 - WebUI should expose communication status, last sent messages, and adapter
-  setup health.
+  setup health. Recipient identities should be masked in primary UI surfaces,
+  and raw payloads should stay out of the primary experience.
 - CLI should support:
   - listing adapters;
-  - verifying iMessage setup;
+  - verifying iMessage setup, including a config/allowlist-only mode for CI or
+    local checks that should not probe Messages;
   - sending a dry-run test message;
   - sending a real allowlisted test message after explicit configuration;
   - inspecting recent outbound messages.
@@ -119,6 +166,8 @@ prompts from the local Mac to an allowlisted phone identity.
 - No live trading or real-money execution from a phone message.
 - No scraping private Messages history by default.
 - No broad contact discovery.
+- No inbound iMessage parsing for command execution in the current
+  architecture.
 - No unprompted sending to arbitrary phone numbers or Apple IDs.
 - No dependency on iMessage for core research computation; communication
   failure must not break data, forecast, advice, or expert workflows.
@@ -132,6 +181,11 @@ prompts from the local Mac to an allowlisted phone identity.
 - Daily workflow can optionally trigger communication without failing the whole
   research run when sending fails.
 - Messages use safe research-support language and avoid raw JSON.
+- Safe inbound command design exists before implementation. The design must
+  identify allowed commands, forbidden commands, authentication, allowlist,
+  confirmation, replay protection, audit requirements, and adapter constraints.
+- iMessage remains outbound-only unless a later ADR/task replaces this decision
+  with a safer validated inbound transport.
 - Tests cover dry-run, allowlist rejection, idempotency, adapter failure, and
   template rendering.
 
@@ -142,3 +196,4 @@ prompts from the local Mac to an allowlisted phone identity.
 - `TASK-044`: Daily workflow and expert notification templates.
 - `TASK-045`: Communication WebUI, CLI inspection, and setup health.
 - `TASK-046`: Safe inbound command design for future phone replies.
+- `TASK-051`: Jarvis phone summary template.

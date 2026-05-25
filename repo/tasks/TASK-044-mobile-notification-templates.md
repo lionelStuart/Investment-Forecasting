@@ -2,7 +2,7 @@
 
 ## Status
 
-pending
+completed
 
 ## Purpose
 
@@ -43,6 +43,34 @@ daily research, failures, and expert updates.
   workflow.
 - Templates include research-support or virtual-simulation wording where
   appropriate.
+
+## Completion Notes
+
+- Added `src/investment_forecasting/communication/templates.py` with safe
+  concise notification templates for:
+  - daily workflow success;
+  - daily workflow failure;
+  - provider warning;
+  - expert plan ready;
+  - expert probation/warning;
+  - expert retirement/replacement.
+- Templates render from persisted Jarvis/daily advice, expert plans, expert
+  reviews, and run-step evidence. They avoid raw JSON and include
+  research-support or virtual-simulation language.
+- Added `send_rendered_notification` so callers reuse the existing
+  communication service for allowlist, idempotency, dry-run, adapter policy,
+  and outbound audit records.
+- Added optional notification hooks to:
+  - `daily run` / `run_daily_workflow`;
+  - `experts run-plans`;
+  - `experts score`.
+- Notification sends are opt-in through `--notify-recipient-key`, can be forced
+  dry-run with `--notification-dry-run`, and are non-blocking for research or
+  expert workflows.
+
+## Verification
+
+- `python3 -m pytest tests/test_communication.py tests/test_daily_workflow.py tests/test_experts.py tests/test_expert_scoring.py`
 
 ## Depends On
 

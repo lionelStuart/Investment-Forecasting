@@ -9,12 +9,23 @@ REQUIRED_TABLES = {
     "assets",
     "price_daily",
     "fund_info",
+    "news_items",
+    "news_item_links",
+    "news_item_tags",
+    "news_feature_daily",
     "features_daily",
     "model_predictions",
+    "model_prediction_reliability",
     "backtest_runs",
     "backtest_results",
     "daily_advice",
     "task_logs",
+    "agent_runs",
+    "agent_tool_calls",
+    "scheduler_jobs",
+    "scheduler_runs",
+    "scheduler_watermarks",
+    "provider_rate_limits",
     "user_preferences",
     "experts",
     "virtual_portfolios",
@@ -27,6 +38,12 @@ REQUIRED_TABLES = {
     "expert_scorecards",
     "expert_reviews",
     "expert_lessons",
+    "ai_analysis_records",
+    "jarvis_daily_briefs",
+    "model_monitoring_reports",
+    "communication_recipients",
+    "communication_adapter_configs",
+    "outbound_messages",
 }
 
 
@@ -77,6 +94,80 @@ def test_init_db_adds_missing_fund_info_columns_to_legacy_database(tmp_path):
         columns = {row["name"] for row in conn.execute("PRAGMA table_info(fund_info)").fetchall()}
 
     assert {"fund_company", "custodian", "purchase_fee", "benchmark", "strategy", "objective", "stage_returns_json"}.issubset(columns)
+
+
+def test_init_db_adds_missing_advice_benchmark_identity_columns_to_legacy_database(tmp_path):
+    db_path = tmp_path / "legacy_advice_scores.sqlite3"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """
+            CREATE TABLE advice_outcome_scores (
+              id INTEGER PRIMARY KEY,
+              advice_id INTEGER NOT NULL,
+              horizon_days INTEGER NOT NULL,
+              outcome_date TEXT NOT NULL,
+              portfolio_return REAL,
+              benchmark_return REAL,
+              benchmark_excess REAL,
+              drawdown_control REAL,
+              prediction_score REAL,
+              risk_score REAL,
+              advice_score REAL,
+              overall_score REAL,
+              details_json TEXT NOT NULL,
+              created_at TEXT NOT NULL DEFAULT (datetime('now')),
+              updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+              UNIQUE (advice_id, horizon_days)
+            )
+            """
+        )
+
+    init_db(db_path)
+
+    with connect(db_path) as conn:
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(advice_outcome_scores)").fetchall()}
+
+    assert {"benchmark_identity", "benchmark_source"}.issubset(columns)
+
+
+def test_init_db_adds_prediction_reliability_table_to_legacy_database(tmp_path):
+    db_path = tmp_path / "legacy_prediction_reliability.sqlite3"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """
+            CREATE TABLE model_predictions (
+              id INTEGER PRIMARY KEY,
+              asset_id INTEGER,
+              prediction_date TEXT NOT NULL,
+              horizon_days INTEGER NOT NULL,
+              model_version TEXT NOT NULL,
+              target TEXT NOT NULL,
+              up_probability REAL,
+              expected_return REAL,
+              expected_return_low REAL,
+              expected_return_high REAL,
+              downside_risk REAL,
+              confidence REAL,
+              input_window_start TEXT,
+              input_window_end TEXT,
+              assumptions TEXT,
+              created_at TEXT NOT NULL DEFAULT (datetime('now')),
+              UNIQUE (asset_id, prediction_date, horizon_days, model_version, target)
+            )
+            """
+        )
+
+    init_db(db_path)
+
+    with connect(db_path) as conn:
+        assert "model_prediction_reliability" in table_names(conn)
+        assert "model_replay_runs" in table_names(conn)
+        assert "model_replay_predictions" in table_names(conn)
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(model_prediction_reliability)").fetchall()}
+        replay_columns = {row["name"] for row in conn.execute("PRAGMA table_info(model_replay_predictions)").fetchall()}
+
+    assert {"prediction_id", "rank_score", "same_category_rank", "risk_adjusted_score", "validation_status"}.issubset(columns)
+    assert {"replay_run_id", "score_status", "actual_return", "overall_score"}.issubset(replay_columns)
 
 
 def test_asset_upsert_is_idempotent(tmp_path):

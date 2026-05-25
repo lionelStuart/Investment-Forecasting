@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from investment_forecasting.advice.generator import generate_daily_advice
 from investment_forecasting.advice.scoring import score_matured_advice
-from investment_forecasting.db import connect, init_db, upsert_asset, upsert_price_daily
+from investment_forecasting.db import connect, init_db, upsert_asset, upsert_fund_info, upsert_price_daily
 from investment_forecasting.quant.backtest import run_backtest, run_latest_forecasts
 from investment_forecasting.quant.features import calculate_features_for_db
 
@@ -43,12 +43,42 @@ def seed_asset(conn, code: str, asset_type: str, values: list[float]) -> int:
     return asset_id
 
 
+def seed_fund_info(conn, asset_id: int, fund_type: str) -> None:
+    upsert_fund_info(
+        conn,
+        asset_id=asset_id,
+        source="test",
+        info={
+            "fund_type": fund_type,
+            "fund_company": None,
+            "manager": None,
+            "custodian": None,
+            "management_fee": None,
+            "custody_fee": None,
+            "purchase_fee": None,
+            "scale": None,
+            "inception_date": None,
+            "benchmark": None,
+            "strategy": None,
+            "objective": None,
+            "stage_returns_json": None,
+            "raw_payload": None,
+        },
+    )
+
+
 def test_score_matured_advice_updates_daily_advice_and_score_table(tmp_path):
     db_path = tmp_path / "advice_score.sqlite3"
     init_db(db_path)
     with connect(db_path) as conn:
         seed_asset(conn, "000300", "index", [100, 101, 102, 103, 104, 105, 106])
         seed_asset(conn, "TEST", "stock", [100, 102, 104, 106, 108, 110, 112])
+        fund_id = seed_asset(conn, "FUND", "fund", [100, 101, 103, 104, 106, 108, 110])
+        peer_a_id = seed_asset(conn, "PEER_A", "fund", [100, 100, 102, 103, 104, 105, 106])
+        peer_b_id = seed_asset(conn, "PEER_B", "fund", [100, 101, 102, 104, 105, 106, 107])
+        seed_fund_info(conn, fund_id, "混合型-偏股")
+        seed_fund_info(conn, peer_a_id, "偏股混合型")
+        seed_fund_info(conn, peer_b_id, "股票型")
     calculate_features_for_db(db_path)
     run_latest_forecasts(db_path, horizons=(2,))
     run_backtest(db_path, horizons=(2,), lookback_days=3)
@@ -63,6 +93,8 @@ def test_score_matured_advice_updates_daily_advice_and_score_table(tmp_path):
     assert scored[advice_id] == score["id"]
     assert score["outcome_date"] == "2026-01-03"
     assert score["benchmark_return"] is not None
+    assert score["benchmark_identity"].startswith("equal_weight:")
+    assert score["benchmark_source"] == "equal_weight_selected_benchmarks"
     assert score["benchmark_excess"] is not None
+    assert '"benchmark_peer_count"' in score["details_json"]
     assert advice["overall_score"] == score["overall_score"]
-

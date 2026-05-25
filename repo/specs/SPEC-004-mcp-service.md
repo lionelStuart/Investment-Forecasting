@@ -32,6 +32,7 @@ forecast/backtest workflows, and generate or read daily advice.
   - `run_backtest`
   - `get_daily_advice`
   - `generate_daily_advice`
+  - `search_news_evidence`
 
 ## Constraints
 
@@ -39,6 +40,9 @@ forecast/backtest workflows, and generate or read daily advice.
 - Tool schemas must document required and optional arguments.
 - Long-running tools should report progress through logs or structured status.
 - MCP must preserve auditability by referencing stored record IDs.
+- News evidence tools must return bounded, structured excerpts with evidence
+  IDs, filters, match reasons, and source timestamps. They must not return
+  unbounded news dumps or direct buy/sell advice.
 
 ## Error Cases
 
@@ -53,9 +57,10 @@ forecast/backtest workflows, and generate or read daily advice.
 - Tool responses include stable fields for AI consumption and WebUI reuse.
 - Errors are deterministic enough for an agent to recover or explain.
 - MCP integration tests or smoke tests cover the core tools.
+- News evidence search can be filtered by source, datetime range, asset,
+  theme, event type, sentiment, keyword, and max result count.
 
 ## Related Context
 
 - `ARCHITECTURE.md`
 - `tasks/TASK-006-mcp-tools.md`
-

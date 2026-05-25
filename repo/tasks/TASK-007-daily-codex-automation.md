@@ -2,7 +2,7 @@
 
 ## Status
 
-completed
+completed, superseded by `TASK-085` / `SPEC-013`
 
 ## Source
 
@@ -12,6 +12,10 @@ completed
 
 Configure a daily 08:00 Asia/Shanghai Codex automation that runs the complete
 data update, feature, forecast, score, and advice workflow.
+
+This was an early development convenience. Current product direction removes
+Codex app automation from the operational update path and replaces it with the
+system-owned incremental scheduler in `SPEC-013`.
 
 ## Required Context
 
@@ -71,6 +75,13 @@ Completed on 2026-05-23.
   wrote a successful `daily_workflow` task log.
 - Created active Codex app automation `investment-forecasting-daily-run` for
   daily 08:00 local time.
+
+## Supersession
+
+- The `investment-forecasting-daily-run` Codex app automation was deleted on
+  2026-05-24 as part of scheduler migration planning.
+- Future data/news refresh must be implemented through `SPEC-013` and
+  `TASK-085` through `TASK-089`.
 
 ## Follow-Ups
 

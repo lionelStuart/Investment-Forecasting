@@ -12,9 +12,11 @@ from investment_forecasting.data.ingestion import ingest_mvp_universe
 from investment_forecasting.quant.backtest import aggregate_scores, score_forecast
 from investment_forecasting.quant.features import calculate_features_for_db
 from investment_forecasting.quant.features import PricePoint
+from investment_forecasting.quant.forecast import MODEL_STATES, MODEL_VERSIONS, forecast_expected_return
 
 
-CANDIDATE_VERSIONS = ("baseline_mean_v1", "momentum_last_return_v1")
+CANDIDATE_VERSIONS = MODEL_VERSIONS
+MODEL_GOVERNANCE_STATES = ("baseline", "candidate", "contextual", "promoted", "degraded", "retired")
 
 
 class CalibrationError(RuntimeError):
@@ -63,6 +65,8 @@ def run_calibration_report(
             for window in windows
         ]
         metrics = evaluate_candidates(histories, windows, horizons=horizons, lookback_days=lookback_days)
+        governance = build_model_governance_summary(metrics)
+        metrics["governance"] = governance
         promoted_version, rationale = choose_promoted_version(metrics)
         report = {
             "report_date": target_date,
@@ -147,8 +151,16 @@ def evaluate_candidates(
                                 min(0.0, predicted_return),
                                 benchmark_return=benchmark_return,
                             )
+                            | {
+                                "predicted_return": predicted_return,
+                                "actual_return": actual_return,
+                                "up_probability": None,
+                                "asset_type": "unknown",
+                                "same_category_key": "unknown",
+                            }
                         )
             metrics = aggregate_scores(results)
+            metrics["model_state"] = MODEL_STATES[version]
             window_metrics["candidates"][version] = metrics
             if metrics["count"]:
                 candidate_scores[version].append(metrics)
@@ -164,45 +176,124 @@ def evaluate_candidates(
             "mean_risk_hit_rate": _avg(scores, "risk_hit_rate"),
             "mean_benchmark_excess": _avg(scores, "mean_benchmark_excess"),
             "mean_drawdown_control": _avg(scores, "mean_drawdown_control"),
+            "mean_rank_ic": _avg(scores, "rank_ic"),
+            "mean_bucket_spread": _avg(scores, "bucket_spread"),
+            "model_state": MODEL_STATES[version],
             "stability": _stability([score["mean_overall_score"] for score in scores if score["mean_overall_score"] is not None]),
         }
     return {"aggregate": aggregate, "windows": window_summaries}
 
 
 def candidate_prediction(version: str, history: list[PricePoint], horizon: int) -> float:
-    returns = [(history[index].value / history[index - 1].value) - 1.0 for index in range(1, len(history))]
-    if version == "baseline_mean_v1":
-        return mean(returns) * horizon
-    if version == "momentum_last_return_v1":
-        return returns[-1] * horizon
-    raise CalibrationError(f"Unknown candidate model: {version}")
+    try:
+        return forecast_expected_return(version, history, horizon)
+    except ValueError as exc:
+        raise CalibrationError(str(exc)) from exc
 
 
 def choose_promoted_version(metrics: dict[str, Any]) -> tuple[str | None, str]:
+    governance = metrics.get("governance") or build_model_governance_summary(metrics)
+    primary = governance["primary_decision"]
+    return primary["primary_model_version"], primary["rationale"]
+
+
+def build_model_governance_summary(metrics: dict[str, Any]) -> dict[str, Any]:
     aggregate = metrics["aggregate"]
     viable = {
         version: values
         for version, values in aggregate.items()
         if values["windows"] > 0 and values["mean_overall_score"] is not None
     }
-    if not viable:
-        return None, "No candidate produced enough out-of-sample backtest results."
-    ranked = sorted(
-        viable.items(),
-        key=lambda item: (
-            item[1]["mean_overall_score"] or 0,
-            item[1]["mean_risk_hit_rate"] or 0,
-            item[1]["stability"] or 0,
-        ),
-        reverse=True,
-    )
-    winner, values = ranked[0]
     baseline = viable.get("baseline_mean_v1")
-    if winner != "baseline_mean_v1" and baseline:
-        improvement = (values["mean_overall_score"] or 0) - (baseline["mean_overall_score"] or 0)
-        if improvement < 2.0:
-            return "baseline_mean_v1", "Candidate improvement was below the 2 point promotion threshold, so the baseline remains promoted."
-    return winner, f"{winner} had the strongest combined overall score, risk hit rate, and stability across available windows."
+    models = {}
+    for version, values in aggregate.items():
+        gates = _promotion_gate_results(version, values, baseline)
+        state = _governance_state(version, values, gates)
+        models[version] = {
+            "model_version": version,
+            "configured_state": MODEL_STATES.get(version, "candidate"),
+            "governance_state": state,
+            "promotion_gates": gates,
+            "demotion_gates": _demotion_gate_results(values),
+            "can_influence_jarvis_primary": state in {"baseline", "promoted"},
+            "requires_product_review": version != "baseline_mean_v1" and all(gate["passed"] for gate in gates),
+        }
+    eligible_candidates = [
+        version
+        for version, summary in models.items()
+        if version != "baseline_mean_v1" and summary["requires_product_review"]
+    ]
+    rationale = "baseline_mean_v1 remains the primary model; no candidate passed all promotion gates."
+    if eligible_candidates:
+        rationale = (
+            f"{','.join(eligible_candidates)} passed quantitative gates, but product review is required before primary promotion."
+        )
+    if not viable:
+        rationale = "No model produced enough out-of-sample validation evidence; no promotion is allowed."
+    return {
+        "states": list(MODEL_GOVERNANCE_STATES),
+        "models": models,
+        "primary_decision": {
+            "primary_model_version": "baseline_mean_v1" if baseline else None,
+            "decision": "hold_primary" if baseline else "no_primary_change",
+            "rationale": rationale,
+            "product_review_required_for_candidate_promotion": bool(eligible_candidates),
+            "eligible_candidates": eligible_candidates,
+        },
+    }
+
+
+def _promotion_gate_results(
+    version: str,
+    values: dict[str, Any],
+    baseline: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    improvement = None
+    if baseline and values.get("mean_overall_score") is not None and baseline.get("mean_overall_score") is not None:
+        improvement = float(values["mean_overall_score"]) - float(baseline["mean_overall_score"])
+    risk_delta = None
+    if baseline and values.get("mean_risk_hit_rate") is not None and baseline.get("mean_risk_hit_rate") is not None:
+        risk_delta = float(values["mean_risk_hit_rate"]) - float(baseline["mean_risk_hit_rate"])
+    drawdown_delta = None
+    if baseline and values.get("mean_drawdown_control") is not None and baseline.get("mean_drawdown_control") is not None:
+        drawdown_delta = float(values["mean_drawdown_control"]) - float(baseline["mean_drawdown_control"])
+    gates = [
+        _gate("stored_validation_evidence", (values.get("windows") or 0) >= 2, values.get("windows")),
+        _gate("beats_baseline_overall", version == "baseline_mean_v1" or (improvement is not None and improvement >= 2.0), improvement),
+        _gate("positive_rank_ic", values.get("mean_rank_ic") is not None and float(values["mean_rank_ic"]) > 0, values.get("mean_rank_ic")),
+        _gate("positive_bucket_spread", values.get("mean_bucket_spread") is not None and float(values["mean_bucket_spread"]) > 0, values.get("mean_bucket_spread")),
+        _gate("risk_not_worse_than_baseline", version == "baseline_mean_v1" or (risk_delta is not None and risk_delta >= -0.03), risk_delta),
+        _gate("drawdown_not_worse_than_baseline", version == "baseline_mean_v1" or (drawdown_delta is not None and drawdown_delta >= -0.03), drawdown_delta),
+        _gate("stable_across_windows", values.get("stability") is not None and float(values["stability"]) >= 80, values.get("stability")),
+    ]
+    return gates
+
+
+def _demotion_gate_results(values: dict[str, Any]) -> list[dict[str, Any]]:
+    return [
+        _gate("negative_rank_ic", values.get("mean_rank_ic") is not None and float(values["mean_rank_ic"]) < 0, values.get("mean_rank_ic")),
+        _gate("negative_bucket_spread", values.get("mean_bucket_spread") is not None and float(values["mean_bucket_spread"]) < 0, values.get("mean_bucket_spread")),
+        _gate("low_risk_hit_rate", values.get("mean_risk_hit_rate") is not None and float(values["mean_risk_hit_rate"]) < 0.55, values.get("mean_risk_hit_rate")),
+        _gate("insufficient_windows", (values.get("windows") or 0) < 2, values.get("windows")),
+    ]
+
+
+def _governance_state(version: str, values: dict[str, Any], promotion_gates: list[dict[str, Any]]) -> str:
+    if version == "baseline_mean_v1":
+        return "baseline"
+    if not values.get("windows"):
+        return "candidate"
+    if values.get("mean_rank_ic") is not None and float(values["mean_rank_ic"]) < 0:
+        return "degraded"
+    if values.get("mean_bucket_spread") is not None and float(values["mean_bucket_spread"]) < 0:
+        return "degraded"
+    if all(gate["passed"] for gate in promotion_gates):
+        return "contextual"
+    return "contextual"
+
+
+def _gate(name: str, passed: bool, value: Any) -> dict[str, Any]:
+    return {"gate": name, "passed": bool(passed), "value": value}
 
 
 def _avg(rows: list[dict[str, Any]], key: str) -> float | None:

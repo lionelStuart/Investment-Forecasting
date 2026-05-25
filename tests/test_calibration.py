@@ -71,10 +71,12 @@ def test_candidate_prediction_versions_are_distinct():
     ]
 
     baseline = candidate_prediction("baseline_mean_v1", history, horizon=2)
-    momentum = candidate_prediction("momentum_last_return_v1", history, horizon=2)
+    momentum = candidate_prediction("momentum_reversal_v1", history, horizon=2)
+    risk_adjusted = candidate_prediction("risk_adjusted_factor_v1", history, horizon=2)
 
     assert baseline != momentum
-    assert momentum == pytest.approx(((103 / 101) - 1) * 2)
+    assert risk_adjusted != baseline
+    assert risk_adjusted <= baseline
 
 
 def test_run_calibration_report_persists_idempotently(tmp_path):
@@ -98,8 +100,16 @@ def test_run_calibration_report_persists_idempotently(tmp_path):
     assert windows[0]["start_date"] == "2026-01-01"
     assert windows[-1]["end_date"] == "2026-03-16"
     assert set(metrics["aggregate"]) == set(CANDIDATE_VERSIONS)
+    assert metrics["governance"]["primary_decision"]["primary_model_version"] == "baseline_mean_v1"
+    assert metrics["governance"]["models"]["momentum_reversal_v1"]["governance_state"] in {"contextual", "degraded"}
+    assert metrics["governance"]["models"]["momentum_reversal_v1"]["requires_product_review"] in {False, True}
+    assert row["promoted_version"] == "baseline_mean_v1"
     assert "mean_benchmark_excess" in metrics["aggregate"]["baseline_mean_v1"]
     assert "mean_drawdown_control" in metrics["aggregate"]["baseline_mean_v1"]
+    assert "momentum_reversal_v1" in metrics["aggregate"]
+    assert "risk_adjusted_factor_v1" in metrics["aggregate"]
+    assert metrics["aggregate"]["momentum_reversal_v1"]["model_state"] == "candidate"
+    assert "mean_rank_ic" in metrics["aggregate"]["risk_adjusted_factor_v1"]
     assert row["rationale"]
 
 
@@ -127,4 +137,6 @@ def test_run_historical_calibration_corpus_can_use_existing_data(tmp_path):
     )
 
     assert result["ingest"] == {"skipped": True}
-    assert result["calibration"]["promoted_version"] in CANDIDATE_VERSIONS
+    assert result["calibration"]["promoted_version"] == "baseline_mean_v1"
+    metrics = json.loads(result["calibration"]["metrics_json"])
+    assert "governance" in metrics

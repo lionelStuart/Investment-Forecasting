@@ -1,13 +1,17 @@
-# SPEC-005: Daily Automation
+# SPEC-005: Historical Daily Workflow Automation
 
 ## Status
 
-draft
+superseded by `SPEC-013`
 
 ## Goal
 
-Run the full data update, feature calculation, forecasting, scoring, and daily
-advice generation workflow every day at 08:00 local time.
+Historical goal: run the full data update, feature calculation, forecasting,
+scoring, and daily advice generation workflow every day at 08:00 local time.
+
+Current direction: data/news refresh is owned by the system scheduler in
+`SPEC-013`, using hourly incremental jobs, watermarks, provider request caps,
+and backoff. Codex app automation is no longer the operational scheduler.
 
 ## Non-Goals
 
@@ -33,8 +37,11 @@ advice generation workflow every day at 08:00 local time.
   trading-day data and available overnight context.
 - The workflow must be safe to re-run for the same date.
 - Every step should emit enough structured status to diagnose failures.
-- Codex automation should call a deterministic project command or script rather
-  than relying on ad hoc prompts only.
+- The ingestion step should reuse local history and run provider calls through
+  the polite access policy so scheduled runs do not repeatedly fetch full
+  history or create unnecessary provider pressure.
+- Historical Codex automation must not be used as the product scheduler.
+  System scheduling must use `SPEC-013`.
 
 ## Error Cases
 
@@ -49,11 +56,10 @@ advice generation workflow every day at 08:00 local time.
 - Re-running the workflow for the same date updates or preserves records
   idempotently.
 - Success and failure paths write `task_logs`.
-- Codex automation is configured for 08:00 Asia/Shanghai time once the command
-  is available.
+- Historical 08:00 automation is superseded by system-owned scheduling.
 
 ## Related Context
 
 - `ARCHITECTURE.md`
-- `tasks/TASK-007-daily-codex-automation.md`
-
+- `tasks/TASK-007-daily-codex-automation.md` historical
+- `specs/SPEC-013-system-scheduler-incremental-updates.md`

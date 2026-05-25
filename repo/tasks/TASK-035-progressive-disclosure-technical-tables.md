@@ -2,7 +2,7 @@
 
 ## Status
 
-pending
+completed
 
 ## Purpose
 
@@ -90,6 +90,23 @@ not be part of the primary workflow.
   analysis-heavy page such as `/predictions` or `/backtests`.
 - Verify raw technical data remains available for debugging.
 - Run `python3 -m pytest tests/test_web_app.py`.
+
+## Completion Notes
+
+- Kept `/data`, `/funds`, and `/predictions` summary-first using their existing
+  selector, filters, cards, and collapsed technical-detail sections.
+- Reworked `/backtests` to show model-health summary, degraded-state warning,
+  and horizon score cards before raw run/result rows.
+- Reworked `/advice` to show evidence cards for prediction, backtest, market,
+  and focus-asset evidence before collapsed raw advice JSON.
+- Reworked `/settings` to show a human-readable active risk profile before the
+  editable form and saved-preference field table.
+- Reworked `/logs` to show run-health and failure guidance before collapsed raw
+  task logs.
+
+## Verification
+
+- `python3 -m pytest tests/test_web_app.py`
 
 ## Dependencies
 

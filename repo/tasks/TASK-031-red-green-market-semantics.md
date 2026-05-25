@@ -2,7 +2,7 @@
 
 ## Status
 
-pending
+completed
 
 ## Source
 
@@ -31,3 +31,21 @@ Apply consistent Chinese market color semantics across the WebUI: red for
   screening.
 - `CODE_INDEX.md` is updated if reusable formatting helpers or CSS conventions
   are added.
+
+## Implementation Notes
+
+- Added shared WebUI market-value formatting helpers:
+  `market_percent`, `plain_percent`, and table/stat-grid column/label
+  detection in `src/investment_forecasting/web/app.py`.
+- Positive return-like values now render red with an up arrow and `上涨`;
+  negative values render green with a down arrow and `下跌`; neutral values
+  render muted with a flat arrow and `持平`.
+- Dashboard summary stats, recommendations, prediction tables, fund screening
+  tables, category/data tables, Jarvis model/expert metrics, and expert return
+  views reuse the shared formatter.
+- Operational state styles such as task ok/warn/bad remain separate from
+  market gain/loss colors.
+
+## Verification
+
+- `python3 -m pytest tests/test_web_app.py`

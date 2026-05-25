@@ -2,7 +2,7 @@
 
 ## Status
 
-pending
+completed
 
 ## Purpose
 
@@ -37,6 +37,26 @@ SQLite directly.
 - Dry-run test is available without sending a real phone message.
 - UI does not expose raw payloads or unmasked sensitive recipient data as the
   primary experience.
+
+## Completion Notes
+
+- Added `communication list-adapters` CLI inspection over persisted adapter
+  configs.
+- Added `/communication` WebUI route and nav entry with:
+  - communication status summary;
+  - iMessage adapter setup/preflight health;
+  - allowlisted recipient summary with masked addresses;
+  - WebUI dry-run test form that records a `dry_run` outbound message without
+    invoking Messages;
+  - recent outbound messages, recent error cards, and secondary technical
+    details without raw payloads as the primary view.
+- Reused the channel-neutral communication service for WebUI dry-run sends, so
+  allowlist, idempotency, policy, and outbound audit behavior stay consistent.
+
+## Verification
+
+- `python3 -m pytest tests/test_communication.py tests/test_web_app.py`
+- `python3 -m pytest`
 
 ## Depends On
 

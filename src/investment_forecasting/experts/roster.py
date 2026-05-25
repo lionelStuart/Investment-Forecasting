@@ -7,11 +7,21 @@ from typing import Any
 from investment_forecasting.db import connect, init_db, list_experts, upsert_expert
 
 
+DEFAULT_ACTIVE_EXPERT_COUNT = 4
+OBSOLETE_STYLE_NAMED_EXPERT_KEYS = {"defensive_income", "momentum_growth", "balanced_rotation"}
+OBSOLETE_STYLE_NAMED_EXPERT_SOURCE = "obsolete_style_named_v1"
+OBSOLETE_STYLE_NAMED_EXPERT_RENAMES = {
+    "defensive_income": "管仲（旧配置）",
+    "momentum_growth": "白圭（旧配置）",
+    "balanced_rotation": "范蠡（旧配置）",
+}
+
+
 DEFAULT_EXPERTS: tuple[dict[str, Any], ...] = (
     {
-        "expert_key": "defensive_income",
-        "name": "稳健防守专家",
-        "short_description": "优先控制回撤和流动性风险，只有在证据充分时才提高仓位。",
+        "expert_key": "guan_zhong",
+        "name": "管仲",
+        "short_description": "重视秩序、流动性和风险边界，只有在证据充分时才提高仓位。",
         "style_label": "防守收益 / 回撤控制",
         "focus_weights": {
             "volatility": 0.24,
@@ -29,9 +39,9 @@ DEFAULT_EXPERTS: tuple[dict[str, Any], ...] = (
         "mandate": "在高波动或弱市场状态下允许保持现金，不因短期踏空被单独惩罚。",
     },
     {
-        "expert_key": "momentum_growth",
-        "name": "趋势进攻专家",
-        "short_description": "寻找趋势和成长参与机会，但必须在回撤或置信度恶化时降低暴露。",
+        "expert_key": "bai_gui",
+        "name": "白圭",
+        "short_description": "偏好趋势与时机，寻找成长参与机会，但必须在回撤或置信度恶化时降低暴露。",
         "style_label": "趋势动量 / 成长参与",
         "focus_weights": {
             "return_20d": 0.2,
@@ -50,9 +60,9 @@ DEFAULT_EXPERTS: tuple[dict[str, Any], ...] = (
         "mandate": "可以承担较高波动，但不得忽略下行风险、模型置信度下降和市场广度恶化。",
     },
     {
-        "expert_key": "balanced_rotation",
-        "name": "均衡轮动专家",
-        "short_description": "比较类别之间的风险调整收益，偏好分散和小步再平衡。",
+        "expert_key": "fan_li",
+        "name": "范蠡",
+        "short_description": "比较类别之间的风险调整收益，偏好分散、克制和小步再平衡。",
         "style_label": "均衡轮动 / 风险调整配置",
         "focus_weights": {
             "sharpe": 0.2,
@@ -70,6 +80,28 @@ DEFAULT_EXPERTS: tuple[dict[str, Any], ...] = (
         "lifecycle_state": "active",
         "mandate": "以组合均衡和证据质量为核心，避免单一资产或单一风格过度集中。",
     },
+    {
+        "expert_key": "sang_hongyang",
+        "name": "桑弘羊",
+        "short_description": "重视宏观环境、资金流向和跨资产配置，在风险变化时调整资产类别暴露。",
+        "style_label": "宏观配置 / 流动性观察",
+        "focus_weights": {
+            "market_snapshot_risk": 0.22,
+            "market_breadth": 0.16,
+            "benchmark_excess": 0.16,
+            "confidence": 0.14,
+            "cash_buffer": 0.14,
+            "volatility": 0.1,
+            "category_diversification": 0.08,
+        },
+        "risk_budget_pct": 0.5,
+        "max_drawdown_tolerance": 0.11,
+        "allowed_asset_categories": ["index", "etf", "fund"],
+        "default_cash_buffer_pct": 0.22,
+        "review_cadence_days": 20,
+        "lifecycle_state": "active",
+        "mandate": "以宏观与流动性证据调整配置，不因单一资产信号而过度集中。",
+    },
 )
 
 
@@ -78,11 +110,34 @@ def initialize_default_experts(db_path: str | Path) -> list[dict[str, Any]]:
     with connect(db_path) as conn:
         for expert in DEFAULT_EXPERTS:
             upsert_expert(conn, _serialize_expert(expert))
+        conn.execute(
+            """
+            UPDATE experts
+            SET lifecycle_state = 'retired',
+                name = CASE expert_key
+                    WHEN 'defensive_income' THEN ?
+                    WHEN 'momentum_growth' THEN ?
+                    WHEN 'balanced_rotation' THEN ?
+                    ELSE name
+                END,
+                source = ?,
+                updated_at = datetime('now')
+            WHERE lifecycle_state = 'active'
+              AND expert_key IN ({})
+            """.format(",".join("?" for _ in OBSOLETE_STYLE_NAMED_EXPERT_KEYS)),
+            (
+                OBSOLETE_STYLE_NAMED_EXPERT_RENAMES["defensive_income"],
+                OBSOLETE_STYLE_NAMED_EXPERT_RENAMES["momentum_growth"],
+                OBSOLETE_STYLE_NAMED_EXPERT_RENAMES["balanced_rotation"],
+                OBSOLETE_STYLE_NAMED_EXPERT_SOURCE,
+                *tuple(sorted(OBSOLETE_STYLE_NAMED_EXPERT_KEYS)),
+            ),
+        )
         rows = list_experts(conn, lifecycle_state="active")
 
     active = [_deserialize_expert(dict(row)) for row in rows]
-    if len(active) != len(DEFAULT_EXPERTS):
-        raise RuntimeError(f"Expected {len(DEFAULT_EXPERTS)} active experts, found {len(active)}")
+    if len(active) != DEFAULT_ACTIVE_EXPERT_COUNT:
+        raise RuntimeError(f"Expected {DEFAULT_ACTIVE_EXPERT_COUNT} active experts, found {len(active)}")
     return active
 
 

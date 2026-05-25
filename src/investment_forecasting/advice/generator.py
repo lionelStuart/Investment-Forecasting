@@ -6,12 +6,14 @@ from pathlib import Path
 from statistics import mean
 from typing import Any
 
+from investment_forecasting.advice.allocation import build_correlation_risk_budget_proposal, build_target_volatility_proposal
 from investment_forecasting.db import (
     active_user_preference,
     complete_task_log,
     connect,
     init_db,
     latest_backtest_runs,
+    latest_capital_flow_observations,
     latest_market_snapshot,
     latest_model_predictions,
     start_task_log,
@@ -56,6 +58,7 @@ def generate_daily_advice(db_path: str | Path, advice_date: str | None = None) -
             predictions = latest_model_predictions(conn)
             backtest_runs = latest_backtest_runs(conn)
             market_snapshot = latest_market_snapshot(conn)
+            capital_flows = latest_capital_flow_observations(conn, limit=12)
             user_preference = active_user_preference(conn)
             if not predictions:
                 raise AdviceGenerationError("Cannot generate advice without model_predictions evidence")
@@ -63,10 +66,12 @@ def generate_daily_advice(db_path: str | Path, advice_date: str | None = None) -
                 raise AdviceGenerationError("Cannot generate advice without backtest_runs evidence")
 
             record = build_daily_advice_record(
+                conn,
                 target_date,
                 predictions,
                 backtest_runs,
                 market_snapshot=market_snapshot,
+                capital_flows=capital_flows,
                 user_preference=user_preference,
             )
             check_compliance(
@@ -91,10 +96,12 @@ def generate_daily_advice(db_path: str | Path, advice_date: str | None = None) -
 
 
 def build_daily_advice_record(
+    conn: Any,
     target_date: str,
     predictions: list[Any],
     backtest_runs: list[Any],
     market_snapshot: Any | None = None,
+    capital_flows: list[Any] | None = None,
     user_preference: Any | None = None,
 ) -> dict[str, Any]:
     avg_expected = mean(float(row["expected_return"]) for row in predictions if row["expected_return"] is not None)
@@ -108,6 +115,17 @@ def build_daily_advice_record(
     preferred_horizon = int(user_preference["investment_horizon_days"]) if user_preference else 20
     if user_preference:
         policy = _apply_user_constraints(policy, user_preference)
+    target_volatility = build_target_volatility_proposal(
+        conn,
+        target_date=target_date,
+        user_preference=user_preference,
+    )
+    risk_budget = build_correlation_risk_budget_proposal(
+        conn,
+        target_date=target_date,
+        target_volatility=target_volatility,
+    )
+    capital_flow_summary = _capital_flow_summary(capital_flows or [])
     source_prediction_ids = [int(row["id"]) for row in predictions]
     backtest_run_ids = [int(row["id"]) for row in backtest_runs]
     latest_prediction_date = max(row["prediction_date"] for row in predictions)
@@ -129,6 +147,12 @@ def build_daily_advice_record(
             f"宽度为 {_fmt_pct(market_snapshot['breadth'])}，"
             f"流动性热度为 {_fmt_num(market_snapshot['liquidity_heat'])}。"
         )
+    if capital_flow_summary["status"] == "available":
+        market_summary += (
+            f" 最新资金流观测覆盖 {capital_flow_summary['count']} 个对象，"
+            f"主力净流入 {capital_flow_summary['positive_count']} 个、"
+            f"净流出 {capital_flow_summary['negative_count']} 个。"
+        )
     if user_preference:
         market_summary += (
             f" 当前活跃风险设置为 {user_preference['profile_name']}，"
@@ -147,6 +171,23 @@ def build_daily_advice_record(
             f" 仓位区间已应用用户约束：权益上限 {float(user_preference['max_equity_pct']):.0%}，"
             f"现金下限 {float(user_preference['min_cash_pct']):.0%}。"
         )
+    if target_volatility["status"] == "ready":
+        weights = target_volatility["proposed_weights"]
+        assumptions += (
+            f" 目标波动率提案基于 {target_volatility['evidence']['asset_count']} 个资产的入库风险指标，"
+            f"建议权益 {weights['equity']:.0%}、固收 {weights['fixed_income']:.0%}、现金 {weights['cash']:.0%}。"
+        )
+    if risk_budget["status"] == "ready":
+        correlation = risk_budget["correlation"]
+        assumptions += (
+            f" 相关性风险预算基于 {correlation['pair_count']} 组成对资产收益序列，"
+            f"平均绝对相关性 {correlation['average_abs_correlation']:.2f}。"
+        )
+    if capital_flow_summary["status"] == "available":
+        assumptions += (
+            f" 资金流证据来自 {capital_flow_summary['latest_date']} 的入库观测，"
+            "仅用于流动性与拥挤度辅助判断，不单独构成买卖依据。"
+        )
     risk_warnings = (
         "本系统输出是投资研究和辅助决策参考，不构成直接买卖指令。市场可能受政策、流动性、"
         "行业事件和数据延迟影响，预测区间和仓位范围需要结合个人风险承受能力复核。"
@@ -164,10 +205,16 @@ def build_daily_advice_record(
             "source_prediction_ids": source_prediction_ids,
             "backtest_run_ids": backtest_run_ids,
             "market_snapshot_id": int(market_snapshot["id"]) if market_snapshot else None,
+            "capital_flow_ids": [int(row["id"]) for row in (capital_flows or [])],
+            "target_volatility_feature_ids": target_volatility["evidence"]["feature_ids"],
+            "risk_budget_asset_ids": risk_budget["evidence"]["asset_ids"],
         },
         "user_preference": _preference_payload(user_preference),
         "focus_assets": focus_assets,
         "cautious_assets": cautious_assets,
+        "target_volatility": target_volatility,
+        "risk_budget": risk_budget,
+        "capital_flow": capital_flow_summary,
     }
 
     return {
@@ -194,6 +241,37 @@ def check_compliance(text: str) -> None:
     for phrase in PROHIBITED_PHRASES:
         if phrase.lower() in lower_text:
             raise ComplianceError(f"Prohibited advice language detected: {phrase}")
+
+
+def _capital_flow_summary(rows: list[Any]) -> dict[str, Any]:
+    if not rows:
+        return {"status": "missing", "count": 0, "latest_date": None, "positive_count": 0, "negative_count": 0, "top_inflows": [], "top_outflows": []}
+    normalized = [dict(row) for row in rows]
+    positive = [row for row in normalized if (row.get("main_net_inflow") or 0) > 0]
+    negative = [row for row in normalized if (row.get("main_net_inflow") or 0) < 0]
+    top_inflows = sorted(positive, key=lambda row: float(row.get("main_net_inflow") or 0), reverse=True)[:3]
+    top_outflows = sorted(negative, key=lambda row: float(row.get("main_net_inflow") or 0))[:3]
+    return {
+        "status": "available",
+        "count": len(normalized),
+        "latest_date": max(row["flow_date"] for row in normalized if row.get("flow_date")),
+        "positive_count": len(positive),
+        "negative_count": len(negative),
+        "top_inflows": [_capital_flow_view(row) for row in top_inflows],
+        "top_outflows": [_capital_flow_view(row) for row in top_outflows],
+    }
+
+
+def _capital_flow_view(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": row.get("id"),
+        "flow_date": row.get("flow_date"),
+        "scope": row.get("scope"),
+        "subject_code": row.get("subject_code"),
+        "subject_name": row.get("subject_name"),
+        "main_net_inflow": row.get("main_net_inflow"),
+        "main_net_inflow_pct": row.get("main_net_inflow_pct"),
+    }
 
 
 def _risk_level(avg_expected: float, avg_downside: float, backtest_score: float | None) -> str:

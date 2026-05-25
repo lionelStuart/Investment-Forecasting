@@ -6,19 +6,22 @@ completed
 
 ## Purpose
 
-Create the durable expert model required for a three-expert investment
+Create the durable expert model required for a four-expert investment
 committee. Each expert must have a distinct style, signal focus, risk limits,
 allowed asset categories, lifecycle state, and audit trail.
 
 ## Scope
 
 - Add expert roster persistence.
-- Seed or create the initial three experts:
-  - defensive income/drawdown control;
-  - momentum/growth participation;
-  - balanced rotation/risk-adjusted allocation.
+- Seed or create the initial four experts using historical persona names:
+  - 管仲: defensive income/drawdown control;
+  - 白圭: momentum/growth participation;
+  - 范蠡: balanced rotation/risk-adjusted allocation;
+  - 桑弘羊: macro allocation/liquidity observation.
 - Store style, focus weights, risk limits, allowed categories, default cash
   buffer, review cadence, and lifecycle state.
+- Keep style as structured metadata; do not use style labels as fixed expert
+  names.
 - Add query/upsert helpers and tests.
 - Document module ownership in `ARCHITECTURE.md` and `CODE_INDEX.md`.
 
@@ -41,7 +44,7 @@ allowed asset categories, lifecycle state, and audit trail.
 ## Acceptance Criteria
 
 - SQLite stores experts with lifecycle state and structured configuration.
-- A command or service function can initialize exactly three active experts.
+- A command or service function can initialize exactly four active experts.
 - Expert records are idempotent and can be queried in stable order.
 - Tests cover creation, update, active roster filtering, and lifecycle status.
 
@@ -55,9 +58,9 @@ allowed asset categories, lifecycle state, and audit trail.
 - Added the `experts` SQLite table with lifecycle state, risk limits, focus
   weights, allowed categories, default cash buffer, review cadence, mandate,
   and audit timestamps.
-- Added `investment_forecasting.experts.roster` with the three default active
-  experts from `SPEC-007`, idempotent initialization, and structured roster
-  listing.
+- Added `investment_forecasting.experts.roster` with the four default active
+  experts from `SPEC-007`, idempotent initialization, structured roster
+  listing, and legacy retirement for older style-named experts.
 - Added persistence helpers for expert upsert, lookup, stable listing, and
   active/lifecycle filtering.
 - Added CLI inspection commands:

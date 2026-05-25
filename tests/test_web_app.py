@@ -1,14 +1,30 @@
 from __future__ import annotations
 
 from investment_forecasting.advice.generator import generate_daily_advice
-from investment_forecasting.db import connect, init_db, upsert_asset, upsert_expert, upsert_fund_info, upsert_price_daily
+from investment_forecasting.db import (
+    connect,
+    init_db,
+    upsert_asset,
+    upsert_communication_adapter_config,
+    upsert_communication_recipient,
+    upsert_expert,
+    upsert_fund_info,
+    upsert_price_daily,
+)
 from investment_forecasting.experts.roster import initialize_default_experts
-from investment_forecasting.portfolio.accounting import ensure_expert_portfolios
+from investment_forecasting.jarvis.synthesis import generate_jarvis_brief
+from investment_forecasting.portfolio.accounting import create_virtual_portfolio, ensure_expert_portfolios, record_virtual_order, value_virtual_portfolio
 from investment_forecasting.quant.backtest import run_backtest, run_latest_forecasts
 from investment_forecasting.quant.features import calculate_features_for_db
 from investment_forecasting.quant.market import calculate_market_snapshot
+from investment_forecasting.quant.monitoring import run_model_monitoring_report
+from investment_forecasting.scheduler import initialize_scheduler, record_provider_failure, run_scheduler_job
 from investment_forecasting.web.app import render_route
 from tests.test_daily_workflow import seed_asset_with_prices
+
+
+def primary_nav(html: str) -> str:
+    return html.split("<nav>", 1)[1].split("</nav>", 1)[0]
 
 
 def prepare_web_db(tmp_path):
@@ -22,12 +38,51 @@ def prepare_web_db(tmp_path):
     seed_fund_info(db_path, balanced_fund_id, "混合型-偏股", "张经理", 26.4, 0.15)
     seed_fund_info(db_path, aggressive_fund_id, "股票型", "王经理", 8.2, None)
     seed_fund_info(db_path, missing_meta_fund_id, None, None, None, None)
-    seed_typed_asset(db_path, "600519", "贵州茅台", "stock", [1500, 1510, 1520, 1505, 1530, 1540, 1550])
+    stock_id = seed_typed_asset(db_path, "600519", "贵州茅台", "stock", [1500, 1510, 1520, 1505, 1530, 1540, 1550])
     calculate_features_for_db(db_path)
+    with connect(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO macro_observations(series_id, observation_date, value, source, raw_payload)
+            VALUES ('DGS10', '2026-05-22', 4.25, 'fred', '{}')
+            ON CONFLICT(series_id, observation_date, source) DO NOTHING
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO capital_flow_observations(
+                flow_date, scope, subject_code, subject_name, asset_id,
+                pct_change, main_net_inflow, main_net_inflow_pct,
+                super_large_net_inflow, large_net_inflow, medium_net_inflow,
+                small_net_inflow, source, raw_payload
+            )
+            VALUES (
+                '2026-05-22', 'stock', '600519', '贵州茅台', ?,
+                0.012, 12000000, 0.06, 3000000, 9000000, -1000000,
+                -11000000, 'test', '{}'
+            )
+            ON CONFLICT(scope, subject_code, flow_date, source) DO NOTHING
+            """,
+            (stock_id,),
+        )
+        conn.execute(
+            """
+            INSERT INTO fund_holdings(
+                fund_asset_id, report_period, holding_type, holding_code,
+                holding_name, holding_asset_id, weight_pct, shares,
+                market_value, rank, source, raw_payload
+            )
+            VALUES (?, '2024年4季度股票投资明细', 'stock', '600519',
+                    '贵州茅台', ?, 0.082, 120000, 18000000, 1, 'test', '{}')
+            ON CONFLICT(fund_asset_id, report_period, holding_type, holding_code, source) DO NOTHING
+            """,
+            (balanced_fund_id, stock_id),
+        )
     calculate_market_snapshot(db_path, snapshot_date="20260523")
     run_latest_forecasts(db_path, horizons=(5, 20, 60))
     run_backtest(db_path, horizons=(2,), lookback_days=3)
     generate_daily_advice(db_path, advice_date="20260523")
+    run_model_monitoring_report(db_path, report_date="20260523")
     return db_path
 
 
@@ -99,42 +154,166 @@ def test_dashboard_renders_empty_database(tmp_path):
     init_db(db_path)
 
     html = render_route(db_path, "/", {})
+    jarvis_html = render_route(db_path, "/jarvis", {})
 
-    assert "总览" in html
-    assert "数据状态" in html
+    assert "今日简报" in html
+    assert "贾维斯今日简报" in html
+    assert "今天怎么看?" in html
+    assert "为什么?" in html
+    assert "能不能信?" in html
+    assert "关注哪些资产?" in html
+    assert "专家是否一致?" in html
+    assert "风险边界和观察条件" in html
+    assert "三条理由" in html
+    assert "运行健康" in html
+    assert "数据采集" in html
+    assert "恢复提示" in html
+    assert "还没有 Jarvis 关注方向" in html
+    assert "还没有 Jarvis 简报" in jarvis_html
+    assert "数据新鲜度" in html
     assert "当前数据库" in html
     assert "没有资产或行情数据" in html
-    assert "暂无建议" in html
-    assert "暂无日志" in html
 
 
 def test_workbench_pages_render_with_data(tmp_path):
     db_path = prepare_web_db(tmp_path)
 
     seed_expert_web_state(db_path)
-    pages = ["/", "/timeline", "/categories", "/data", "/funds", "/predictions", "/backtests", "/advice", "/experts", "/settings", "/logs"]
+    seed_communication_web_state(db_path)
+    generate_jarvis_brief(db_path, brief_date="20260523")
+    pages = ["/", "/opportunities", "/experts", "/evidence", "/settings", "/jarvis", "/timeline", "/market", "/categories", "/themes", "/data", "/funds", "/predictions", "/backtests", "/advice", "/portfolios", "/communication", "/logs"]
     rendered = {page: render_route(db_path, page, {}) for page in pages}
 
-    assert "市场状态" in rendered["/"]
-    assert "研究时间线" in rendered["/"]
-    assert "数据状态" in rendered["/"]
+    nav = primary_nav(rendered["/"])
+    assert nav.count("<a ") == 5
+    assert "今日简报" in nav
+    assert "机会池" in nav
+    assert "专家团" in nav
+    assert "证据" in nav
+    assert "设置" in nav
+    for legacy_label in ["研究时间线", "产品分类", "数据与曲线", "基金筛选", "预测", "回测评分", "每日建议", "风险设置", "任务日志"]:
+        assert legacy_label not in nav
+
+    assert "贾维斯今日简报" in rendered["/"]
+    assert "今天怎么看?" in rendered["/"]
+    assert "为什么?" in rendered["/"]
+    assert "能不能信?" in rendered["/"]
+    assert "关注哪些资产?" in rendered["/"]
+    assert "专家是否一致?" in rendered["/"]
+    assert "风险边界和观察条件" in rendered["/"]
+    assert "三条理由" in rendered["/"]
+    assert "运行健康" in rendered["/"]
+    assert "数据采集" in rendered["/"]
+    assert "指标计算" in rendered["/"]
+    assert "市场快照" in rendered["/"]
+    assert "模型预测" in rendered["/"]
+    assert "回测评分" in rendered["/"]
+    assert "每日建议" in rendered["/"]
+    assert "运行监控" in rendered["/"]
+    assert "恢复提示" in rendered["/"]
+    assert "风险设置" in rendered["/"]
+    assert "打开机会池" in rendered["/"]
+    assert "打开证据页" in rendered["/"]
+    assert "Jarvis 每日简报" in rendered["/jarvis"]
+    assert "今日关注方向" in rendered["/jarvis"]
+    assert "模型预测" in rendered["/jarvis"]
+    assert "专家观点" in rendered["/jarvis"]
+    assert "综合建议" in rendered["/jarvis"] or "均衡观察" in rendered["/jarvis"]
+    assert "风险与边界" in rendered["/jarvis"]
+    assert "证据入口" in rendered["/jarvis"]
+    assert 'href="/predictions"' in rendered["/jarvis"]
+    assert 'href="/backtests"' in rendered["/jarvis"]
+    assert 'href="/experts"' in rendered["/jarvis"]
+    assert "最近研究脉络" in rendered["/"]
+    assert "数据新鲜度" in rendered["/"]
     assert "当前数据库" in rendered["/"]
     assert "近期优先关注" in rendered["/"]
+    assert "market-signal market-up" in rendered["/"]
+    assert "上涨" in rendered["/"]
+    assert "机会池筛选" in rendered["/opportunities"]
+    assert "产品与资产入口" in rendered["/opportunities"]
+    assert "主题机会" in rendered["/opportunities"]
+    assert "资产级预测" in rendered["/opportunities"]
+    assert "基金候选" in rendered["/opportunities"]
+    assert 'href="/categories"' in rendered["/opportunities"]
+    assert "证据入口" in rendered["/evidence"]
+    assert "回测与模型健康" in rendered["/evidence"]
+    assert "市场与资金流" in rendered["/evidence"]
+    assert "数据覆盖" in rendered["/evidence"]
     assert "产品分类" in rendered["/categories"]
     assert "固收/现金代理" in rendered["/categories"]
+    assert "科技" in rendered["/categories"]
+    assert "主题配置" in rendered["/themes"]
+    assert "主题总览" in rendered["/themes"]
+    assert "代表标的" in rendered["/themes"]
+    assert "预测覆盖" in rendered["/themes"]
+    market_category = render_route(db_path, "/categories", {"category": ["market_indicator"]})
+    assert "查看市场指标" in market_category
+    assert 'href="/market"' in market_category
     assert "筛选条件" in rendered["/funds"]
+    assert "行业/主题" in rendered["/funds"]
     assert "筛选结果" in rendered["/funds"]
+    assert "基金持仓观测" in rendered["/funds"]
+    assert "持仓穿透主题暴露" in rendered["/funds"]
+    assert "2024年4季度股票投资明细" in rendered["/funds"]
+    assert "贵州茅台" in rendered["/funds"]
+    assert "消费" in rendered["/funds"]
+    assert "8.20%" in rendered["/funds"]
+    assert "科技" in rendered["/funds"]
+    assert "market-signal market-down" in rendered["/funds"]
+    assert "下跌" in rendered["/funds"]
     assert "涨幅曲线" in rendered["/data"]
+    assert "range-chip active" in rendered["/data"]
+    assert 'type="date" name="start_date"' in rendered["/data"]
+    assert "axis-label x-label" in rendered["/data"]
+    assert "curve-point" in rendered["/data"]
+    assert "curve-tooltip" in rendered["/data"]
+    assert "curve-capture" in rendered["/data"]
+    assert "point-guide-x" in rendered["/data"]
+    assert "point-guide-y" in rendered["/data"]
+    assert "point-hit" not in rendered["/data"]
+    assert "curve-readout" not in rendered["/data"]
+    assert 'data-role="date"' in rendered["/data"]
     assert "资产概览" in rendered["/data"]
+    assert "主题识别" in rendered["/data"]
     assert "技术明细" in rendered["/data"]
     assert "行情 / 净值历史" in rendered["/data"]
+    gated_html = render_route(db_path, "/jarvis", {})
+    assert "信心门" in gated_html or "模型预测" in gated_html
+    assert "validation_status" in gated_html
+    assert "risk_gate" in gated_html
     assert "模型预测" in rendered["/predictions"]
+    assert "资产级预测卡片" in rendered["/predictions"]
+    assert "原始模型预测" in rendered["/predictions"]
+    assert "5日" in rendered["/predictions"]
+    assert "20日" in rendered["/predictions"]
+    assert "60日" in rendered["/predictions"]
+    assert "消费" in rendered["/predictions"]
+    assert "market-signal market-up" in rendered["/predictions"]
     assert "回测任务" in rendered["/backtests"]
+    assert "模型健康" in rendered["/backtests"]
+    assert "baseline_mean_v1" in rendered["/backtests"]
     assert "每日建议" in rendered["/advice"]
+    assert "目标波动率配置" in rendered["/advice"]
+    assert "相关性风险预算" in rendered["/advice"]
+    assert "波动率证据" in rendered["/advice"]
+    assert "相关性证据" in rendered["/advice"]
+    assert "模拟组合" in rendered["/portfolios"]
     assert "专家委员会" in rendered["/experts"]
-    assert "最新计划与执行" in rendered["/experts"]
-    assert "权益曲线与基准" in rendered["/experts"]
-    assert "技术明细" in rendered["/experts"]
+    assert "专家总览" in rendered["/experts"]
+    assert "专家收益对比" in rendered["/experts"]
+    assert "总览投资 / 收益曲线" not in rendered["/experts"]
+    assert 'href="/experts?expert=' in rendered["/experts"]
+    assert "查看详情" in rendered["/experts"]
+    assert "最新计划与执行" not in rendered["/experts"]
+    assert "<table" not in rendered["/experts"]
+    assert "手机通信" in rendered["/communication"]
+    assert "通信状态" in rendered["/communication"]
+    assert "iMessage 设置健康" in rendered["/communication"]
+    assert "Allowlist 收件人" in rendered["/communication"]
+    assert "最近 outbound messages" in rendered["/communication"]
+    assert "+13***5678" in rendered["/communication"]
+    assert "+13800135678" not in rendered["/communication"]
     assert "连续研究记录" in rendered["/timeline"]
     assert "每日建议" in rendered["/timeline"]
     assert "模型预测" in rendered["/timeline"]
@@ -143,12 +322,40 @@ def test_workbench_pages_render_with_data(tmp_path):
     assert 'href="/advice?advice_id=' in rendered["/timeline"]
     assert 'href="/predictions"' in rendered["/timeline"]
     assert "缺失" in rendered["/timeline"]
+    assert "市场指标" in rendered["/market"]
+    assert "市场快照" in rendered["/market"]
+    assert "资金流观测" in rendered["/market"]
+    assert "主力净流入对象" in rendered["/market"]
+    assert "贵州茅台" in rendered["/market"]
+    assert "宏观观测" in rendered["/market"]
+    assert "美国10年期国债收益率" in rendered["/market"]
+    assert "市场快照历史" in rendered["/market"]
+    assert "资金流历史" in rendered["/market"]
     assert "风险设置" in rendered["/settings"]
     assert "任务日志" in rendered["/logs"]
     for html in rendered.values():
         assert "<!doctype html>" in html
-        assert "投资预测工作台" in html
+        assert "贾维斯理财助理" in html
         assert "viewport" in html
+
+
+def test_dashboard_run_health_surfaces_failed_stage(tmp_path):
+    db_path = prepare_web_db(tmp_path)
+    with connect(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO task_logs(task_name, run_date, status, message, error)
+            VALUES ('daily_advice_generation', '2026-05-23', 'failed', 'advice failed', 'fixture failure')
+            """
+        )
+
+    html = render_route(db_path, "/", {})
+
+    assert "每日建议" in html
+    assert "运行异常" in html
+    assert "advice failed" not in html
+    assert "缺建议会缺少当天风险口径" in html
+    assert "恢复提示：运行 advice generate" in html
 
 
 def test_advice_page_can_select_history_and_link_focus_assets(tmp_path):
@@ -166,6 +373,80 @@ def test_advice_page_can_select_history_and_link_focus_assets(tmp_path):
     assert "2026-05-23" in html
     assert 'href="/advice?advice_id=' in html
     assert f'href="/data?asset_id={asset["id"]}"' in html
+
+
+def test_predictions_page_groups_repeated_horizons_by_asset(tmp_path):
+    db_path = prepare_web_db(tmp_path)
+
+    html = render_route(db_path, "/predictions", {})
+    card_section = html.split("<h2>资产级预测卡片</h2>", 1)[1].split("<h2>技术明细</h2>", 1)[0]
+
+    assert card_section.count("<h3>沪深300ETF</h3>") == 1
+    assert "5日" in card_section
+    assert "20日" in card_section
+    assert "60日" in card_section
+    assert "上涨" in card_section
+    assert "排名" in card_section
+    assert "同类" in card_section
+    assert "风险调整" in card_section
+    assert "校验" in card_section
+    assert any(label in card_section for label in ["一致向上", "分歧观察", "中长期转强", "中长期转弱", "高下行风险"])
+    assert "原始模型预测" in html
+    assert "rank_score" in html
+    assert "validation_status" in html
+
+
+def test_table_heavy_pages_use_progressive_disclosure(tmp_path):
+    db_path = prepare_web_db(tmp_path)
+
+    backtests = render_route(db_path, "/backtests", {})
+    advice = render_route(db_path, "/advice", {})
+    settings = render_route(db_path, "/settings", {})
+    logs = render_route(db_path, "/logs", {})
+
+    assert "模型健康" in backtests
+    assert "分周期评分" in backtests
+    assert "Rank IC" in backtests
+    assert "分桶" in backtests
+    assert "治理状态" in backtests
+    assert "Jarvis主结论" in backtests
+    assert "bucket_spread" in backtests
+    assert "information_coefficient" in backtests
+    assert "回测任务原始字段" in backtests
+    assert "历史预测评分原始行" in backtests
+    assert backtests.index("模型健康") < backtests.index("技术明细")
+
+    assert "证据入口" in advice
+    assert "预测证据" in advice
+    assert "回测证据" in advice
+    assert "原始建议 JSON" in advice
+    assert "source_prediction_ids" in advice
+    assert advice.index("证据入口") < advice.index("原始建议 JSON")
+
+    assert "当前风险画像" in settings
+    assert "活跃风险设置" in settings
+    assert "系统调度" in settings
+    assert "调度 Watermarks" in settings
+    assert "已保存设置字段" in settings
+    assert settings.index("当前风险画像") < settings.index("活跃风险设置") < settings.index("技术明细")
+
+    assert "运行健康摘要" in logs
+    assert "原始任务日志" in logs
+    assert logs.index("运行健康摘要") < logs.index("技术明细")
+
+
+def test_settings_page_shows_scheduler_backoff_and_latest_runs(tmp_path):
+    db_path = prepare_web_db(tmp_path)
+    initialize_scheduler(db_path)
+    run_scheduler_job(db_path, "news_hourly_incremental")
+    record_provider_failure(db_path, "akshare", "HTTP 429 rate limit")
+
+    settings = render_route(db_path, "/settings", {})
+
+    assert "系统调度" in settings
+    assert "news_hourly_incremental" in settings
+    assert "Provider Backoff" in settings
+    assert "HTTP 429 rate limit" in settings
 
 
 def test_timeline_shows_latest_three_advice_dates_and_missing_states(tmp_path):
@@ -193,16 +474,21 @@ def test_category_navigation_groups_assets_and_data_page_prioritizes_summary(tmp
     categories = render_route(db_path, "/categories", {"category": ["fixed_income_cash"]})
     dashboard = render_route(db_path, "/", {})
     data = render_route(db_path, "/data", {})
+    themes = render_route(db_path, "/themes", {"theme": ["technology"]})
 
     assert "产品分类" in categories
     assert "固收/现金代理 摘要" in categories
     assert "国债ETF" in categories
     assert 'href="/data?asset_id=' in categories
-    assert 'href="/categories?category=fixed_income_cash"' in dashboard
+    assert 'href="/opportunities?type=fixed_income_cash"' in dashboard or 'href="/opportunities"' in dashboard
     assert "资产概览" in data
     assert "当前分类" in data
     assert "完整资产表" in data
     assert data.index("资产概览") < data.index("技术明细")
+    assert "主题配置" in themes
+    assert "科技 代表标的" in themes
+    assert "科技成长股票" in themes
+    assert "名称/类型包含" in themes
 
 
 def test_fund_screening_filters_and_presets(tmp_path):
@@ -219,6 +505,7 @@ def test_fund_screening_filters_and_presets(tmp_path):
         },
     )
     conservative = render_route(db_path, "/funds", {"preset": ["conservative"]})
+    technology = render_route(db_path, "/funds", {"theme": ["technology"]})
     missing_meta = render_route(db_path, "/funds", {"manager": ["不存在"]})
     all_funds = render_route(db_path, "/funds", {})
 
@@ -228,6 +515,9 @@ def test_fund_screening_filters_and_presets(tmp_path):
     assert "20日收益样本不足" in filtered
     assert "保守预设" in conservative
     assert "匹配保守预设" in conservative
+    assert "当前条件命中 1" in technology
+    assert "科技成长股票" in technology
+    assert "华夏成长混合" not in technology
     assert "没有基金满足当前筛选" in missing_meta
     assert "基金类型待补充" in all_funds
     assert "费率待补充" in all_funds
@@ -245,15 +535,98 @@ def test_experts_page_empty_active_and_retired_states(tmp_path):
 
     assert "专家委员会" in html
     assert "活跃专家" in html
-    assert "稳健防守专家" in html
-    assert "当前资产" in html
-    assert "最新计划与执行" in html
-    assert "权益曲线与基准" in html
-    assert "综合评分" in html
+    assert "管仲" in html
+    assert "资产" in html
+    assert "专家总览" in html
+    assert "专家收益对比" in html
+    assert "权益曲线与基准" not in html
+    assert "总览投资 / 收益曲线" not in html
+    overview_curve_html = html.split("<h2>专家收益对比</h2>", 1)[1].split("<h2>复盘与经验</h2>", 1)[0]
+    assert "<table" not in overview_curve_html
+    assert "benchmark_excess" not in overview_curve_html
+    assert "benchmark_return" not in overview_curve_html
+    assert "<table" not in html
+    assert 'href="/experts?expert=' in html
+    assert "查看详情" in html
+    assert "最新计划与执行" not in html
+    assert "评分" in html
     assert "已清退" in html
     assert "失败经验" in html
-    assert "原始评分记录" in html
-    assert "原始复盘记录" in html
+    assert "原始评分记录" not in html
+    assert "原始复盘记录" not in html
+
+    detail_html = render_route(db_path, "/experts", {"expert": ["guan_zhong"]})
+    assert "管仲详情" in detail_html
+    assert "返回专家总览" in detail_html
+    assert "专家档案" in detail_html
+    assert "完整时间系" in detail_html
+    assert "投资计划与执行" in detail_html
+    assert "投资计划" in detail_html
+    assert "当前投资" in detail_html
+    assert "收益曲线" in detail_html
+    assert "收益与资产序列" not in detail_html
+    return_curve_html = detail_html.split("<h2>收益曲线</h2>", 1)[1].split("<h2>分析与反思</h2>", 1)[0]
+    assert "<table" not in return_curve_html
+    assert "valuation_date" not in return_curve_html
+    assert "分析与反思" in detail_html
+    assert "reason" in detail_html
+    assert "reflection" in detail_html
+    assert "总资产" in detail_html
+    assert "已投资" in detail_html
+    assert "最新计划与执行" not in detail_html
+
+
+def test_portfolios_page_shows_holdings_transactions_and_equity_curve(tmp_path):
+    db_path = prepare_web_db(tmp_path)
+    with connect(db_path) as conn:
+        asset = conn.execute("SELECT id FROM assets WHERE code = '510300'").fetchone()
+        portfolio_id = create_virtual_portfolio(
+            conn,
+            owner_type="user",
+            owner_id=1,
+            name="用户研究组合",
+            initial_capital=100_000,
+        )
+        record_virtual_order(
+            conn,
+            portfolio_id=portfolio_id,
+            trade_date="2026-01-07",
+            side="buy",
+            asset_id=asset["id"],
+            quantity=10,
+            fee=1,
+            reason="验证组合页面。",
+        )
+        value_virtual_portfolio(conn, portfolio_id=portfolio_id, valuation_date="2026-01-07")
+
+    html = render_route(db_path, "/portfolios", {})
+
+    assert "模拟组合" in html
+    assert "组合概览" in html
+    assert "权益曲线" in html
+    assert "当前持仓" in html
+    assert "交易与估值记录" in html
+    assert "用户研究组合" in html
+    assert "510300" in html
+    assert "交易记录" in html
+    assert "估值记录" in html
+
+
+def test_communication_page_can_record_dry_run_without_exposing_raw_recipient(tmp_path):
+    db_path = prepare_web_db(tmp_path)
+    seed_communication_web_state(db_path)
+
+    html = render_route(db_path, "/communication", {"dry_run_test": ["1"], "recipient_key": ["owner_phone"]})
+
+    with connect(db_path) as conn:
+        message = conn.execute("SELECT * FROM outbound_messages WHERE template_key = 'webui_dry_run_test'").fetchone()
+
+    assert "已记录干跑测试" in html
+    assert "dry_run" in html
+    assert message["status"] == "dry_run"
+    assert "不会触发真实手机发送" in html
+    assert "+13***5678" in html
+    assert "+13800135678" not in html
 
 
 def test_settings_page_saves_active_preference_and_advice_uses_it(tmp_path):
@@ -304,6 +677,7 @@ def seed_expert_web_state(db_path, include_retired: bool = False) -> None:
                 """,
                 (portfolio["id"], 180_000, total_value - 180_000, total_value),
             )
+
             conn.execute(
                 """
                 INSERT INTO expert_plans(
@@ -370,3 +744,44 @@ def seed_expert_web_state(db_path, include_retired: bool = False) -> None:
                 """,
                 (retired_id,),
             )
+
+
+def seed_communication_web_state(db_path) -> None:
+    with connect(db_path) as conn:
+        upsert_communication_adapter_config(
+            conn,
+            {
+                "channel": "imessage",
+                "enabled": 1,
+                "dry_run_default": 1,
+                "setup_status": "verified",
+                "last_verified_at": "2026-05-23 08:00:00",
+            },
+        )
+        upsert_communication_recipient(
+            conn,
+            {
+                "recipient_key": "owner_phone",
+                "display_name": "Owner",
+                "channel": "imessage",
+                "address": "+13800135678",
+                "allowlisted": 1,
+                "enabled": 1,
+                "rate_limit_per_hour": 10,
+            },
+        )
+        conn.execute(
+            """
+            INSERT INTO outbound_messages(
+                channel, recipient_key, template_key, subject, body,
+                severity, payload_summary, idempotency_key, status,
+                adapter_result_json
+            )
+            VALUES (
+                'imessage', 'owner_phone', 'daily_workflow_success',
+                'Daily research ready', '研究摘要，仅供研究辅助。',
+                'info', 'daily success', 'web-fixture-message',
+                'dry_run', '{"status":"dry_run","details":{}}'
+            )
+            """
+        )

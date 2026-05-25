@@ -6,7 +6,13 @@ from pathlib import Path
 from statistics import mean, stdev
 from typing import Any
 
+from investment_forecasting.communication.templates import (
+    render_expert_probation,
+    render_expert_retirement,
+    send_rendered_notification,
+)
 from investment_forecasting.db import complete_task_log, connect, init_db, list_experts, start_task_log, upsert_expert
+from investment_forecasting.experts.roster import DEFAULT_ACTIVE_EXPERT_COUNT
 from investment_forecasting.portfolio.accounting import DEFAULT_EXPERT_INITIAL_CAPITAL, create_virtual_portfolio
 
 
@@ -24,6 +30,9 @@ def score_and_review_experts(
     *,
     window_days: int = DEFAULT_SCORE_WINDOW_DAYS,
     min_valuations: int = DEFAULT_MIN_VALUATIONS,
+    notify_recipient_key: str | None = None,
+    notification_channel: str = "imessage",
+    notification_dry_run: bool | None = None,
 ) -> dict[str, Any]:
     init_db(db_path)
     target_date = _date_text(review_date)
@@ -41,11 +50,55 @@ def score_and_review_experts(
                 reviewed.append({**scorecard, "id": scorecard_id, "review": review})
             replacements = _hire_replacements_if_needed(conn, target_date)
             complete_task_log(conn, log_id, "success", f"Reviewed {len(reviewed)} experts; replacements={len(replacements)}")
+            if notify_recipient_key:
+                _send_expert_review_notifications(
+                    conn,
+                    review_date=target_date,
+                    recipient_key=notify_recipient_key,
+                    channel=notification_channel,
+                    dry_run=notification_dry_run,
+                )
         except Exception as exc:
             complete_task_log(conn, log_id, "failed", error=str(exc))
             conn.commit()
             raise
     return {"review_date": target_date, "reviewed": reviewed, "replacements": replacements}
+
+
+def _send_expert_review_notifications(
+    conn,
+    *,
+    review_date: str,
+    recipient_key: str,
+    channel: str,
+    dry_run: bool | None,
+) -> None:
+    review_counts = conn.execute(
+        """
+        SELECT decision, COUNT(*) AS count
+        FROM expert_reviews
+        WHERE review_date = ?
+        GROUP BY decision
+        """,
+        (review_date,),
+    ).fetchall()
+    counts = {row["decision"]: row["count"] for row in review_counts}
+    notifications = []
+    if counts.get("warn", 0) or counts.get("probation", 0):
+        notifications.append(render_expert_probation(conn, review_date=review_date))
+    if counts.get("retire", 0) or counts.get("hire_replacement", 0):
+        notifications.append(render_expert_retirement(conn, review_date=review_date))
+    for notification in notifications:
+        try:
+            send_rendered_notification(
+                conn,
+                channel=channel,
+                recipient_key=recipient_key,
+                notification=notification,
+                dry_run=dry_run,
+            )
+        except Exception:
+            continue
 
 
 def build_expert_scorecard(
@@ -60,7 +113,7 @@ def build_expert_scorecard(
     plans = _window_plans(conn, expert["id"], score_date, window_days)
     details: dict[str, Any] = {"valuation_dates": [row["valuation_date"] for row in valuations]}
     valuation_count = len(valuations)
-    mature_enough = valuation_count >= min_valuations
+    mature_enough = valuation_count >= max(min_valuations, 2)
     if valuation_count < 2:
         metrics = _empty_metrics()
     else:
@@ -172,7 +225,7 @@ def _new_lifecycle_state(previous: str, decision: str) -> str:
 def _hire_replacements_if_needed(conn, review_date: str) -> list[dict[str, Any]]:
     replacements = []
     active_count = conn.execute("SELECT COUNT(*) AS count FROM experts WHERE lifecycle_state = 'active'").fetchone()["count"]
-    while active_count < 3:
+    while active_count < DEFAULT_ACTIVE_EXPERT_COUNT:
         replacement = _replacement_candidate(conn, review_date, active_count)
         expert_id = upsert_expert(conn, replacement)
         create_virtual_portfolio(
@@ -190,7 +243,7 @@ def _hire_replacements_if_needed(conn, review_date: str) -> list[dict[str, Any]]
             decision="hire_replacement",
             previous_state="candidate",
             new_state="active",
-            rationale="Active expert count fell below three; hired a style-diverse replacement from recorded lessons.",
+            rationale=f"Active expert count fell below {DEFAULT_ACTIVE_EXPERT_COUNT}; hired a style-diverse replacement from recorded lessons.",
             evidence={"active_count_before": active_count},
         )
         _insert_hiring_lesson(conn, expert_id, review_id, review_date)
@@ -211,7 +264,7 @@ def _replacement_candidate(conn, review_date: str, active_count: int) -> dict[st
     templates = [
         {
             "suffix": "quality_value",
-            "name": "质量价值替补专家",
+            "name": "计然",
             "short_description": "偏重质量、估值安全边际和回撤纪律，避免单纯追涨。",
             "style_label": "质量价值 / 安全边际",
             "focus_weights": {"max_drawdown": 0.2, "sharpe": 0.2, "confidence": 0.2, "fund_metadata_quality": 0.2, "expected_return": 0.2},
@@ -224,7 +277,7 @@ def _replacement_candidate(conn, review_date: str, active_count: int) -> dict[st
         },
         {
             "suffix": "macro_defense",
-            "name": "宏观防御替补专家",
+            "name": "子贡",
             "short_description": "偏重市场环境、现金纪律和跨类别防御配置。",
             "style_label": "宏观防御 / 现金纪律",
             "focus_weights": {"market_snapshot_risk": 0.3, "cash_buffer": 0.2, "max_drawdown": 0.2, "volatility": 0.15, "confidence": 0.15},
@@ -356,7 +409,7 @@ def _insert_hiring_lesson(conn, expert_id: int, review_id: int, review_date: str
             expert_id,
             review_id,
             review_date,
-            "补位专家根据风格缺口和历史失败 lessons 生成，用于保持三位 active 专家并行。",
+            f"补位专家根据风格缺口和历史失败 lessons 生成，用于保持{DEFAULT_ACTIVE_EXPERT_COUNT}位 active 专家并行。",
             "diversity, risk discipline",
             "none",
             "none",

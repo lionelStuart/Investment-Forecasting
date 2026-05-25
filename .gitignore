@@ -6,3 +6,6 @@ __pycache__/
 .runtime/
 data/*.sqlite3
 data/*.sqlite3-*
+.gstack/
+.gstack/
+.gstack/

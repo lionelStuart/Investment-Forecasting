@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from investment_forecasting.db import connect, init_db, upsert_asset, upsert_price_daily
+from investment_forecasting.cli import main as cli_main
+from investment_forecasting.experts.roster import DEFAULT_ACTIVE_EXPERT_COUNT
 from investment_forecasting.experts.roster import initialize_default_experts
 from investment_forecasting.portfolio.accounting import (
     DEFAULT_EXPERT_INITIAL_CAPITAL,
@@ -21,9 +23,9 @@ def test_each_active_expert_receives_virtual_portfolio(tmp_path):
     with connect(db_path) as conn:
         count = conn.execute("SELECT COUNT(*) AS count FROM virtual_portfolios").fetchone()["count"]
 
-    assert len(portfolios) == 3
-    assert len(repeated) == 3
-    assert count == 3
+    assert len(portfolios) == DEFAULT_ACTIVE_EXPERT_COUNT
+    assert len(repeated) == DEFAULT_ACTIVE_EXPERT_COUNT
+    assert count == DEFAULT_ACTIVE_EXPERT_COUNT
     assert all(row["owner_type"] == "expert" for row in portfolios)
     assert all(row["initial_capital"] == DEFAULT_EXPERT_INITIAL_CAPITAL for row in portfolios)
     assert all(row["cash"] == DEFAULT_EXPERT_INITIAL_CAPITAL for row in portfolios)
@@ -145,6 +147,44 @@ def test_missing_price_records_unfilled_order_and_valuation_exception(tmp_path):
     assert valuation["positions_value"] == 0
     assert valuation["missing_prices"] == [{"asset_id": asset_id, "asset_code": "NO_PRICE"}]
     assert valuation["details"][0]["price"] is None
+
+
+def test_portfolio_cli_create_trade_value_and_list(tmp_path, capsys):
+    db_path, asset_id = seed_price_asset(tmp_path)
+
+    assert cli_main(["portfolio", "create", "--db", str(db_path), "--name", "用户组合", "--initial-capital", "10000"]) == 0
+    create_output = capsys.readouterr().out
+    assert '"portfolio_id": 1' in create_output
+
+    assert cli_main([
+        "portfolio",
+        "trade",
+        "--db",
+        str(db_path),
+        "--portfolio-id",
+        "1",
+        "--date",
+        "2026-05-20",
+        "--side",
+        "buy",
+        "--asset-id",
+        str(asset_id),
+        "--quantity",
+        "5",
+        "--fee",
+        "1",
+    ]) == 0
+    trade_output = capsys.readouterr().out
+    assert '"status": "filled"' in trade_output
+
+    assert cli_main(["portfolio", "value", "--db", str(db_path), "--portfolio-id", "1", "--date", "2026-05-21"]) == 0
+    value_output = capsys.readouterr().out
+    assert '"total_value"' in value_output
+
+    assert cli_main(["portfolio", "list", "--db", str(db_path)]) == 0
+    list_output = capsys.readouterr().out
+    assert '"count": 1' in list_output
+    assert "用户组合" in list_output
 
 
 def seed_price_asset(tmp_path):

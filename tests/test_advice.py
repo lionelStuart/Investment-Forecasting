@@ -11,6 +11,7 @@ from investment_forecasting.advice.generator import (
     generate_daily_advice,
 )
 from investment_forecasting.db import connect, init_db, upsert_user_preference
+from investment_forecasting.quant.features import calculate_features_for_db
 from investment_forecasting.quant.backtest import run_backtest, run_latest_forecasts
 from tests.test_features import seed_asset_with_prices
 
@@ -20,6 +21,7 @@ def test_generate_daily_advice_from_forecast_and_backtest_evidence(tmp_path):
     seed_asset_with_prices(db_path, [100, 101, 102, 103, 104, 105, 106])
     run_latest_forecasts(db_path, horizons=(5, 20, 60))
     run_backtest(db_path, horizons=(2,), lookback_days=3)
+    seed_capital_flow(db_path)
 
     advice_id = generate_daily_advice(db_path, advice_date="20260523")
     repeat_id = generate_daily_advice(db_path, advice_date="20260523")
@@ -44,6 +46,11 @@ def test_generate_daily_advice_from_forecast_and_backtest_evidence(tmp_path):
     assert "近期优先关注" in advice["balanced_advice"]
     assert evidence["source_prediction_ids"]
     assert evidence["backtest_run_ids"]
+    assert evidence["capital_flow_ids"]
+    assert "risk_budget_asset_ids" in evidence
+    assert allocation["risk_budget"]["status"] in {"ready", "insufficient_correlation_history", "insufficient_risk_assets"}
+    assert allocation["capital_flow"]["status"] == "available"
+    assert "资金流观测覆盖" in advice["market_summary"]
     assert logs == 2
 
 
@@ -69,6 +76,7 @@ def test_generate_daily_advice_failure_writes_task_log(tmp_path):
 def test_generate_daily_advice_applies_active_user_preference(tmp_path):
     db_path = tmp_path / "advice-pref.sqlite3"
     seed_asset_with_prices(db_path, [100, 101, 102, 103, 104, 105, 106])
+    calculate_features_for_db(db_path)
     run_latest_forecasts(db_path, horizons=(5, 20, 60))
     run_backtest(db_path, horizons=(2,), lookback_days=3)
 
@@ -92,8 +100,34 @@ def test_generate_daily_advice_applies_active_user_preference(tmp_path):
         advice = conn.execute("SELECT * FROM daily_advice WHERE id = ?", (advice_id,)).fetchone()
 
     allocation = json.loads(advice["allocation_json"])
+    target_volatility = allocation["target_volatility"]
     assert allocation["user_preference"]["profile_name"] == "稳健账户"
     assert allocation["focus_assets"][0]["horizon_days"] == 60
     assert allocation["profiles"]["aggressive"]["equity"] == "30%-30%"
+    assert target_volatility["status"] == "ready"
+    assert target_volatility["constraints"]["max_equity_pct"] == 0.3
+    assert target_volatility["constraints"]["min_cash_pct"] == 0.25
+    assert target_volatility["proposed_weights"]["equity"] <= 0.3
+    assert target_volatility["proposed_weights"]["cash"] >= 0.25
+    assert target_volatility["evidence"]["feature_ids"]
+    assert "risk_budget" in allocation
+    assert allocation["risk_budget"]["evidence"]["asset_ids"]
     assert "权益上限 30%" in advice["assumptions"]
+    assert "目标波动率提案" in advice["assumptions"]
     assert "稳健账户" in advice["market_summary"]
+
+
+def seed_capital_flow(db_path) -> None:
+    with connect(db_path) as conn:
+        asset_id = conn.execute("SELECT id FROM assets ORDER BY id LIMIT 1").fetchone()["id"]
+        conn.execute(
+            """
+            INSERT INTO capital_flow_observations(
+                flow_date, scope, subject_code, subject_name, asset_id,
+                main_net_inflow, main_net_inflow_pct, source, raw_payload
+            )
+            VALUES ('2026-05-22', 'stock', 'TEST', 'Test Asset', ?, 1200000, 0.04, 'test', '{}')
+            ON CONFLICT(scope, subject_code, flow_date, source) DO NOTHING
+            """,
+            (asset_id,),
+        )

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 
 import pytest
@@ -13,6 +14,7 @@ from investment_forecasting.data.ingestion import (
 )
 from investment_forecasting.db import connect, init_db, upsert_asset
 from investment_forecasting.providers.akshare_provider import (
+    ProviderAccessPolicy,
     ProviderDataError,
     RetryConfig,
     normalize_fund_info,
@@ -117,6 +119,35 @@ class PartiallyFailingProvider(FakeProvider):
         return super().history(asset, start_date, end_date)
 
 
+class IncrementalProvider:
+    def __init__(self):
+        self.calls = []
+
+    def history(self, asset, start_date: str, end_date: str):
+        self.calls.append((asset.code, start_date, end_date))
+        return [
+            {
+                "trade_date": f"{end_date[:4]}-{end_date[4:6]}-{end_date[6:8]}",
+                "open": 10.0,
+                "high": 11.0,
+                "low": 9.5,
+                "close": 10.5,
+                "volume": 1000.0,
+                "amount": 10500.0,
+                "pct_change": 1.2,
+                "adjusted_close": 10.5,
+                "nav": 10.5 if asset.asset_type == "fund" else None,
+                "accumulated_nav": 12.0 if asset.asset_type == "fund" else None,
+                "raw_payload": None,
+            }
+        ]
+
+
+class EmptyProvider:
+    def history(self, asset, start_date: str, end_date: str):
+        raise ProviderDataError("AKShare returned no history for index:000300")
+
+
 class FakeAkModule:
     def fund_open_fund_info_em(self, symbol: str, indicator: str):
         return [
@@ -157,6 +188,17 @@ class FlakyAkModule:
         self.calls += 1
         if self.calls == 1:
             raise RuntimeError("temporary")
+        return [{"净值日期": "2026-05-20", "单位净值": "1.0"}]
+
+
+class ThrottledThenOkAkModule:
+    def __init__(self):
+        self.calls = 0
+
+    def fund_open_fund_info_em(self, symbol: str, indicator: str):
+        self.calls += 1
+        if self.calls == 1:
+            raise RuntimeError("429 too many requests")
         return [{"净值日期": "2026-05-20", "单位净值": "1.0"}]
 
 
@@ -283,11 +325,29 @@ def test_ingest_mvp_universe_upserts_prices_without_duplicates(tmp_path):
         logs = conn.execute("SELECT COUNT(*) AS count FROM task_logs WHERE status = 'success'").fetchone()["count"]
 
     assert first == {f"{asset.asset_type}:{asset.code}": 1 for asset in MVP_UNIVERSE}
-    assert second == first
+    assert second == {f"{asset.asset_type}:{asset.code}": 0 for asset in MVP_UNIVERSE}
     assert assets == len(MVP_UNIVERSE)
     assert prices == len(MVP_UNIVERSE)
     assert reports == len(MVP_UNIVERSE)
     assert logs == 2
+
+
+def test_ingest_uses_incremental_start_date_when_local_history_exists(tmp_path):
+    db_path = tmp_path / "incremental.sqlite3"
+    provider = IncrementalProvider()
+    universe = [MVP_UNIVERSE[0]]
+
+    first = ingest_mvp_universe(db_path, "20260520", "20260521", provider=provider, universe=universe)
+    second = ingest_mvp_universe(db_path, "20260520", "20260522", provider=provider, universe=universe)
+    third = ingest_mvp_universe(db_path, "20260520", "20260522", provider=provider, universe=universe)
+
+    assert first == {"index:000300": 1}
+    assert second == {"index:000300": 1}
+    assert third == {"index:000300": 0}
+    assert provider.calls == [
+        ("000300", "20260520", "20260521"),
+        ("000300", "20260522", "20260522"),
+    ]
 
 
 def test_ingest_mvp_universe_writes_fund_info_when_provider_supports_it(tmp_path):
@@ -443,6 +503,27 @@ def test_ingest_can_continue_after_asset_fetch_failure(tmp_path):
     assert log["status"] == "success"
 
 
+def test_empty_provider_response_records_actionable_warning_in_task_log(tmp_path):
+    db_path = tmp_path / "empty.sqlite3"
+
+    summary = ingest_mvp_universe(
+        db_path,
+        "20260520",
+        "20260521",
+        provider=EmptyProvider(),
+        universe=[MVP_UNIVERSE[0]],
+        continue_on_error=True,
+    )
+
+    with connect(db_path) as conn:
+        log = conn.execute("SELECT status, message FROM task_logs ORDER BY id DESC LIMIT 1").fetchone()
+
+    message = json.loads(log["message"])
+    assert summary == {"index:000300": 0}
+    assert log["status"] == "success"
+    assert "empty response" in " ".join(message["warnings"])
+
+
 def test_provider_filters_fund_history_to_requested_dates():
     provider = AkshareProvider(ak_module=FakeAkModule())
     asset = next(asset for asset in MVP_UNIVERSE if asset.asset_type == "fund")
@@ -505,6 +586,49 @@ def test_provider_retries_transient_failures():
 
     assert ak_module.calls == 2
     assert rows[0]["trade_date"] == "2026-05-20"
+
+
+def test_provider_rate_limit_policy_delays_between_requests():
+    now = [10.0]
+    sleeps = []
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        now[0] += seconds
+
+    provider = AkshareProvider(
+        ak_module=FakeAkModule(),
+        retry_config=RetryConfig(attempts=1),
+        access_policy=ProviderAccessPolicy(min_delay_seconds=1.0, jitter_seconds=0.0),
+        sleep_func=sleep,
+        monotonic_func=lambda: now[0],
+    )
+    asset = next(asset for asset in MVP_UNIVERSE if asset.asset_type == "fund")
+
+    provider.history(asset, start_date="20260520", end_date="20260520")
+    provider.history(asset, start_date="20260520", end_date="20260520")
+
+    assert sleeps == [1.0]
+    assert provider.diagnostics()["request_count"] == 2
+
+
+def test_provider_backoff_marks_likely_throttling():
+    sleeps = []
+    provider = AkshareProvider(
+        ak_module=ThrottledThenOkAkModule(),
+        retry_config=RetryConfig(attempts=2, backoff_base_seconds=2.0, max_backoff_seconds=2.0),
+        access_policy=ProviderAccessPolicy(min_delay_seconds=0.0, jitter_seconds=0.0),
+        sleep_func=lambda seconds: sleeps.append(seconds),
+    )
+    asset = next(asset for asset in MVP_UNIVERSE if asset.asset_type == "fund")
+
+    rows = provider.history(asset, start_date="20260520", end_date="20260520")
+
+    diagnostics = provider.diagnostics()
+    assert rows[0]["trade_date"] == "2026-05-20"
+    assert sleeps == [2.0]
+    assert diagnostics["retry_count"] == 1
+    assert "likely throttling" in diagnostics["throttling_warnings"][0]
 
 
 def test_provider_falls_back_to_direct_when_proxy_env_fails(monkeypatch):

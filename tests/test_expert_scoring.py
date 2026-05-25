@@ -2,7 +2,16 @@ from __future__ import annotations
 
 import json
 
-from investment_forecasting.db import connect, get_expert, init_db, upsert_asset, upsert_price_daily
+from investment_forecasting.db import (
+    connect,
+    get_expert,
+    init_db,
+    upsert_asset,
+    upsert_communication_adapter_config,
+    upsert_communication_recipient,
+    upsert_price_daily,
+)
+from investment_forecasting.experts.roster import DEFAULT_ACTIVE_EXPERT_COUNT
 from investment_forecasting.experts.roster import initialize_default_experts
 from investment_forecasting.experts.scoring import score_and_review_experts
 from investment_forecasting.portfolio.accounting import ensure_expert_portfolios
@@ -18,10 +27,10 @@ def test_scorecards_are_reproducible_from_persisted_portfolio_records(tmp_path):
         scorecards = conn.execute("SELECT * FROM expert_scorecards").fetchall()
         reviews = conn.execute("SELECT * FROM expert_reviews").fetchall()
 
-    assert len(first["reviewed"]) == 3
-    assert len(second["reviewed"]) == 3
-    assert len(scorecards) == 3
-    assert len(reviews) == 6
+    assert len(first["reviewed"]) == DEFAULT_ACTIVE_EXPERT_COUNT
+    assert len(second["reviewed"]) == DEFAULT_ACTIVE_EXPERT_COUNT
+    assert len(scorecards) == DEFAULT_ACTIVE_EXPERT_COUNT
+    assert len(reviews) == DEFAULT_ACTIVE_EXPERT_COUNT * 2
     assert all(row["mature_enough"] == 1 for row in scorecards)
     assert all(row["overall_score"] is not None for row in scorecards)
     assert all(json.loads(row["details_json"])["valuation_dates"] for row in scorecards)
@@ -43,12 +52,48 @@ def test_bad_expert_warns_then_probation_then_retirement_and_replacement(tmp_pat
     assert any(item["review"]["decision"] == "warn" for item in first["reviewed"])
     assert any(item["review"]["decision"] == "probation" for item in second["reviewed"])
     assert any(item["review"]["decision"] == "retire" for item in third["reviewed"])
-    assert active_count == 3
+    assert active_count == DEFAULT_ACTIVE_EXPERT_COUNT
     assert retired
     assert any(row["lesson_type"] == "failure" for row in lessons)
     assert any("避免招聘复制" in row["avoid_hiring_patterns"] for row in lessons)
     assert replacement is not None
     assert replacement["style_label"] not in {row["style_label"] for row in retired}
+
+
+def test_expert_lifecycle_notifications_are_rendered_for_probation_and_retirement(tmp_path):
+    db_path = seed_scoring_db(tmp_path, declining=True)
+    seed_notification_recipient(db_path)
+
+    score_and_review_experts(
+        db_path,
+        review_date="2026-05-23",
+        min_valuations=3,
+        notify_recipient_key="owner_phone",
+        notification_dry_run=True,
+    )
+    score_and_review_experts(
+        db_path,
+        review_date="2026-05-24",
+        min_valuations=3,
+        notify_recipient_key="owner_phone",
+        notification_dry_run=True,
+    )
+    score_and_review_experts(
+        db_path,
+        review_date="2026-05-25",
+        min_valuations=3,
+        notify_recipient_key="owner_phone",
+        notification_dry_run=True,
+    )
+
+    with connect(db_path) as conn:
+        messages = conn.execute("SELECT template_key, status, body FROM outbound_messages ORDER BY id").fetchall()
+
+    template_keys = {row["template_key"] for row in messages}
+    assert "expert_probation" in template_keys
+    assert "expert_retirement" in template_keys
+    assert all(row["status"] == "dry_run" for row in messages)
+    assert any("虚拟专家委员会通知" in row["body"] for row in messages)
 
 
 def test_insufficient_maturity_keeps_expert_without_punishment(tmp_path):
@@ -154,3 +199,20 @@ def seed_scoring_db(tmp_path, *, declining: bool, valuation_days: int = 4):
                     (portfolio["id"], f"2026-05-{day:02d}"),
                 )
     return db_path
+
+
+def seed_notification_recipient(db_path) -> None:
+    with connect(db_path) as conn:
+        upsert_communication_adapter_config(conn, {"channel": "imessage", "enabled": 1, "dry_run_default": 1})
+        upsert_communication_recipient(
+            conn,
+            {
+                "recipient_key": "owner_phone",
+                "display_name": "Owner",
+                "channel": "imessage",
+                "address": "+10000000000",
+                "allowlisted": 1,
+                "enabled": 1,
+                "rate_limit_per_hour": 10,
+            },
+        )

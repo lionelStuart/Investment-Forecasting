@@ -1,0 +1,4 @@
+interface:
+  display_name: "Tushare Usage Manual"
+  short_description: "Find Tushare docs, APIs, permissions, and usage."
+  default_prompt: "Use $tushare-usage-manual to find the correct Tushare official docs, interface page, SDK/HTTP usage, permissions, fields, and project integration pattern for this data need."

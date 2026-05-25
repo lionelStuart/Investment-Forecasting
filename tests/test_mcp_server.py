@@ -40,8 +40,15 @@ async def test_mcp_stdio_lists_tools_and_calls_read_and_workflow_tools(tmp_path)
         "run_expert_plans",
         "get_expert_portfolios",
         "score_experts",
-        "get_expert_scorecards",
-        "get_expert_lessons",
+            "get_expert_scorecards",
+            "get_expert_lessons",
+            "get_jarvis_daily_brief",
+            "generate_jarvis_daily_brief",
+            "search_news_evidence",
+            "get_agent_tool_manifest",
+            "validate_agent_output",
+            "submit_expert_virtual_action",
+            "submit_jarvis_daily_brief",
     } == tool_names
 
     snapshot_payload = getattr(snapshot, "structuredContent")

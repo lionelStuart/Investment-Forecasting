@@ -2,7 +2,7 @@
 
 ## Status
 
-pending
+completed
 
 ## Purpose
 
@@ -43,6 +43,28 @@ allowlisted phone identity.
 - CLI can verify setup and send an allowlisted test message.
 - Tests cover command construction or adapter boundary without requiring a real
   Messages account in CI.
+
+## Completion Notes
+
+- Added `src/investment_forecasting/communication/imessage.py` with:
+  - AppleScript command construction for local macOS Messages/iMessage sends.
+  - `IMessageAdapter` returning structured `sent`, `failed`, and
+    `permission_required` adapter results.
+  - Setup verification for adapter configuration, allowlisted recipient, macOS,
+    and `osascript` availability.
+- Updated the channel-neutral communication service so explicit real
+  `imessage` sends resolve to the iMessage adapter after allowlist, policy, and
+  enabled-config checks pass.
+- Added CLI setup health:
+  - `investment-forecasting communication verify-setup --recipient-key owner_phone`
+  - `--skip-system-probe` supports CI/local config-only checks without touching
+    Messages.
+- Kept dry-run behavior in the service layer so tests and local setup checks do
+  not invoke Messages.
+
+## Verification
+
+- `python3 -m pytest tests/test_communication.py`
 
 ## Depends On
 
