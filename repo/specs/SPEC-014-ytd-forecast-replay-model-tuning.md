@@ -236,3 +236,9 @@ is accepted.
 - `TASK-090`: YTD forecast replay corpus.
 - `TASK-091`: Replay scoring and diagnostic metrics.
 - `TASK-092`: Model tuning recommendation report.
+
+## Follow-Up
+
+- `SPEC-015`: Model applicability and shadow routing governance turns replay
+  findings into persistent health facts, applicability profiles, shadow routing,
+  confidence labels, and monthly model governance summaries.

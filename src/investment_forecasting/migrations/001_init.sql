@@ -192,6 +192,111 @@ CREATE TABLE IF NOT EXISTS model_replay_predictions (
   UNIQUE (replay_run_id, asset_id, prediction_date, horizon_days, model_version, target)
 );
 
+CREATE TABLE IF NOT EXISTS model_health_metrics (
+  id INTEGER PRIMARY KEY,
+  replay_run_id INTEGER NOT NULL REFERENCES model_replay_runs(id) ON DELETE CASCADE,
+  model_version TEXT NOT NULL,
+  horizon_days INTEGER NOT NULL,
+  asset_type TEXT NOT NULL,
+  same_category_key TEXT NOT NULL,
+  prediction_month TEXT NOT NULL,
+  evaluation_window TEXT NOT NULL,
+  sample_count INTEGER NOT NULL,
+  direction_accuracy REAL,
+  rank_ic REAL,
+  bucket_spread REAL,
+  top_bottom_decile_spread REAL,
+  mae REAL,
+  median_abs_error REAL,
+  raw_high_conf_wrong_rate REAL,
+  coverage_rate REAL,
+  status TEXT NOT NULL,
+  output_role TEXT NOT NULL DEFAULT 'observation_only',
+  promotion_status TEXT NOT NULL DEFAULT 'not_reviewed',
+  degradation_reason TEXT,
+  minimum_sample_met INTEGER NOT NULL DEFAULT 0,
+  consumer_display_level TEXT NOT NULL DEFAULT 'internal',
+  confidence_label TEXT NOT NULL DEFAULT '暂不强调',
+  confidence_rationale_json TEXT NOT NULL DEFAULT '{}',
+  last_promoted_at TEXT,
+  last_demoted_at TEXT,
+  metrics_json TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+  UNIQUE (
+    replay_run_id, model_version, horizon_days, asset_type,
+    same_category_key, prediction_month, evaluation_window
+  )
+);
+
+CREATE TABLE IF NOT EXISTS model_applicability_profiles (
+  id INTEGER PRIMARY KEY,
+  replay_run_id INTEGER NOT NULL REFERENCES model_replay_runs(id) ON DELETE CASCADE,
+  source_metric_id INTEGER NOT NULL REFERENCES model_health_metrics(id) ON DELETE CASCADE,
+  model_version TEXT NOT NULL,
+  horizon_days INTEGER NOT NULL,
+  asset_type TEXT NOT NULL,
+  same_category_key TEXT NOT NULL,
+  prediction_month TEXT NOT NULL,
+  evaluation_window TEXT NOT NULL,
+  output_role TEXT NOT NULL CHECK (output_role IN (
+    'primary_forecast',
+    'allocation_bias',
+    'ranking_signal',
+    'risk_reference',
+    'observation_only'
+  )),
+  ranking_disabled INTEGER NOT NULL DEFAULT 0,
+  ranking_disable_reason TEXT,
+  promotion_status TEXT NOT NULL DEFAULT 'not_reviewed',
+  degradation_reason TEXT,
+  minimum_sample_met INTEGER NOT NULL DEFAULT 0,
+  consumer_display_level TEXT NOT NULL DEFAULT 'internal',
+  confidence_label TEXT NOT NULL DEFAULT '暂不强调',
+  confidence_rationale_json TEXT NOT NULL DEFAULT '{}',
+  rationale_json TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+  UNIQUE (
+    replay_run_id, model_version, horizon_days, asset_type,
+    same_category_key, prediction_month, evaluation_window
+  )
+);
+
+CREATE TABLE IF NOT EXISTS model_shadow_routes (
+  id INTEGER PRIMARY KEY,
+  replay_run_id INTEGER NOT NULL REFERENCES model_replay_runs(id) ON DELETE CASCADE,
+  route_name TEXT NOT NULL,
+  horizon_days INTEGER NOT NULL,
+  prediction_month TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'shadow_only',
+  training_cutoff TEXT,
+  baseline_floor REAL NOT NULL,
+  monthly_turnover_cap REAL NOT NULL,
+  realized_turnover REAL NOT NULL,
+  weights_json TEXT NOT NULL,
+  shadow_metrics_json TEXT NOT NULL DEFAULT '{}',
+  baseline_metrics_json TEXT NOT NULL DEFAULT '{}',
+  comparison_json TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+  UNIQUE (replay_run_id, route_name, horizon_days, prediction_month)
+);
+
+CREATE TABLE IF NOT EXISTS model_governance_reviews (
+  id INTEGER PRIMARY KEY,
+  replay_run_id INTEGER NOT NULL REFERENCES model_replay_runs(id) ON DELETE CASCADE,
+  review_month TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'review_only',
+  summary_text TEXT NOT NULL,
+  report_json TEXT NOT NULL DEFAULT '{}',
+  production_defaults_changed INTEGER NOT NULL DEFAULT 0,
+  promotion_review_eligible INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+  UNIQUE (replay_run_id, review_month)
+);
+
 CREATE TABLE IF NOT EXISTS backtest_runs (
   id INTEGER PRIMARY KEY,
   model_version TEXT NOT NULL,
@@ -915,6 +1020,10 @@ CREATE INDEX IF NOT EXISTS idx_fund_holdings_holding_code ON fund_holdings(holdi
 CREATE INDEX IF NOT EXISTS idx_features_daily_asset_date ON features_daily(asset_id, feature_date);
 CREATE INDEX IF NOT EXISTS idx_model_predictions_date ON model_predictions(prediction_date, horizon_days);
 CREATE INDEX IF NOT EXISTS idx_model_prediction_reliability_prediction ON model_prediction_reliability(prediction_id);
+CREATE INDEX IF NOT EXISTS idx_model_health_metrics_run ON model_health_metrics(replay_run_id, model_version, horizon_days, status);
+CREATE INDEX IF NOT EXISTS idx_model_applicability_profiles_run ON model_applicability_profiles(replay_run_id, model_version, horizon_days, output_role);
+CREATE INDEX IF NOT EXISTS idx_model_shadow_routes_run ON model_shadow_routes(replay_run_id, route_name, horizon_days, status);
+CREATE INDEX IF NOT EXISTS idx_model_governance_reviews_run ON model_governance_reviews(replay_run_id, review_month, status);
 CREATE INDEX IF NOT EXISTS idx_daily_advice_date ON daily_advice(advice_date);
 CREATE INDEX IF NOT EXISTS idx_task_logs_name_date ON task_logs(task_name, run_date);
 CREATE INDEX IF NOT EXISTS idx_agent_runs_role_date ON agent_runs(role_type, role_key, run_date DESC);

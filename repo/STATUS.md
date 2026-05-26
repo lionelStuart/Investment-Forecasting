@@ -2,26 +2,56 @@
 
 ## Current Focus
 
-- Next planned phase is `M16 YTD Model Accuracy And Confidence Replay Audit`
-  (`SPEC-014`, `TASK-090` through `TASK-092`). The model algorithms are not
-  considered sufficiently validated yet. The next step is to rebuild this
-  year's daily model prediction record from already stored local history, score
-  only matured outcomes, and turn accuracy/confidence diagnostics into a
-  concrete tuning plan before changing model defaults. This phase does not
-  evaluate expert committee predictions, Jarvis daily conclusions, investment
-  advice, or portfolio outcomes.
+- Active phase is `M17 Model Applicability And Shadow Routing Governance`
+  (`SPEC-015`, `ADR-010`, `TASK-093` through `TASK-097`). Data
+  expert replay research and CEO review both reject "best model wins" as the
+  next optimization strategy. This phase builds a durable model-layer
+  governance loop: model-health facts, applicability roles,
+  same-type ranking disable rules, 20-day shadow routing, confidence labels,
+  and monthly governance summaries.
 
-- Local audit context on 2026-05-25: `price_daily` covers 2024-01-02 through
-  2026-05-22; `model_predictions` has partial/latest prediction evidence and
-  is not a complete 2026 daily prediction ledger; `backtest_results` has broad
-  rolling evidence but is not organized as a current-year replay report with
-  tuning recommendations. Therefore the next implementation should create a
-  separate replay corpus rather than overwrite production predictions.
+- CEO-approved boundaries for M17: keep production defaults unchanged; run
+  `router_floor70_cap05` only as 20-day shadow evidence; do not use 20-day
+  router output for same-type asset ranking; do not let shadow output affect
+  expert actions, Jarvis stance, investment advice, phone summaries, or
+  operational `model_predictions`; do not introduce black-box models.
 
-- `TASK-090` should start the phase by adding a `model-validation replay-ytd`
-  path that uses no provider/network calls, uses only price history available
-  at each prediction date, persists replay rows outside `model_predictions`,
-  and marks recent immature horizons as pending instead of failed.
+- `TASK-093` through `TASK-097` are complete. The system now persists
+  context-specific health metrics, derives applicability profiles, runs the
+  conservative 20-day shadow router, applies confidence labels, and writes a
+  monthly governance review without changing operational predictions or
+  Jarvis/expert/advice behavior. Local replay run `1` has 1,512 persisted
+  health rows and 1,512 applicability profiles: 8 `primary_forecast`, 2
+  `allocation_bias`, 53 `ranking_signal`, 46 `risk_reference`, 1,403
+  `observation_only`, and 1,125 same-type ranking disables. It also has 4
+  monthly `router_floor70_cap05` shadow-only route rows for 2026-01 through
+  2026-04 with baseline weight floor 70%, monthly turnover cap 5%, and
+  same-type ranking disabled. The confidence label pass produced 1,508
+  `暂不强调`, 4 `谨慎观察`, and 0 `相对稳健` labels, so no strong confidence
+  language is supported by the current replay evidence. The `2026-05`
+  governance review is `review_only`, has no promotion-review eligible model,
+  and records `production_defaults_changed=0`.
+
+- `M16 YTD Model Accuracy And Confidence Replay Audit` (`SPEC-014`,
+  `TASK-090` through `TASK-092`) has been implemented for the 2026 local
+  corpus. The system now has `model-validation replay-ytd`, `report`, and
+  `tuning-plan` commands, persisted `model_replay_runs` /
+  `model_replay_predictions`, and deterministic replay diagnostics that stay
+  separate from operational `model_predictions`.
+
+- Local replay run on 2026-05-25: run id `1`, `2026-01-01` through
+  `2026-05-22`, all assets, horizons `5,20,60`, models
+  `baseline_mean_v1`, `momentum_reversal_v1`, and
+  `risk_adjusted_factor_v1`. It wrote 374,922 replay rows: 255,201 matured,
+  119,487 pending, and 234 skipped. No provider/network calls were used.
+
+- Replay findings: `baseline_mean_v1` 5-day validated with 0.556 direction
+  accuracy and positive Rank IC/bucket spread; `baseline_mean_v1` 20-day is
+  degraded due negative Rank IC and bucket spread; 60-day baseline and
+  risk-adjusted variants rank better but have larger return errors. The tuning
+  plan currently recommends rank gates, alpha-amplitude reduction where bucket
+  spread is negative, probability calibration, and confidence cooling before
+  any model default changes.
 
 - Previous development phase was `M15 System Scheduler And Incremental Updates`
   (`SPEC-013`, `ADR-009`, `TASK-085` through `TASK-089`). The old Codex app
@@ -39,12 +69,7 @@
   definitions are observable through scheduler status without Codex app
   automation.
 
-- Development is paused after `TASK-060` so the next phase can be narrowed
-  before implementation continues. The immediate focus is not more data
-  coverage, experts, optimization, phone-command expansion, or additional
-  developer workbench pages. CEO review confirms that the product must shift
-  from module-based navigation to a Jarvis-first consumer decision journey.
-
+- Earlier Jarvis-first IA narrowing is closed, not the current active pause.
   `TASK-061` through `TASK-065` are complete: the AI provider boundary,
   expert/Jarvis prompt and evidence schemas, provider-backed orchestration,
   Jarvis confidence gates, and architecture/code-index synchronization are in

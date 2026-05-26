@@ -158,6 +158,155 @@ def _ensure_legacy_columns(conn: sqlite3.Connection) -> None:
     )
     conn.execute(
         """
+        CREATE TABLE IF NOT EXISTS model_health_metrics (
+          id INTEGER PRIMARY KEY,
+          replay_run_id INTEGER NOT NULL REFERENCES model_replay_runs(id) ON DELETE CASCADE,
+          model_version TEXT NOT NULL,
+          horizon_days INTEGER NOT NULL,
+          asset_type TEXT NOT NULL,
+          same_category_key TEXT NOT NULL,
+          prediction_month TEXT NOT NULL,
+          evaluation_window TEXT NOT NULL,
+          sample_count INTEGER NOT NULL,
+          direction_accuracy REAL,
+          rank_ic REAL,
+          bucket_spread REAL,
+          top_bottom_decile_spread REAL,
+          mae REAL,
+          median_abs_error REAL,
+          raw_high_conf_wrong_rate REAL,
+          coverage_rate REAL,
+          status TEXT NOT NULL,
+          output_role TEXT NOT NULL DEFAULT 'observation_only',
+          promotion_status TEXT NOT NULL DEFAULT 'not_reviewed',
+          degradation_reason TEXT,
+          minimum_sample_met INTEGER NOT NULL DEFAULT 0,
+          consumer_display_level TEXT NOT NULL DEFAULT 'internal',
+          confidence_label TEXT NOT NULL DEFAULT '暂不强调',
+          confidence_rationale_json TEXT NOT NULL DEFAULT '{}',
+          last_promoted_at TEXT,
+          last_demoted_at TEXT,
+          metrics_json TEXT NOT NULL DEFAULT '{}',
+          created_at TEXT NOT NULL DEFAULT (datetime('now')),
+          updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+          UNIQUE (
+            replay_run_id, model_version, horizon_days, asset_type,
+            same_category_key, prediction_month, evaluation_window
+          )
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_model_health_metrics_run "
+        "ON model_health_metrics(replay_run_id, model_version, horizon_days, status)"
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS model_applicability_profiles (
+          id INTEGER PRIMARY KEY,
+          replay_run_id INTEGER NOT NULL REFERENCES model_replay_runs(id) ON DELETE CASCADE,
+          source_metric_id INTEGER NOT NULL REFERENCES model_health_metrics(id) ON DELETE CASCADE,
+          model_version TEXT NOT NULL,
+          horizon_days INTEGER NOT NULL,
+          asset_type TEXT NOT NULL,
+          same_category_key TEXT NOT NULL,
+          prediction_month TEXT NOT NULL,
+          evaluation_window TEXT NOT NULL,
+          output_role TEXT NOT NULL CHECK (output_role IN (
+            'primary_forecast',
+            'allocation_bias',
+            'ranking_signal',
+            'risk_reference',
+            'observation_only'
+          )),
+          ranking_disabled INTEGER NOT NULL DEFAULT 0,
+          ranking_disable_reason TEXT,
+          promotion_status TEXT NOT NULL DEFAULT 'not_reviewed',
+          degradation_reason TEXT,
+          minimum_sample_met INTEGER NOT NULL DEFAULT 0,
+          consumer_display_level TEXT NOT NULL DEFAULT 'internal',
+          confidence_label TEXT NOT NULL DEFAULT '暂不强调',
+          confidence_rationale_json TEXT NOT NULL DEFAULT '{}',
+          rationale_json TEXT NOT NULL DEFAULT '{}',
+          created_at TEXT NOT NULL DEFAULT (datetime('now')),
+          updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+          UNIQUE (
+            replay_run_id, model_version, horizon_days, asset_type,
+            same_category_key, prediction_month, evaluation_window
+          )
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_model_applicability_profiles_run "
+        "ON model_applicability_profiles(replay_run_id, model_version, horizon_days, output_role)"
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS model_shadow_routes (
+          id INTEGER PRIMARY KEY,
+          replay_run_id INTEGER NOT NULL REFERENCES model_replay_runs(id) ON DELETE CASCADE,
+          route_name TEXT NOT NULL,
+          horizon_days INTEGER NOT NULL,
+          prediction_month TEXT NOT NULL,
+          status TEXT NOT NULL DEFAULT 'shadow_only',
+          training_cutoff TEXT,
+          baseline_floor REAL NOT NULL,
+          monthly_turnover_cap REAL NOT NULL,
+          realized_turnover REAL NOT NULL,
+          weights_json TEXT NOT NULL,
+          shadow_metrics_json TEXT NOT NULL DEFAULT '{}',
+          baseline_metrics_json TEXT NOT NULL DEFAULT '{}',
+          comparison_json TEXT NOT NULL DEFAULT '{}',
+          created_at TEXT NOT NULL DEFAULT (datetime('now')),
+          updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+          UNIQUE (replay_run_id, route_name, horizon_days, prediction_month)
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_model_shadow_routes_run "
+        "ON model_shadow_routes(replay_run_id, route_name, horizon_days, status)"
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS model_governance_reviews (
+          id INTEGER PRIMARY KEY,
+          replay_run_id INTEGER NOT NULL REFERENCES model_replay_runs(id) ON DELETE CASCADE,
+          review_month TEXT NOT NULL,
+          status TEXT NOT NULL DEFAULT 'review_only',
+          summary_text TEXT NOT NULL,
+          report_json TEXT NOT NULL DEFAULT '{}',
+          production_defaults_changed INTEGER NOT NULL DEFAULT 0,
+          promotion_review_eligible INTEGER NOT NULL DEFAULT 0,
+          created_at TEXT NOT NULL DEFAULT (datetime('now')),
+          updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+          UNIQUE (replay_run_id, review_month)
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_model_governance_reviews_run "
+        "ON model_governance_reviews(replay_run_id, review_month, status)"
+    )
+    _ensure_columns(
+        conn,
+        "model_health_metrics",
+        {
+            "confidence_label": "TEXT NOT NULL DEFAULT '暂不强调'",
+            "confidence_rationale_json": "TEXT NOT NULL DEFAULT '{}'",
+        },
+    )
+    _ensure_columns(
+        conn,
+        "model_applicability_profiles",
+        {
+            "confidence_label": "TEXT NOT NULL DEFAULT '暂不强调'",
+            "confidence_rationale_json": "TEXT NOT NULL DEFAULT '{}'",
+        },
+    )
+    conn.execute(
+        """
         CREATE TABLE IF NOT EXISTS agent_runs (
           id INTEGER PRIMARY KEY,
           role_type TEXT NOT NULL CHECK (role_type IN ('expert', 'jarvis')),
@@ -565,6 +714,15 @@ def list_outbound_messages(conn: sqlite3.Connection, limit: int = 50) -> list[sq
     ).fetchall()
 
 
+def _ensure_columns(conn: sqlite3.Connection, table: str, columns: dict[str, str]) -> None:
+    existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+    if not existing:
+        return
+    for column, definition in columns.items():
+        if column not in existing:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+
 def upsert_asset(conn: sqlite3.Connection, asset: dict[str, Any]) -> int:
     cursor = conn.execute(
         """
@@ -875,6 +1033,252 @@ def upsert_model_prediction_reliability(conn: sqlite3.Connection, reliability: d
         },
     )
     return int(cursor.fetchone()["id"])
+
+
+def upsert_model_health_metric(conn: sqlite3.Connection, metric: dict[str, Any]) -> int:
+    cursor = conn.execute(
+        """
+        INSERT INTO model_health_metrics(
+            replay_run_id, model_version, horizon_days, asset_type,
+            same_category_key, prediction_month, evaluation_window,
+            sample_count, direction_accuracy, rank_ic, bucket_spread,
+            top_bottom_decile_spread, mae, median_abs_error,
+            raw_high_conf_wrong_rate, coverage_rate, status, output_role,
+            promotion_status, degradation_reason, minimum_sample_met,
+            consumer_display_level, confidence_label, confidence_rationale_json,
+            last_promoted_at, last_demoted_at, metrics_json
+        )
+        VALUES (
+            :replay_run_id, :model_version, :horizon_days, :asset_type,
+            :same_category_key, :prediction_month, :evaluation_window,
+            :sample_count, :direction_accuracy, :rank_ic, :bucket_spread,
+            :top_bottom_decile_spread, :mae, :median_abs_error,
+            :raw_high_conf_wrong_rate, :coverage_rate, :status, :output_role,
+            :promotion_status, :degradation_reason, :minimum_sample_met,
+            :consumer_display_level, :confidence_label, :confidence_rationale_json,
+            :last_promoted_at, :last_demoted_at, :metrics_json
+        )
+        ON CONFLICT(
+            replay_run_id, model_version, horizon_days, asset_type,
+            same_category_key, prediction_month, evaluation_window
+        ) DO UPDATE SET
+            sample_count = excluded.sample_count,
+            direction_accuracy = excluded.direction_accuracy,
+            rank_ic = excluded.rank_ic,
+            bucket_spread = excluded.bucket_spread,
+            top_bottom_decile_spread = excluded.top_bottom_decile_spread,
+            mae = excluded.mae,
+            median_abs_error = excluded.median_abs_error,
+            raw_high_conf_wrong_rate = excluded.raw_high_conf_wrong_rate,
+            coverage_rate = excluded.coverage_rate,
+            status = excluded.status,
+            output_role = excluded.output_role,
+            promotion_status = excluded.promotion_status,
+            degradation_reason = excluded.degradation_reason,
+            minimum_sample_met = excluded.minimum_sample_met,
+            consumer_display_level = excluded.consumer_display_level,
+            confidence_label = excluded.confidence_label,
+            confidence_rationale_json = excluded.confidence_rationale_json,
+            last_promoted_at = excluded.last_promoted_at,
+            last_demoted_at = excluded.last_demoted_at,
+            metrics_json = excluded.metrics_json,
+            updated_at = datetime('now')
+        RETURNING id
+        """,
+        metric,
+    )
+    return int(cursor.fetchone()["id"])
+
+
+def list_model_health_metrics(conn: sqlite3.Connection, replay_run_id: int | None = None) -> list[sqlite3.Row]:
+    if replay_run_id is None:
+        return conn.execute(
+            """
+            SELECT *
+            FROM model_health_metrics
+            ORDER BY replay_run_id DESC, model_version, horizon_days,
+                     asset_type, same_category_key, prediction_month,
+                     evaluation_window
+            """
+        ).fetchall()
+    return conn.execute(
+        """
+        SELECT *
+        FROM model_health_metrics
+        WHERE replay_run_id = ?
+        ORDER BY model_version, horizon_days, asset_type, same_category_key,
+                 prediction_month, evaluation_window
+        """,
+        (replay_run_id,),
+    ).fetchall()
+
+
+def upsert_model_applicability_profile(conn: sqlite3.Connection, profile: dict[str, Any]) -> int:
+    cursor = conn.execute(
+        """
+        INSERT INTO model_applicability_profiles(
+            replay_run_id, source_metric_id, model_version, horizon_days,
+            asset_type, same_category_key, prediction_month, evaluation_window,
+            output_role, ranking_disabled, ranking_disable_reason,
+            promotion_status, degradation_reason, minimum_sample_met,
+            consumer_display_level, confidence_label, confidence_rationale_json,
+            rationale_json
+        )
+        VALUES (
+            :replay_run_id, :source_metric_id, :model_version, :horizon_days,
+            :asset_type, :same_category_key, :prediction_month, :evaluation_window,
+            :output_role, :ranking_disabled, :ranking_disable_reason,
+            :promotion_status, :degradation_reason, :minimum_sample_met,
+            :consumer_display_level, :confidence_label, :confidence_rationale_json,
+            :rationale_json
+        )
+        ON CONFLICT(
+            replay_run_id, model_version, horizon_days, asset_type,
+            same_category_key, prediction_month, evaluation_window
+        ) DO UPDATE SET
+            source_metric_id = excluded.source_metric_id,
+            output_role = excluded.output_role,
+            ranking_disabled = excluded.ranking_disabled,
+            ranking_disable_reason = excluded.ranking_disable_reason,
+            promotion_status = excluded.promotion_status,
+            degradation_reason = excluded.degradation_reason,
+            minimum_sample_met = excluded.minimum_sample_met,
+            consumer_display_level = excluded.consumer_display_level,
+            confidence_label = excluded.confidence_label,
+            confidence_rationale_json = excluded.confidence_rationale_json,
+            rationale_json = excluded.rationale_json,
+            updated_at = datetime('now')
+        RETURNING id
+        """,
+        profile,
+    )
+    return int(cursor.fetchone()["id"])
+
+
+def list_model_applicability_profiles(conn: sqlite3.Connection, replay_run_id: int | None = None) -> list[sqlite3.Row]:
+    if replay_run_id is None:
+        return conn.execute(
+            """
+            SELECT *
+            FROM model_applicability_profiles
+            ORDER BY replay_run_id DESC, model_version, horizon_days,
+                     asset_type, same_category_key, prediction_month,
+                     evaluation_window
+            """
+        ).fetchall()
+    return conn.execute(
+        """
+        SELECT *
+        FROM model_applicability_profiles
+        WHERE replay_run_id = ?
+        ORDER BY model_version, horizon_days, asset_type, same_category_key,
+                 prediction_month, evaluation_window
+        """,
+        (replay_run_id,),
+    ).fetchall()
+
+
+def upsert_model_shadow_route(conn: sqlite3.Connection, route: dict[str, Any]) -> int:
+    cursor = conn.execute(
+        """
+        INSERT INTO model_shadow_routes(
+            replay_run_id, route_name, horizon_days, prediction_month, status,
+            training_cutoff, baseline_floor, monthly_turnover_cap,
+            realized_turnover, weights_json, shadow_metrics_json,
+            baseline_metrics_json, comparison_json
+        )
+        VALUES (
+            :replay_run_id, :route_name, :horizon_days, :prediction_month, :status,
+            :training_cutoff, :baseline_floor, :monthly_turnover_cap,
+            :realized_turnover, :weights_json, :shadow_metrics_json,
+            :baseline_metrics_json, :comparison_json
+        )
+        ON CONFLICT(replay_run_id, route_name, horizon_days, prediction_month) DO UPDATE SET
+            status = excluded.status,
+            training_cutoff = excluded.training_cutoff,
+            baseline_floor = excluded.baseline_floor,
+            monthly_turnover_cap = excluded.monthly_turnover_cap,
+            realized_turnover = excluded.realized_turnover,
+            weights_json = excluded.weights_json,
+            shadow_metrics_json = excluded.shadow_metrics_json,
+            baseline_metrics_json = excluded.baseline_metrics_json,
+            comparison_json = excluded.comparison_json,
+            updated_at = datetime('now')
+        RETURNING id
+        """,
+        route,
+    )
+    return int(cursor.fetchone()["id"])
+
+
+def list_model_shadow_routes(
+    conn: sqlite3.Connection,
+    replay_run_id: int | None = None,
+    route_name: str | None = None,
+) -> list[sqlite3.Row]:
+    filters = []
+    params: list[Any] = []
+    if replay_run_id is not None:
+        filters.append("replay_run_id = ?")
+        params.append(replay_run_id)
+    if route_name is not None:
+        filters.append("route_name = ?")
+        params.append(route_name)
+    where = f"WHERE {' AND '.join(filters)}" if filters else ""
+    return conn.execute(
+        f"""
+        SELECT *
+        FROM model_shadow_routes
+        {where}
+        ORDER BY replay_run_id DESC, route_name, horizon_days, prediction_month
+        """,
+        params,
+    ).fetchall()
+
+
+def upsert_model_governance_review(conn: sqlite3.Connection, review: dict[str, Any]) -> int:
+    cursor = conn.execute(
+        """
+        INSERT INTO model_governance_reviews(
+            replay_run_id, review_month, status, summary_text, report_json,
+            production_defaults_changed, promotion_review_eligible
+        )
+        VALUES (
+            :replay_run_id, :review_month, :status, :summary_text, :report_json,
+            :production_defaults_changed, :promotion_review_eligible
+        )
+        ON CONFLICT(replay_run_id, review_month) DO UPDATE SET
+            status = excluded.status,
+            summary_text = excluded.summary_text,
+            report_json = excluded.report_json,
+            production_defaults_changed = excluded.production_defaults_changed,
+            promotion_review_eligible = excluded.promotion_review_eligible,
+            updated_at = datetime('now')
+        RETURNING id
+        """,
+        review,
+    )
+    return int(cursor.fetchone()["id"])
+
+
+def list_model_governance_reviews(conn: sqlite3.Connection, replay_run_id: int | None = None) -> list[sqlite3.Row]:
+    if replay_run_id is None:
+        return conn.execute(
+            """
+            SELECT *
+            FROM model_governance_reviews
+            ORDER BY replay_run_id DESC, review_month DESC
+            """
+        ).fetchall()
+    return conn.execute(
+        """
+        SELECT *
+        FROM model_governance_reviews
+        WHERE replay_run_id = ?
+        ORDER BY review_month DESC
+        """,
+        (replay_run_id,),
+    ).fetchall()
 
 
 def upsert_backtest_run(conn: sqlite3.Connection, run: dict[str, Any]) -> int:

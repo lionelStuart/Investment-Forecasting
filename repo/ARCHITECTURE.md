@@ -196,7 +196,8 @@ optional documentation pass.
   monitoring, rank validation, and model reliability reporting.
 - Inputs: Historical price/fund data and stored features.
 - Outputs: Forecasts, backtest runs/results, risk metrics, scores,
-  calibration reports, model monitoring reports, and replay audit reports.
+  calibration reports, model monitoring reports, replay audit reports, and
+  model-health fact rows.
 - Forbidden Changes: Do not allow future leakage or unrecorded model versions.
 - Model reliability policy: introduce interpretable candidate models before
   tree/deep models; evaluate candidates with IC, Rank IC, bucket spread,
@@ -209,6 +210,38 @@ optional documentation pass.
   default changes. Expert committee predictions, Jarvis conclusions,
   investment advice, MCP/WebUI surfaces, and portfolio outcomes are outside the
   first replay-audit scope.
+- Model applicability policy: model roles are context-specific. A model/horizon
+  can be a valid allocation-bias signal while invalid as a same-type ranking
+  signal. Routing changes must run shadow-only until future review, and
+  `router_floor70_cap05` must not alter operational `model_predictions`.
+  Same-type ranking is disabled when same-type Rank IC or bucket spread is
+  non-positive. Raw confidence is evidence quality, not success probability.
+- Model-health fact layer: `model_health_metrics` persists replay-derived
+  metrics by replay run, model, horizon, asset type, same-category key,
+  prediction month, and evaluation window. It is generated from matured
+  `model_replay_predictions` only and remains model-layer evidence until later
+  applicability/profile tasks explicitly consume it.
+- Model-applicability profile layer: `model_applicability_profiles` derives
+  context-specific output roles from `model_health_metrics` and records the
+  source metric id plus rationale. Same-type ranking is disabled when
+  same-category Rank IC or bucket spread is non-positive; profile generation
+  does not update operational forecasts or downstream product behavior.
+- Shadow-router evidence layer: `model_shadow_routes` persists
+  `router_floor70_cap05` monthly weights, training cutoff, turnover, shadow
+  metrics, fixed-baseline comparison, and guardrail metadata. It is generated
+  from replay rows only, keeps status `shadow_only`, and cannot write
+  `model_predictions`.
+- Confidence calibration labels: model-health and applicability records carry
+  conservative `confidence_label` values. Labels treat raw confidence as
+  evidence quality, not success probability; strong labels require positive
+  rank/bucket evidence, controlled calibration/overconfidence metrics, and
+  multiple matured monthly windows.
+- Monthly governance reviews: `model_governance_reviews` persists
+  review-only monthly summaries generated from health, applicability,
+  confidence-label, and shadow-router evidence. Reviews answer safe-default,
+  continue-shadow, downgrade/disable, and promotion-review questions, record
+  promotion blockers, and keep `production_defaults_changed=0` unless a future
+  product review explicitly approves promotion.
 - `investment_forecasting.quant.benchmarks` owns benchmark selection for
   stored scoring workflows: funds prefer same-bucket peer-average benchmarks,
   then fall back explicitly to stored 沪深300 history; non-fund assets use

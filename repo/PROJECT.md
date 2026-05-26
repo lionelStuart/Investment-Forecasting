@@ -57,6 +57,10 @@ capital protection, guaranteed returns, or direct instructions to buy or sell.
   regenerate daily predictions from stored local history, score only matured
   outcomes, and use accuracy/confidence diagnostics to define tuning
   experiments before model defaults change.
+- Optimize model prediction strategy through context-specific applicability
+  governance: model health by horizon/scope, shadow routing before promotion,
+  same-type ranking disable rules, and confidence labels grounded in replay
+  evidence.
 - Introduce a system-scheduled Codex agent runtime access layer: the system
   owns triggers, audit, validation, persistence, and UI, while Codex runs
   expert and Jarvis role tasks through injected project skills, role prompts,
@@ -125,6 +129,12 @@ capital protection, guaranteed returns, or direct instructions to buy or sell.
 - Model tuning must be evidence-led. Replaying and scoring historical
   predictions comes before parameter changes, model promotion, or stronger
   confidence language.
+- Model suitability is conditional. A model can be valid as a broad allocation
+  bias while invalid as a same-type ranking signal; implementation must encode
+  that distinction instead of relying on a single global score.
+- Routing changes must run in shadow mode before production use, and shadow
+  outputs must not alter operational predictions or downstream product
+  behavior during the governance phase.
 - Time-series evaluation must avoid future leakage and random sample splitting.
 - All scheduled jobs must be idempotent where practical and must write logs.
 - Data updates must support retry, validation, and recoverable failure handling.
@@ -218,6 +228,11 @@ capital protection, guaranteed returns, or direct instructions to buy or sell.
   configured model would have predicted on past dates using only information
   available at each prediction date. Replay evidence does not overwrite
   operational `model_predictions`.
+- `Model Applicability Profile`: A context-specific role assignment that says
+  whether a model/horizon/scope is usable as primary forecast, allocation bias,
+  ranking signal, risk reference, or observation-only.
+- `Shadow Router`: A model routing experiment that produces comparison
+  evidence without changing operational predictions.
 - `MCP Tool`: A structured callable interface used by AI agents to retrieve data
   or run system capabilities.
 
@@ -261,11 +276,31 @@ capital protection, guaranteed returns, or direct instructions to buy or sell.
 - `jarvis:generate-notify`: `investment-forecasting jarvis generate --db data/investment_forecasting.sqlite3 --date YYYYMMDD --notify-recipient-key owner_phone --notification-dry-run`
 - `web:run`: `investment-forecasting web run --db data/investment_forecasting.sqlite3 --host 127.0.0.1 --port 8765`
 - `calibration:run`: `investment-forecasting calibration run --db data/investment_forecasting.sqlite3 --date YYYYMMDD --horizons 5,20,60 --lookback-days 60`
-- `model-validation:replay-ytd`: Planned by `TASK-090`;
+- `model-validation:replay-ytd`: implemented by `TASK-090`;
   `investment-forecasting model-validation replay-ytd --db data/investment_forecasting.sqlite3 --year 2026 --horizons 5,20,60`
-- `model-validation:report`: Planned by `TASK-091`;
+- `model-validation:report`: implemented by `TASK-091`;
   `investment-forecasting model-validation report --db data/investment_forecasting.sqlite3 --run-id latest`
-- `model-validation:tuning-plan`: Planned by `TASK-092`;
+- `model-validation:tuning-plan`: implemented by `TASK-092`;
   `investment-forecasting model-validation tuning-plan --db data/investment_forecasting.sqlite3 --run-id latest`
+- `model-validation:health-generate`: implemented by `TASK-093`;
+  `investment-forecasting model-validation health-generate --db data/investment_forecasting.sqlite3 --run-id latest`
+- `model-validation:health-report`: implemented by `TASK-093`;
+  `investment-forecasting model-validation health-report --db data/investment_forecasting.sqlite3 --run-id latest`
+- `model-validation:applicability-generate`: implemented by `TASK-094`;
+  `investment-forecasting model-validation applicability-generate --db data/investment_forecasting.sqlite3 --run-id latest`
+- `model-validation:applicability-report`: implemented by `TASK-094`;
+  `investment-forecasting model-validation applicability-report --db data/investment_forecasting.sqlite3 --run-id latest`
+- `model-validation:shadow-router-run`: implemented by `TASK-095`;
+  `investment-forecasting model-validation shadow-router-run --db data/investment_forecasting.sqlite3 --run-id latest`
+- `model-validation:shadow-router-report`: implemented by `TASK-095`;
+  `investment-forecasting model-validation shadow-router-report --db data/investment_forecasting.sqlite3 --run-id latest`
+- `model-validation:confidence-labels-generate`: implemented by `TASK-096`;
+  `investment-forecasting model-validation confidence-labels-generate --db data/investment_forecasting.sqlite3 --run-id latest`
+- `model-validation:confidence-labels-report`: implemented by `TASK-096`;
+  `investment-forecasting model-validation confidence-labels-report --db data/investment_forecasting.sqlite3 --run-id latest`
+- `model-validation:governance-generate`: implemented by `TASK-097`;
+  `investment-forecasting model-validation governance-generate --db data/investment_forecasting.sqlite3 --run-id latest`
+- `model-validation:governance-report`: implemented by `TASK-097`;
+  `investment-forecasting model-validation governance-report --db data/investment_forecasting.sqlite3 --run-id latest`
 - `test`: `python3 -m pytest`
 - `build`: Not defined. The MVP WebUI is a local server-rendered workbench.

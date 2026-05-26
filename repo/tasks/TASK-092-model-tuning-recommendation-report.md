@@ -2,7 +2,7 @@
 
 ## Status
 
-pending
+completed
 
 ## Purpose
 
@@ -67,6 +67,16 @@ ranking quality, and confidence calibration only.
 ## Test Plan
 
 - `python3 -m pytest tests/test_model_validation.py -q`
+
+## Completion Notes
+
+- Added `investment-forecasting model-validation tuning-plan`.
+- Tuning recommendations are persisted on `model_replay_runs` and include
+  priority, affected scope, triggering metrics, experiment, verification
+  metric, stop condition, and model confidence impact.
+- The 2026 replay run produced recommendations for rank gates, alpha strength
+  reduction, probability calibration, and confidence cooling before any model
+  default change.
 
 ## Depends On
 

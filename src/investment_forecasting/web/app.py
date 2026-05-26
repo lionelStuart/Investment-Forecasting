@@ -7,7 +7,7 @@ from datetime import date, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlencode, urlparse
 
 from investment_forecasting.communication.imessage import system_preflight
 from investment_forecasting.communication.service import CommunicationError, send_outbound_message
@@ -276,6 +276,9 @@ def render_themes(db_path: Path, query: dict[str, list[str]]) -> str:
 
 
 def render_data(db_path: Path, query: dict[str, list[str]]) -> str:
+    table_tab = str(_first_query_value(query, "table_tab", "history") or "history")
+    if table_tab not in {"history", "features"}:
+        table_tab = "history"
     with connect(db_path) as conn:
         assets = conn.execute("SELECT * FROM assets ORDER BY asset_type, code").fetchall()
         selected_id = int(query.get("asset_id", [assets[0]["id"] if assets else 0])[0] or 0)
@@ -335,12 +338,26 @@ def render_data(db_path: Path, query: dict[str, list[str]]) -> str:
             """,
             (selected_id,),
         ).fetchall()
-    selector = asset_selector(assets, selected_id, "/data")
+    selector = asset_selector(
+        assets,
+        selected_id,
+        "/data",
+        hidden={
+            "table_tab": table_tab,
+            "range": _first_query_value(query, "range"),
+            "start_date": _first_query_value(query, "start_date"),
+            "end_date": _first_query_value(query, "end_date"),
+        },
+    )
     chart_rows = list(reversed(history))
+    tab_content = data_table_tab_panels(
+        history,
+        features,
+        active_tab=table_tab,
+    )
     body = section("资产概览", selector + selected_asset_summary(selected_asset, selected_prediction, category) + category_context_panel(category, peers))
     body += section("涨幅曲线", return_curve(chart_rows, asset_id=selected_id, date_window=date_window))
-    body += section("行情 / 净值历史", table(history, ["trade_date", "close", "adjusted_close", "nav", "volume", "amount", "pct_change", "source"]))
-    body += section("量化指标", table(features, ["feature_date", "return_1d", "return_20d", "volatility_20d", "max_drawdown_60d", "sharpe_60d", "calmar_60d", "win_rate_60d", "market_state", "source"]))
+    body += section("行情与量化指标", data_table_tabs(query, selected_id, table_tab) + tab_content)
     body += section("技术明细", collapsible("完整资产表", table(assets, ["id", "code", "name", "asset_type", "market", "status", "source"])))
     return render_page("数据与曲线", body, "/data")
 
@@ -2042,6 +2059,7 @@ def render_page(title: str, body: str, active_path: str) -> str:
     <header><h1>{escape(title)}</h1><p>用本地研究数据、模型证据和专家复盘辅助理解市场与风险边界，不承诺收益。</p></header>
     {body}
   </main>
+  <script>{JS}</script>
 </body>
 </html>"""
 
@@ -3511,6 +3529,40 @@ def _first_query_value(query: dict[str, list[str]], key: str, default: Any = Non
     return values[0] if values else default
 
 
+def query_url(path: str, query: dict[str, list[str]], **updates: Any) -> str:
+    params: dict[str, Any] = {key: values[0] for key, values in query.items() if values}
+    for key, value in updates.items():
+        if value in (None, ""):
+            params.pop(key, None)
+        else:
+            params[key] = value
+    encoded = urlencode(params)
+    return f"{path}?{encoded}" if encoded else path
+
+
+def data_table_tabs(query: dict[str, list[str]], selected_id: int, active_tab: str) -> str:
+    tabs = [
+        ("history", "行情 / 净值历史"),
+        ("features", "量化指标"),
+    ]
+    links = "".join(
+        f'<button class="tab-link {"active" if key == active_tab else ""}" type="button" role="tab" aria-selected="{str(key == active_tab).lower()}" data-tab-target="{escape(key)}" data-tab-url="{escape(query_url("/data", query, asset_id=selected_id, table_tab=key))}">{escape(label)}</button>'
+        for key, label in tabs
+    )
+    return f'<div class="tab-bar" role="tablist" aria-label="行情与量化指标切换">{links}</div>'
+
+
+def data_table_tab_panels(history: Any, features: Any, *, active_tab: str) -> str:
+    history_table = table(history, ["trade_date", "close", "adjusted_close", "nav", "volume", "amount", "pct_change", "source"])
+    feature_table = table(features, ["feature_date", "return_1d", "return_20d", "volatility_20d", "max_drawdown_60d", "sharpe_60d", "calmar_60d", "win_rate_60d", "market_state", "source"])
+    return "\n".join(
+        [
+            f'<div class="tab-panel {"active" if active_tab == "history" else ""}" data-tab-panel="history" role="tabpanel">{history_table}</div>',
+            f'<div class="tab-panel {"active" if active_tab == "features" else ""}" data-tab-panel="features" role="tabpanel">{feature_table}</div>',
+        ]
+    )
+
+
 def _preference_from_query(query: dict[str, list[str]]) -> dict[str, Any]:
     risk_profile = _first_query_value(query, "risk_profile", "balanced")
     if risk_profile not in {"aggressive", "balanced", "conservative"}:
@@ -3784,12 +3836,17 @@ def table(rows: Any, columns: list[str], escape_cells: bool = True) -> str:
     return f'<div class="table-wrap"><table><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table></div>'
 
 
-def asset_selector(assets: Any, selected_id: int, path: str) -> str:
+def asset_selector(assets: Any, selected_id: int, path: str, hidden: dict[str, Any] | None = None) -> str:
     options = "".join(
         f'<option value="{asset["id"]}" {"selected" if asset["id"] == selected_id else ""}>{escape(asset["code"])} · {escape(asset["name"])}</option>'
         for asset in assets
     )
-    return f'<form class="toolbar" method="get" action="{path}"><select name="asset_id">{options}</select><button type="submit">查看</button></form>'
+    hidden_inputs = "".join(
+        f'<input type="hidden" name="{escape(key)}" value="{escape(value)}">'
+        for key, value in (hidden or {}).items()
+        if value not in (None, "")
+    )
+    return f'<form class="toolbar" method="get" action="{path}">{hidden_inputs}<select name="asset_id">{options}</select><button type="submit">查看</button></form>'
 
 
 def advice_selector(history: Any, selected_id: int) -> str:
@@ -4709,6 +4766,38 @@ def escape(value: Any) -> str:
     return html.escape(str(value), quote=True)
 
 
+JS = """
+document.addEventListener('DOMContentLoaded', () => {
+  document.querySelectorAll('.tab-bar').forEach((bar) => {
+    bar.addEventListener('click', (event) => {
+      const link = event.target.closest('.tab-link[data-tab-target]');
+      if (!link || !bar.contains(link)) {
+        return;
+      }
+      const scope = link.closest('section') || document;
+      const target = link.dataset.tabTarget;
+      const targetPanel = scope.querySelector(`[data-tab-panel="${target}"]`);
+      if (!target || !targetPanel) {
+        return;
+      }
+      event.preventDefault();
+      bar.querySelectorAll('.tab-link[data-tab-target]').forEach((item) => {
+        const active = item === link;
+        item.classList.toggle('active', active);
+        item.setAttribute('aria-selected', active ? 'true' : 'false');
+      });
+      scope.querySelectorAll('.tab-panel[data-tab-panel]').forEach((panel) => {
+        panel.classList.toggle('active', panel === targetPanel);
+      });
+      if (link.dataset.tabUrl && window.history && window.history.replaceState) {
+        window.history.replaceState(null, '', link.dataset.tabUrl);
+      }
+    });
+  });
+});
+"""
+
+
 CSS = """
 :root{color-scheme:light;--bg:#f5f7f8;--panel:#ffffff;--ink:#1b2528;--muted:#637176;--line:#d7e0e3;--accent:#0f766e;--warn:#a16207;--bad:#b91c1c;--market-up:#b91c1c;--market-down:#0f766e;--market-flat:#637176}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;display:grid;grid-template-columns:232px minmax(0,1fr);min-height:100vh}
@@ -4720,7 +4809,7 @@ section{background:var(--panel);border:1px solid var(--line);border-radius:8px;m
 .market-signal{display:inline-flex;align-items:baseline;gap:4px;font-weight:750;white-space:nowrap}.market-signal b{font-size:.92em}.market-signal small{font-size:11px;font-weight:650}.market-up{color:var(--market-up)}.market-down{color:var(--market-down)}.market-flat{color:var(--market-flat)}
 .table-wrap{overflow:auto;border:1px solid var(--line);border-radius:6px}table{width:100%;border-collapse:collapse;min-width:760px}th,td{padding:8px 10px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top;white-space:nowrap}th{background:#edf4f3;font-size:12px;color:#37474c;position:sticky;top:0}td{max-width:260px;overflow:hidden;text-overflow:ellipsis}
 .toolbar{display:flex;gap:8px;margin-bottom:12px}select,button{height:34px;border:1px solid var(--line);border-radius:6px;background:#fff;padding:0 10px}button{background:var(--accent);color:#fff;border-color:var(--accent);font-weight:650}
-.settings-form,.filter-form{display:grid;grid-template-columns:repeat(3,minmax(160px,1fr));gap:12px}.settings-form label,.filter-form label{display:grid;gap:6px;color:var(--muted);font-size:12px}.settings-form input,.settings-form select,.filter-form input,.filter-form select{height:34px;border:1px solid var(--line);border-radius:6px;background:#fff;padding:0 10px;color:var(--ink);font-size:14px}.settings-form .wide{grid-column:span 2}.filter-form .checkbox{display:flex;align-items:center;gap:8px;color:var(--ink);font-size:14px}.filter-form .checkbox input{height:auto}.notice{border:1px solid #b9ded8;background:#e3f4f1;color:#0f5f59;border-radius:6px;padding:10px;margin-bottom:12px;font-weight:650}.preset-bar{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px}.preset-link{border:1px solid var(--line);border-radius:6px;background:#fff;color:#0f5f59;text-decoration:none;padding:7px 10px;font-weight:650}.preset-link.active{background:#e3f4f1;border-color:#95c9c3}
+.settings-form,.filter-form{display:grid;grid-template-columns:repeat(3,minmax(160px,1fr));gap:12px}.settings-form label,.filter-form label{display:grid;gap:6px;color:var(--muted);font-size:12px}.settings-form input,.settings-form select,.filter-form input,.filter-form select{height:34px;border:1px solid var(--line);border-radius:6px;background:#fff;padding:0 10px;color:var(--ink);font-size:14px}.settings-form .wide{grid-column:span 2}.filter-form .checkbox{display:flex;align-items:center;gap:8px;color:var(--ink);font-size:14px}.filter-form .checkbox input{height:auto}.notice{border:1px solid #b9ded8;background:#e3f4f1;color:#0f5f59;border-radius:6px;padding:10px;margin-bottom:12px;font-weight:650}.preset-bar,.tab-bar{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px}.preset-link,.tab-link{border:1px solid var(--line);border-radius:6px;background:#fff;color:#0f5f59;text-decoration:none;padding:7px 10px;font:inherit;font-weight:650;cursor:pointer}.preset-link.active,.tab-link.active{background:#e3f4f1;border-color:#0f766e;color:#0f5f59}.tab-link{min-width:118px;text-align:center}.tab-link:hover{border-color:#95c9c3;background:#f1faf8}.tab-link:focus-visible{outline:2px solid #0f766e;outline-offset:2px}.tab-panel{display:none}.tab-panel.active{display:block}
 .notice.warn{border-color:#e2c66f;background:#fffaf0;color:#7c4a03}.today-hero{display:flex;justify-content:space-between;gap:18px;align-items:flex-start;border:1px solid #b9ded8;border-left:5px solid var(--accent);border-radius:8px;background:#fbfdfd;padding:16px}.today-hero span{display:block;color:var(--muted);font-size:12px}.today-hero h2{font-size:28px;line-height:1.2;margin:5px 0 8px;color:#0f5f59}.today-hero p{margin:0 0 8px;max-width:920px}.today-hero small{display:block;color:var(--muted)}.today-hero strong{flex:0 0 auto;background:#e3f4f1;color:#0f5f59;border:1px solid #b9ded8;border-radius:999px;padding:5px 10px}.jarvis-entry{display:flex;justify-content:space-between;gap:16px;align-items:center;border:1px solid var(--line);border-left:4px solid var(--accent);border-radius:8px;background:#fbfdfd;padding:14px;color:var(--ink);text-decoration:none}.jarvis-entry:hover{border-color:#95c9c3;background:#f1faf8}.jarvis-entry span{display:block;color:var(--muted);font-size:12px}.jarvis-entry strong{display:block;margin-top:4px;font-size:22px;color:#0f5f59}.jarvis-entry b{color:#0f5f59}.jarvis-hero{display:flex;justify-content:space-between;gap:18px;align-items:flex-start;border:1px solid var(--line);border-radius:8px;background:#fbfdfd;padding:14px;margin-bottom:12px}.jarvis-hero span{color:var(--muted);font-size:12px}.jarvis-hero h2{font-size:28px;margin:4px 0 8px}.jarvis-hero p{margin:0;max-width:920px}.jarvis-hero strong{background:#e3f4f1;color:#0f5f59;border:1px solid #b9ded8;border-radius:999px;padding:5px 10px}.jarvis-focus-grid{display:grid;grid-template-columns:repeat(3,minmax(160px,1fr));gap:10px;margin-bottom:14px}.jarvis-focus-card{border:1px solid var(--line);border-radius:8px;background:#fff;padding:12px}.jarvis-focus-card span{display:block;color:var(--muted);font-size:12px}.jarvis-focus-card strong{display:block;margin:5px 0;font-size:18px;color:#0f5f59}.jarvis-focus-card p{margin:0}.jarvis-subsection{margin-top:16px}.jarvis-subsection h3{margin:0 0 8px;font-size:14px}.jarvis-expert-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:10px}.jarvis-expert-card{display:block;border:1px solid var(--line);border-left:4px solid var(--accent);border-radius:8px;background:#fbfdfd;padding:10px;color:var(--ink);text-decoration:none}.jarvis-expert-card:hover{border-color:#95c9c3;background:#f1faf8}.jarvis-expert-card p{margin:8px 0;color:var(--ink)}.jarvis-evidence-links{display:grid;grid-template-columns:repeat(5,minmax(110px,1fr));gap:10px}.jarvis-evidence-links a{border:1px solid var(--line);border-radius:8px;background:#fbfdfd;padding:10px;color:var(--ink);text-decoration:none}.jarvis-evidence-links a:hover{border-color:#95c9c3;background:#f1faf8}.jarvis-evidence-links span{display:block;color:var(--muted);font-size:12px}.jarvis-evidence-links strong{display:block;margin-top:4px;color:#0f5f59;font-size:20px}
 .dashboard-brief{display:grid;grid-template-columns:minmax(260px,1.05fr) minmax(320px,1fr);gap:12px;margin-bottom:14px}.dashboard-brief-main,.dashboard-brief-reasons{border:1px solid var(--line);border-radius:8px;background:#fbfdfd;padding:14px}.dashboard-brief-main span,.dashboard-brief-main small{display:block;color:var(--muted);font-size:12px}.dashboard-brief-main h2{margin:4px 0 8px;font-size:24px;color:#0f5f59}.dashboard-brief-main p{margin:0 0 8px}.dashboard-brief-reasons strong{display:block;margin-bottom:8px}.dashboard-brief-reasons ol{margin:0;padding-left:20px}.dashboard-brief-reasons li{margin:5px 0}.run-health h3{margin:0 0 8px;font-size:14px}.run-health-grid{display:grid;grid-template-columns:repeat(4,minmax(170px,1fr));gap:10px}.run-health-card{border:1px solid var(--line);border-radius:8px;background:#fff;padding:10px;min-height:142px}.run-health-card div{display:flex;justify-content:space-between;gap:8px;align-items:flex-start}.run-health-card span,.run-health-card small{color:var(--muted);font-size:12px}.run-health-card strong{color:#0f5f59}.run-health-card p{margin:8px 0;color:var(--ink)}.run-health-card em{display:block;color:var(--muted);font-style:normal;font-size:12px}.run-health-card.ok{border-color:#b9ded8}.run-health-card.warn{border-color:#e2c66f;background:#fffaf0}.run-health-card.bad,.run-health-card.missing{border-color:#efb4b4;background:#fff8f8}.run-health-card.bad strong,.run-health-card.missing strong{color:var(--bad)}
 .score-card-grid,.evidence-chip-grid,.failure-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:10px}.score-card,.evidence-chip,.failure-card{border:1px solid var(--line);border-radius:8px;background:#fbfdfd;padding:12px;color:var(--ink);text-decoration:none}.score-card div,.failure-card div{display:flex;justify-content:space-between;gap:10px}.score-card span,.score-card small,.score-card em,.evidence-chip span,.evidence-chip small,.failure-card span,.failure-card em{display:block;color:var(--muted);font-size:12px;font-style:normal}.score-card strong,.evidence-chip strong,.failure-card strong{display:block;color:#0f5f59;font-size:20px}.score-card p,.failure-card p{margin:8px 0}.score-card.warn,.score-card.missing{border-color:#e2c66f;background:#fffaf0}.evidence-chip:hover{border-color:#95c9c3;background:#f1faf8}.failure-card{border-color:#efb4b4;background:#fff8f8}.failure-card strong{font-size:15px;color:var(--bad)}.link-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:8px}.link-grid a{border:1px solid var(--line);border-radius:6px;background:#fbfdfd;color:#0f5f59;text-decoration:none;padding:10px;font-weight:700}.link-grid a:hover{border-color:#95c9c3;background:#f1faf8}

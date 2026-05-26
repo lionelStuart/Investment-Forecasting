@@ -8,7 +8,7 @@ tables, or task families are added, removed, renamed, or materially repurposed.
 
 | Surface | File | Notes |
 | --- | --- | --- |
-| CLI | `src/investment_forecasting/cli.py` | Commands for DB init, polite/incremental ingestion with explicit provider selection, macro/capital-flow/fund-holding/news ingestion, features, market snapshots, forecasts, backtests, monitoring, advice, preferences, generic simulated portfolios, expert roster/portfolios, communication configuration/inspection/notifications, Jarvis brief generation, AI provider inspection/dry-run, agent-run inspection, scheduler inspection/manual runs, MCP, daily workflow, calibration, and WebUI. Planned model-validation commands are `model-validation replay-ytd`, `model-validation report`, and `model-validation tuning-plan` from `SPEC-014`. |
+| CLI | `src/investment_forecasting/cli.py` | Commands for DB init, polite/incremental ingestion with explicit provider selection, macro/capital-flow/fund-holding/news ingestion, features, market snapshots, forecasts, backtests, monitoring, advice, preferences, generic simulated portfolios, expert roster/portfolios, communication configuration/inspection/notifications, Jarvis brief generation, AI provider inspection/dry-run, agent-run inspection, scheduler inspection/manual runs, MCP, daily workflow, calibration, and WebUI. Model-validation commands include `replay-ytd`, `report`, `tuning-plan`, `health-generate/report`, `applicability-generate/report`, `shadow-router-run/report`, `confidence-labels-generate/report`, and `governance-generate/report`. |
 | WebUI server | `src/investment_forecasting/web/app.py` | Server-rendered Jarvis-first product routes, legacy technical routes, navigation, and product view helpers. |
 | MCP server | `src/investment_forecasting/mcp/server.py` | Official MCP stdio transport. |
 | MCP tools | `src/investment_forecasting/mcp/tools.py` | JSON-callable tool registry for assets, research workflows, advice, expert committee operations, Jarvis brief retrieval/generation, role-scoped agent manifests, agent output validation preview, and audited expert/Jarvis submission envelopes. |
@@ -24,7 +24,8 @@ tables, or task families are added, removed, renamed, or materially repurposed.
 | Providers | `src/investment_forecasting/providers/*.py` | AKShare default provider and optional Tushare provider, provider-specific fetching, normalization, retry/backoff, polite access policy, diagnostics, and optional Tushare news retrieval. |
 | Scheduler | `src/investment_forecasting/scheduler/*` | System-owned fixed job registry, due-job selection, incremental news/market/price/features handlers, scheduler watermarks, provider request budgets/backoff state, task readiness gates, and CLI/WebUI/MCP status/manual run commands. |
 | Quant | `src/investment_forecasting/quant/*.py` | Features, forecasts, backtests, benchmark selection, calibration, model monitoring, market snapshots, rank validation, candidate-model comparison, and model reliability metadata. |
-| Model validation replay | Planned `src/investment_forecasting/quant/model_validation.py` | Current-year daily forecast replay from stored local history, replay run/prediction persistence, matured outcome scoring, diagnostics by model/horizon/asset group/month/regime, and evidence-backed tuning recommendations for model accuracy and confidence only. Replay rows must not overwrite operational `model_predictions` and must not evaluate expert/Jarvis/advice outputs. |
+| Model validation replay | `src/investment_forecasting/quant/model_validation.py` | Current-year daily forecast replay from stored local history, replay run/prediction persistence, matured outcome scoring, diagnostics by model/horizon/asset group/month/regime, and evidence-backed tuning recommendations for model accuracy and confidence only. Replay rows must not overwrite operational `model_predictions` and must not evaluate expert/Jarvis/advice outputs. |
+| Model applicability governance | `src/investment_forecasting/quant/model_validation.py` | Context-specific model-health facts, model applicability profiles, same-type ranking disable rules, 20-day shadow router `router_floor70_cap05`, confidence labels, and monthly governance summaries. Production `model_predictions` remain unchanged. |
 | Advice | `src/investment_forecasting/advice/*.py` | Daily advice generation, target-volatility allocation proposals, correlation risk-budget evidence, capital-flow evidence summaries, benchmark-aware outcome scoring, compliance-oriented language. |
 | AI analysis | `src/investment_forecasting/ai_analysis.py` | Versioned expert/Jarvis prompt and output-schema contracts, bounded evidence packets, provider request builders, structured analysis output, compliance checks, unsupported prediction/news evidence validation, persisted provider/fallback metadata, and deterministic fallback. |
 | AI providers | `src/investment_forecasting/ai_providers/*` | Provider request/response/config contracts, environment config discovery, fake-provider dry runs, timeout/error fallback mapping, source metadata, and future model SDK/API calls. No other module should import model SDKs directly. |
@@ -117,7 +118,8 @@ readiness, submission audit, and persistence links.
 | Derived metrics | `features_daily`, `market_snapshots`, `macro_observations`, `capital_flow_observations` |
 | News evidence | `news_items`, `news_item_links`, `news_item_tags`, `news_feature_daily` |
 | Forecasting and evaluation | `model_predictions`, `backtest_runs`, `backtest_results`, `model_monitoring_reports`, `advice_outcome_scores` including benchmark identity/source, calibration-related records |
-| Model replay audit | Planned `model_replay_runs`, `model_replay_predictions` |
+| Model replay audit | `model_replay_runs`, `model_replay_predictions` for point-in-time YTD replay, matured/pending/skipped scoring, diagnostics, and tuning recommendations |
+| Model applicability governance | `model_health_metrics` for persisted replay-derived health facts and confidence labels, `model_applicability_profiles` for context-specific roles, confidence labels, and same-type ranking disables, `model_shadow_routes` for shadow-only router weights/metrics, `model_governance_reviews` for review-only monthly governance reports |
 | Advice and preferences | `daily_advice`, `user_preferences` |
 | AI analysis orchestration | `ai_analysis_records` |
 | Experts | `experts` |
@@ -134,7 +136,7 @@ readiness, submission audit, and persistence links.
 | --- | --- |
 | Persistence/schema | `tests/test_db.py` |
 | Data ingestion/quality | `tests/test_akshare_ingestion.py`, `tests/test_data_quality.py`, `tests/test_macro.py`, `tests/test_capital_flow.py`, `tests/test_fund_holdings.py` |
-| Quant and calibration | `tests/test_features.py`, `tests/test_market.py`, `tests/test_backtest.py`, `tests/test_calibration.py`, `tests/test_monitoring.py` |
+| Quant and calibration | `tests/test_features.py`, `tests/test_market.py`, `tests/test_backtest.py`, `tests/test_calibration.py`, `tests/test_monitoring.py`, `tests/test_model_validation.py` |
 | Advice | `tests/test_advice.py`, `tests/test_advice_scoring.py`, `tests/test_daily_workflow.py` |
 | Portfolio | `tests/test_portfolio.py` |
 | Expert scoring | `tests/test_expert_scoring.py` |
@@ -216,9 +218,14 @@ readiness, submission audit, and persistence links.
 | `TASK-087` incremental watermarks | `scheduler/service.py`, bounded news windows, market-context subject planning, per-asset price/NAV freshness, feature affected ranges, dry-run summaries, no-full-history tests |
 | `TASK-088` provider rate limits/backoff | `scheduler/registry.py`, `scheduler/service.py`, provider policy config, `provider_rate_limits`, deferred scheduler runs, task logs, rate-limit/backoff tests |
 | `TASK-089` hourly orchestration/health | `scheduler/`, `web/app.py`, `mcp/tools.py`, `cli.py scheduler status`, post-close and T/T+1 readiness gates, scheduler-health tests |
-| `TASK-090` YTD forecast replay corpus | Planned `quant/model_validation.py`, `db.py`, migrations, `cli.py model-validation replay-ytd`, `price_daily`, replay tables, `tests/test_model_validation.py` |
+| `TASK-090` YTD forecast replay corpus | `quant/model_validation.py`, `db.py`, migrations, `cli.py model-validation replay-ytd`, `price_daily`, replay tables, `tests/test_model_validation.py` |
 | `TASK-091` replay scoring diagnostics | `quant/model_validation.py`, `quant/backtest.py` scoring helpers, benchmark selection, replay metrics JSON, `tests/test_model_validation.py`, `tests/test_backtest.py` |
 | `TASK-092` model tuning recommendations | `quant/model_validation.py`, calibration/governance helpers, tuning recommendation schema, CLI report output, model-only scope checks, `tests/test_model_validation.py` |
+| `TASK-093` model health facts | `quant/model_validation.py`, `db.py`, migrations, `cli.py model-validation health-generate/health-report`, `model_health_metrics`, monthly/all-history health metrics, no-product-table-read tests |
+| `TASK-094` applicability profiles | `quant/model_validation.py`, `db.py`, migrations, `cli.py model-validation applicability-generate/applicability-report`, `model_applicability_profiles`, same-type ranking disable rules, no-production-prediction tests |
+| `TASK-095` 20-day shadow router | `quant/model_validation.py`, `db.py`, migrations, `cli.py model-validation shadow-router-run/shadow-router-report`, `model_shadow_routes`, walk-forward monthly weights, no operational prediction overwrite tests |
+| `TASK-096` confidence labels | `quant/model_validation.py`, `db.py`, migrations, `cli.py model-validation confidence-labels-generate/confidence-labels-report`, health/profile confidence labels, conservative gate tests |
+| `TASK-097` monthly governance summary | `quant/model_validation.py`, `db.py`, migrations, `cli.py model-validation governance-generate/governance-report`, `model_governance_reviews`, model-health/profile/shadow/confidence evidence, review-only guardrail tests |
 
 ## Development Guardrails
 
@@ -247,6 +254,12 @@ readiness, submission audit, and persistence links.
   recommendations before changing any model default. Do not include expert
   committee predictions, Jarvis conclusions, investment advice, MCP/WebUI
   surfaces, or portfolio outcomes in this phase.
+- For model applicability/shadow-routing work, follow `SPEC-015` and
+  `ADR-010`: derive context-specific model roles from health metrics, run
+  `router_floor70_cap05` as 20-day shadow-only evidence, disable same-type
+  ranking when same-type Rank IC or bucket spread is non-positive, downgrade
+  raw confidence into evidence-quality labels, and keep operational
+  `model_predictions` unchanged.
 - For the AI interaction layer, inspect `ai_analysis.py`, `jarvis/synthesis.py`,
   `experts/planning.py`, and the existing `ai_providers/` boundary before
   adding code. Do not create a second AI pipeline or call model SDKs from

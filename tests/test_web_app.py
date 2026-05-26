@@ -277,7 +277,22 @@ def test_workbench_pages_render_with_data(tmp_path):
     assert "资产概览" in rendered["/data"]
     assert "主题识别" in rendered["/data"]
     assert "技术明细" in rendered["/data"]
+    assert "行情与量化指标" in rendered["/data"]
     assert "行情 / 净值历史" in rendered["/data"]
+    assert "量化指标" in rendered["/data"]
+    assert "tab-link active" in rendered["/data"]
+    assert 'data-tab-panel="history" role="tabpanel"' in rendered["/data"]
+    assert 'data-tab-panel="features" role="tabpanel"' in rendered["/data"]
+    feature_tab = render_route(db_path, "/data", {"asset_id": ["1"], "table_tab": ["features"]})
+    tab_section = feature_tab.split("<h2>行情与量化指标</h2>", 1)[1].split("<h2>技术明细</h2>", 1)[0]
+    assert "量化指标" in feature_tab
+    assert "feature_date" in feature_tab
+    assert "return_20d" in feature_tab
+    assert 'data-tab-target="features"' in tab_section
+    assert 'data-tab-url="/data?asset_id=1&amp;table_tab=features"' in tab_section
+    assert 'href="/data?asset_id=1&amp;table_tab=features"' not in tab_section
+    assert 'aria-selected="true" data-tab-target="features"' in tab_section
+    assert 'tab-panel active" data-tab-panel="features"' in tab_section
     gated_html = render_route(db_path, "/jarvis", {})
     assert "信心门" in gated_html or "模型预测" in gated_html
     assert "validation_status" in gated_html

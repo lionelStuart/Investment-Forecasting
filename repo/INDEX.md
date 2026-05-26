@@ -18,6 +18,7 @@
 | SPEC-012 | `specs/SPEC-012-codex-agent-runtime-orchestration.md` | draft | codex-runtime, agents, experts, jarvis, scheduler, mcp | SPEC-004, SPEC-007, SPEC-009, SPEC-010, SPEC-011 |
 | SPEC-013 | `specs/SPEC-013-system-scheduler-incremental-updates.md` | draft | scheduler, incremental, hourly, watermarks, provider-backoff | SPEC-001, SPEC-005, SPEC-010, SPEC-012 |
 | SPEC-014 | `specs/SPEC-014-ytd-forecast-replay-model-tuning.md` | draft | model, replay, ytd, accuracy, confidence, tuning | SPEC-002, SPEC-011 |
+| SPEC-015 | `specs/SPEC-015-model-applicability-shadow-routing.md` | draft | model, applicability, shadow-routing, governance, confidence | SPEC-014, SPEC-011 |
 
 ## Tasks
 
@@ -114,9 +115,14 @@
 | TASK-087 | `tasks/TASK-087-incremental-watermarks-news-market-features.md` | completed | SPEC-013 | TASK-086 |
 | TASK-088 | `tasks/TASK-088-provider-rate-limit-backoff-policy.md` | completed | SPEC-013 | TASK-087 |
 | TASK-089 | `tasks/TASK-089-hourly-scheduler-orchestration-health.md` | completed | SPEC-013 | TASK-088 |
-| TASK-090 | `tasks/TASK-090-ytd-forecast-replay-corpus.md` | pending | SPEC-014 | TASK-079 |
-| TASK-091 | `tasks/TASK-091-replay-scoring-diagnostics.md` | pending | SPEC-014 | TASK-090 |
-| TASK-092 | `tasks/TASK-092-model-tuning-recommendation-report.md` | pending | SPEC-014 | TASK-091 |
+| TASK-090 | `tasks/TASK-090-ytd-forecast-replay-corpus.md` | completed | SPEC-014 | TASK-079 |
+| TASK-091 | `tasks/TASK-091-replay-scoring-diagnostics.md` | completed | SPEC-014 | TASK-090 |
+| TASK-092 | `tasks/TASK-092-model-tuning-recommendation-report.md` | completed | SPEC-014 | TASK-091 |
+| TASK-093 | `tasks/TASK-093-model-health-fact-layer.md` | completed | SPEC-015 | TASK-092 |
+| TASK-094 | `tasks/TASK-094-model-applicability-profiles.md` | completed | SPEC-015 | TASK-093 |
+| TASK-095 | `tasks/TASK-095-20d-shadow-router.md` | completed | SPEC-015 | TASK-094 |
+| TASK-096 | `tasks/TASK-096-confidence-calibration-labels.md` | completed | SPEC-015 | TASK-094 |
+| TASK-097 | `tasks/TASK-097-monthly-model-governance-summary.md` | completed | SPEC-015 | TASK-095, TASK-096 |
 
 ## Decisions
 
@@ -131,6 +137,7 @@
 | ADR-007 | `decisions/ADR-007-jarvis-consumer-information-architecture.md` | accepted | Jarvis five-entry consumer information architecture |
 | ADR-008 | `decisions/ADR-008-system-scheduled-codex-agent-runtime.md` | accepted | System-owned scheduling and Codex role agent runtime |
 | ADR-009 | `decisions/ADR-009-system-owned-incremental-scheduler.md` | accepted | System-owned hourly incremental scheduler and provider safety |
+| ADR-010 | `decisions/ADR-010-model-applicability-shadow-routing.md` | accepted | Context-specific model applicability and shadow routing |
 
 ## Architecture And Code Index
 

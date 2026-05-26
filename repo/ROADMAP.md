@@ -179,7 +179,8 @@
 
 ### M16: YTD Model Accuracy And Confidence Replay Audit
 
-- Status: Planned through `SPEC-014` and `TASK-090` through `TASK-092`.
+- Status: Completed through `TASK-090` to `TASK-092` for the 2026 local
+  replay corpus.
 - Scope: Re-run current-year daily predictions from already stored historical
   data, persist a separate replay corpus, score only matured prediction
   windows, diagnose model/horizon/asset-group failures, and produce ranked
@@ -193,6 +194,24 @@
   horizons are separated from failures; CLI exposes the latest replay report
   and tuning recommendations; no expert/Jarvis/advice surface changes in this
   phase.
+
+### M17: Model Applicability And Shadow Routing Governance
+
+- Status: Implemented through `SPEC-015`, `ADR-010`, and completed
+  `TASK-093` through `TASK-097`.
+- Scope: Convert replay research and CEO review into a generalizable model
+  optimization loop: persistent model-health facts, context-specific model
+  applicability profiles, same-type ranking disable rules, conservative
+  20-day shadow routing, confidence calibration labels, and monthly
+  governance summaries.
+- Exit Criteria: Model health is persisted by horizon/asset scope/month;
+  model roles state whether a signal is default, allocation bias, ranking,
+  risk reference, or observation-only; `router_floor70_cap05` runs shadow-only
+  without changing operational predictions; raw confidence is downgraded into
+  evidence-quality labels; governance reports keep production defaults
+  unchanged unless a future product review approves promotion. Local replay
+  run `1` now has the full M17 evidence chain, including the `2026-05`
+  `review_only` governance report with no promotion-review eligibility.
 
 ## Backlog Themes
 
@@ -223,6 +242,9 @@
 - YTD model accuracy and confidence replay audit: rebuild this year's daily
   model prediction evidence from stored local data, score matured outcomes,
   and turn accuracy/confidence diagnostics into testable tuning experiments.
+- Model applicability and shadow routing governance: shift optimization from
+  "best global model wins" to context-specific model roles, shadow routing,
+  ranking disable rules, and confidence calibration.
 - User risk profiles and investment horizon settings.
 - Model monitoring and drift detection.
 - Productized WebUI flow: timeline, category-first screening, red/green market
@@ -318,3 +340,8 @@
     overconfident, underconfident, or insufficient-sample before changing any
     algorithm defaults. Expert/Jarvis/advice prediction evaluation is outside
     this phase.
+18. Model Applicability And Shadow Routing Governance: use `TASK-093` through
+    `TASK-097` to make model suitability context-specific. Success means the
+    system can explain which model/horizon/scope is a default forecast,
+    allocation bias, ranking signal, risk reference, or observation-only, while
+    keeping the 20-day router in shadow and production defaults unchanged.

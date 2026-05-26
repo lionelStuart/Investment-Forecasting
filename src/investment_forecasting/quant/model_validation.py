@@ -4,11 +4,24 @@ import json
 from collections import defaultdict
 from datetime import date
 from pathlib import Path
-from statistics import mean
+from statistics import median, mean
 from typing import Any
 
 from investment_forecasting.data.classification import classify_asset_theme
-from investment_forecasting.db import connect, init_db, list_assets, list_price_history
+from investment_forecasting.db import (
+    connect,
+    init_db,
+    list_assets,
+    list_model_applicability_profiles,
+    list_model_governance_reviews,
+    list_model_health_metrics,
+    list_model_shadow_routes,
+    list_price_history,
+    upsert_model_applicability_profile,
+    upsert_model_governance_review,
+    upsert_model_health_metric,
+    upsert_model_shadow_route,
+)
 from investment_forecasting.quant.backtest import aggregate_scores, forecast_from_history, score_forecast
 from investment_forecasting.quant.benchmarks import select_asset_benchmark
 from investment_forecasting.quant.features import PricePoint
@@ -18,6 +31,17 @@ from investment_forecasting.quant.forecast import MODEL_STATES, MODEL_VERSIONS
 DEFAULT_HORIZONS = (5, 20, 60)
 DEFAULT_MODEL_VERSIONS = MODEL_VERSIONS
 DEFAULT_LOOKBACK_DAYS = 60
+PRIMARY_MODEL_VERSION = "baseline_mean_v1"
+SHADOW_ROUTE_NAME = "router_floor70_cap05"
+SHADOW_ROUTE_HORIZON = 20
+SHADOW_ROUTE_MODELS = ("baseline_mean_v1", "momentum_reversal_v1", "risk_adjusted_factor_v1")
+SHADOW_BASELINE_FLOOR = 0.70
+SHADOW_MONTHLY_TURNOVER_CAP = 0.05
+SHADOW_INITIAL_WEIGHTS = {
+    "baseline_mean_v1": 0.90,
+    "momentum_reversal_v1": 0.05,
+    "risk_adjusted_factor_v1": 0.05,
+}
 
 
 class ModelValidationError(RuntimeError):
@@ -200,6 +224,7 @@ def build_replay_report(db_or_conn: str | Path | Any, *, run_id: int | None = No
         return {"run_id": resolved_run_id, **metrics}
     finally:
         if close_after:
+            conn.commit()
             conn.close()
 
 
@@ -217,6 +242,399 @@ def build_tuning_plan(db_path: str | Path, *, run_id: int | None = None) -> dict
             (json.dumps(recommendations, ensure_ascii=False), resolved_run_id),
         )
     return {"run_id": resolved_run_id, "recommendations": recommendations}
+
+
+def generate_model_health_metrics(db_or_conn: str | Path | Any, *, run_id: int | None = None) -> dict[str, Any]:
+    close_after = False
+    if hasattr(db_or_conn, "execute"):
+        conn = db_or_conn
+    else:
+        init_db(db_or_conn)
+        conn = connect(db_or_conn)
+        close_after = True
+    try:
+        resolved_run_id = run_id or _latest_replay_run_id(conn)
+        if resolved_run_id is None:
+            raise ModelValidationError("No model replay run found")
+        rows = [dict(row) for row in _replay_rows(conn, resolved_run_id)]
+        matured = [row for row in rows if row["score_status"] == "matured"]
+        facts = _model_health_facts(resolved_run_id, matured, total_replay_rows=len(rows))
+        metric_ids = [upsert_model_health_metric(conn, fact) for fact in facts]
+        return {
+            "run_id": resolved_run_id,
+            "written": len(metric_ids),
+            "matured_rows": len(matured),
+            "pending_rows": sum(1 for row in rows if row["score_status"] == "pending"),
+            "skipped_rows": sum(1 for row in rows if row["score_status"] == "skipped"),
+        }
+    finally:
+        if close_after:
+            conn.commit()
+            conn.close()
+
+
+def build_model_health_report(db_path: str | Path, *, run_id: int | None = None) -> dict[str, Any]:
+    init_db(db_path)
+    with connect(db_path) as conn:
+        resolved_run_id = run_id or _latest_replay_run_id(conn)
+        if resolved_run_id is None:
+            raise ModelValidationError("No model replay run found")
+        rows = [dict(row) for row in list_model_health_metrics(conn, resolved_run_id)]
+        if not rows:
+            generate_model_health_metrics(conn, run_id=resolved_run_id)
+            rows = [dict(row) for row in list_model_health_metrics(conn, resolved_run_id)]
+    by_status: dict[str, int] = defaultdict(int)
+    by_scope: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        by_status[str(row["status"])] += 1
+        key = f"{row['model_version']}|{row['horizon_days']}|{row['asset_type']}|{row['same_category_key']}|{row['prediction_month']}|{row['evaluation_window']}"
+        by_scope[key] = {
+            "sample_count": row["sample_count"],
+            "direction_accuracy": row["direction_accuracy"],
+            "rank_ic": row["rank_ic"],
+            "bucket_spread": row["bucket_spread"],
+            "top_bottom_decile_spread": row["top_bottom_decile_spread"],
+            "mae": row["mae"],
+            "median_abs_error": row["median_abs_error"],
+            "raw_high_conf_wrong_rate": row["raw_high_conf_wrong_rate"],
+            "coverage_rate": row["coverage_rate"],
+            "status": row["status"],
+            "output_role": row["output_role"],
+            "promotion_status": row["promotion_status"],
+            "degradation_reason": row["degradation_reason"],
+            "minimum_sample_met": bool(row["minimum_sample_met"]),
+            "consumer_display_level": row["consumer_display_level"],
+            "confidence_label": row["confidence_label"],
+            "confidence_rationale": json.loads(row["confidence_rationale_json"] or "{}"),
+        }
+    return {
+        "run_id": resolved_run_id,
+        "count": len(rows),
+        "by_status": dict(sorted(by_status.items())),
+        "by_scope": by_scope,
+    }
+
+
+def generate_applicability_profiles(db_or_conn: str | Path | Any, *, run_id: int | None = None) -> dict[str, Any]:
+    close_after = False
+    if hasattr(db_or_conn, "execute"):
+        conn = db_or_conn
+    else:
+        init_db(db_or_conn)
+        conn = connect(db_or_conn)
+        close_after = True
+    try:
+        resolved_run_id = run_id or _latest_replay_run_id(conn)
+        if resolved_run_id is None:
+            raise ModelValidationError("No model replay run found")
+        metrics = [dict(row) for row in list_model_health_metrics(conn, resolved_run_id)]
+        if not metrics:
+            generate_model_health_metrics(conn, run_id=resolved_run_id)
+            metrics = [dict(row) for row in list_model_health_metrics(conn, resolved_run_id)]
+        profiles = [_applicability_profile_from_metric(metric) for metric in metrics]
+        profile_ids = [upsert_model_applicability_profile(conn, profile) for profile in profiles]
+        by_role: dict[str, int] = defaultdict(int)
+        disabled = 0
+        for profile in profiles:
+            by_role[str(profile["output_role"])] += 1
+            disabled += int(profile["ranking_disabled"])
+        return {
+            "run_id": resolved_run_id,
+            "written": len(profile_ids),
+            "by_role": dict(sorted(by_role.items())),
+            "ranking_disabled": disabled,
+        }
+    finally:
+        if close_after:
+            conn.commit()
+            conn.close()
+
+
+def build_applicability_report(db_path: str | Path, *, run_id: int | None = None) -> dict[str, Any]:
+    init_db(db_path)
+    with connect(db_path) as conn:
+        resolved_run_id = run_id or _latest_replay_run_id(conn)
+        if resolved_run_id is None:
+            raise ModelValidationError("No model replay run found")
+        rows = [dict(row) for row in list_model_applicability_profiles(conn, resolved_run_id)]
+        if not rows:
+            generate_applicability_profiles(conn, run_id=resolved_run_id)
+            rows = [dict(row) for row in list_model_applicability_profiles(conn, resolved_run_id)]
+    by_role: dict[str, int] = defaultdict(int)
+    by_scope: dict[str, dict[str, Any]] = {}
+    disabled = 0
+    for row in rows:
+        by_role[str(row["output_role"])] += 1
+        disabled += int(row["ranking_disabled"])
+        key = f"{row['model_version']}|{row['horizon_days']}|{row['asset_type']}|{row['same_category_key']}|{row['prediction_month']}|{row['evaluation_window']}"
+        by_scope[key] = {
+            "source_metric_id": row["source_metric_id"],
+            "output_role": row["output_role"],
+            "ranking_disabled": bool(row["ranking_disabled"]),
+            "ranking_disable_reason": row["ranking_disable_reason"],
+            "promotion_status": row["promotion_status"],
+            "degradation_reason": row["degradation_reason"],
+            "minimum_sample_met": bool(row["minimum_sample_met"]),
+            "consumer_display_level": row["consumer_display_level"],
+            "confidence_label": row["confidence_label"],
+            "confidence_rationale": json.loads(row["confidence_rationale_json"] or "{}"),
+            "rationale": json.loads(row["rationale_json"] or "{}"),
+        }
+    return {
+        "run_id": resolved_run_id,
+        "count": len(rows),
+        "by_role": dict(sorted(by_role.items())),
+        "ranking_disabled": disabled,
+        "by_scope": by_scope,
+    }
+
+
+def run_shadow_router_floor70(db_or_conn: str | Path | Any, *, run_id: int | None = None) -> dict[str, Any]:
+    close_after = False
+    if hasattr(db_or_conn, "execute"):
+        conn = db_or_conn
+    else:
+        init_db(db_or_conn)
+        conn = connect(db_or_conn)
+        close_after = True
+    try:
+        resolved_run_id = run_id or _latest_replay_run_id(conn)
+        if resolved_run_id is None:
+            raise ModelValidationError("No model replay run found")
+        rows = _shadow_candidate_rows(conn, resolved_run_id)
+        months = sorted({str(row["month"]) for row in rows if row["score_status"] == "matured"})
+        if not months:
+            raise ModelValidationError("No matured 20-day replay rows found for shadow routing")
+        weights = dict(SHADOW_INITIAL_WEIGHTS)
+        route_ids = []
+        for month in months:
+            training_cutoff = f"{month}-01"
+            train_rows = [
+                row
+                for row in rows
+                if row["score_status"] == "matured"
+                and row["outcome_date"] is not None
+                and str(row["outcome_date"]) < training_cutoff
+            ]
+            target_weights = _shadow_target_weights(train_rows)
+            weights, turnover = _apply_turnover_cap(weights, target_weights, SHADOW_MONTHLY_TURNOVER_CAP)
+            holdout_rows = [row for row in rows if row["score_status"] == "matured" and row["month"] == month]
+            shadow_metrics, baseline_metrics, comparison = _shadow_month_metrics(holdout_rows, weights)
+            if not shadow_metrics["count"]:
+                continue
+            route_ids.append(
+                upsert_model_shadow_route(
+                    conn,
+                    {
+                        "replay_run_id": resolved_run_id,
+                        "route_name": SHADOW_ROUTE_NAME,
+                        "horizon_days": SHADOW_ROUTE_HORIZON,
+                        "prediction_month": month,
+                        "status": "shadow_only",
+                        "training_cutoff": training_cutoff,
+                        "baseline_floor": SHADOW_BASELINE_FLOOR,
+                        "monthly_turnover_cap": SHADOW_MONTHLY_TURNOVER_CAP,
+                        "realized_turnover": turnover,
+                        "weights_json": json.dumps(weights, ensure_ascii=False),
+                        "shadow_metrics_json": json.dumps(shadow_metrics, ensure_ascii=False),
+                        "baseline_metrics_json": json.dumps(baseline_metrics, ensure_ascii=False),
+                        "comparison_json": json.dumps(comparison, ensure_ascii=False),
+                    },
+                )
+            )
+        return {
+            "run_id": resolved_run_id,
+            "route_name": SHADOW_ROUTE_NAME,
+            "horizon_days": SHADOW_ROUTE_HORIZON,
+            "written": len(route_ids),
+            "status": "shadow_only",
+        }
+    finally:
+        if close_after:
+            conn.commit()
+            conn.close()
+
+
+def build_shadow_router_report(db_path: str | Path, *, run_id: int | None = None) -> dict[str, Any]:
+    init_db(db_path)
+    with connect(db_path) as conn:
+        resolved_run_id = run_id or _latest_replay_run_id(conn)
+        if resolved_run_id is None:
+            raise ModelValidationError("No model replay run found")
+        rows = [dict(row) for row in list_model_shadow_routes(conn, resolved_run_id, SHADOW_ROUTE_NAME)]
+        if not rows:
+            run_shadow_router_floor70(conn, run_id=resolved_run_id)
+            rows = [dict(row) for row in list_model_shadow_routes(conn, resolved_run_id, SHADOW_ROUTE_NAME)]
+    monthly = {}
+    for row in rows:
+        monthly[row["prediction_month"]] = {
+            "status": row["status"],
+            "training_cutoff": row["training_cutoff"],
+            "baseline_floor": row["baseline_floor"],
+            "monthly_turnover_cap": row["monthly_turnover_cap"],
+            "realized_turnover": row["realized_turnover"],
+            "weights": json.loads(row["weights_json"] or "{}"),
+            "shadow_metrics": json.loads(row["shadow_metrics_json"] or "{}"),
+            "baseline_metrics": json.loads(row["baseline_metrics_json"] or "{}"),
+            "comparison": json.loads(row["comparison_json"] or "{}"),
+        }
+    return {
+        "run_id": resolved_run_id,
+        "route_name": SHADOW_ROUTE_NAME,
+        "horizon_days": SHADOW_ROUTE_HORIZON,
+        "count": len(rows),
+        "status": "shadow_only",
+        "monthly": monthly,
+    }
+
+
+def generate_confidence_labels(db_or_conn: str | Path | Any, *, run_id: int | None = None) -> dict[str, Any]:
+    close_after = False
+    if hasattr(db_or_conn, "execute"):
+        conn = db_or_conn
+    else:
+        init_db(db_or_conn)
+        conn = connect(db_or_conn)
+        close_after = True
+    try:
+        resolved_run_id = run_id or _latest_replay_run_id(conn)
+        if resolved_run_id is None:
+            raise ModelValidationError("No model replay run found")
+        metrics = [dict(row) for row in list_model_health_metrics(conn, resolved_run_id)]
+        if not metrics:
+            generate_model_health_metrics(conn, run_id=resolved_run_id)
+            metrics = [dict(row) for row in list_model_health_metrics(conn, resolved_run_id)]
+        if not list_model_applicability_profiles(conn, resolved_run_id):
+            generate_applicability_profiles(conn, run_id=resolved_run_id)
+        monthly_passes = _monthly_confidence_pass_counts(metrics)
+        by_label: dict[str, int] = defaultdict(int)
+        for metric in metrics:
+            label, rationale = _confidence_label_for_metric(metric, monthly_passes)
+            rationale_json = json.dumps(rationale, ensure_ascii=False)
+            conn.execute(
+                """
+                UPDATE model_health_metrics
+                SET confidence_label = ?,
+                    confidence_rationale_json = ?,
+                    updated_at = datetime('now')
+                WHERE id = ?
+                """,
+                (label, rationale_json, metric["id"]),
+            )
+            conn.execute(
+                """
+                UPDATE model_applicability_profiles
+                SET confidence_label = ?,
+                    confidence_rationale_json = ?,
+                    updated_at = datetime('now')
+                WHERE source_metric_id = ?
+                """,
+                (label, rationale_json, metric["id"]),
+            )
+            by_label[label] += 1
+        return {"run_id": resolved_run_id, "written": len(metrics), "by_label": dict(sorted(by_label.items()))}
+    finally:
+        if close_after:
+            conn.commit()
+            conn.close()
+
+
+def build_confidence_label_report(db_path: str | Path, *, run_id: int | None = None) -> dict[str, Any]:
+    init_db(db_path)
+    with connect(db_path) as conn:
+        resolved_run_id = run_id or _latest_replay_run_id(conn)
+        if resolved_run_id is None:
+            raise ModelValidationError("No model replay run found")
+        rows = [dict(row) for row in list_model_applicability_profiles(conn, resolved_run_id)]
+        if not rows or not any(row.get("confidence_rationale_json") and row["confidence_rationale_json"] != "{}" for row in rows):
+            generate_confidence_labels(conn, run_id=resolved_run_id)
+            rows = [dict(row) for row in list_model_applicability_profiles(conn, resolved_run_id)]
+    by_label: dict[str, int] = defaultdict(int)
+    by_scope = {}
+    for row in rows:
+        by_label[str(row["confidence_label"])] += 1
+        key = f"{row['model_version']}|{row['horizon_days']}|{row['asset_type']}|{row['same_category_key']}|{row['prediction_month']}|{row['evaluation_window']}"
+        by_scope[key] = {
+            "confidence_label": row["confidence_label"],
+            "confidence_rationale": json.loads(row["confidence_rationale_json"] or "{}"),
+            "output_role": row["output_role"],
+            "ranking_disabled": bool(row["ranking_disabled"]),
+        }
+    return {"run_id": resolved_run_id, "count": len(rows), "by_label": dict(sorted(by_label.items())), "by_scope": by_scope}
+
+
+def generate_model_governance_summary(
+    db_or_conn: str | Path | Any,
+    *,
+    run_id: int | None = None,
+    review_month: str | None = None,
+) -> dict[str, Any]:
+    close_after = False
+    if hasattr(db_or_conn, "execute"):
+        conn = db_or_conn
+    else:
+        init_db(db_or_conn)
+        conn = connect(db_or_conn)
+        close_after = True
+    try:
+        resolved_run_id = run_id or _latest_replay_run_id(conn)
+        if resolved_run_id is None:
+            raise ModelValidationError("No model replay run found")
+        if not list_model_applicability_profiles(conn, resolved_run_id):
+            generate_applicability_profiles(conn, run_id=resolved_run_id)
+        profiles = [dict(row) for row in list_model_applicability_profiles(conn, resolved_run_id)]
+        if not profiles or not any(row.get("confidence_rationale_json") and row["confidence_rationale_json"] != "{}" for row in profiles):
+            generate_confidence_labels(conn, run_id=resolved_run_id)
+            profiles = [dict(row) for row in list_model_applicability_profiles(conn, resolved_run_id)]
+        shadows = [dict(row) for row in list_model_shadow_routes(conn, resolved_run_id, SHADOW_ROUTE_NAME)]
+        if not shadows:
+            try:
+                run_shadow_router_floor70(conn, run_id=resolved_run_id)
+                shadows = [dict(row) for row in list_model_shadow_routes(conn, resolved_run_id, SHADOW_ROUTE_NAME)]
+            except ModelValidationError:
+                shadows = []
+        target_month = review_month or _latest_review_month(profiles, shadows)
+        report = _governance_report(resolved_run_id, target_month, profiles, shadows)
+        summary = _governance_summary_text(report)
+        review_id = upsert_model_governance_review(
+            conn,
+            {
+                "replay_run_id": resolved_run_id,
+                "review_month": target_month,
+                "status": "review_only",
+                "summary_text": summary,
+                "report_json": json.dumps(report, ensure_ascii=False),
+                "production_defaults_changed": 0,
+                "promotion_review_eligible": int(bool(report["promotion_review_eligible"])),
+            },
+        )
+        return {"run_id": resolved_run_id, "review_id": review_id, "review_month": target_month, **report, "summary_text": summary}
+    finally:
+        if close_after:
+            conn.commit()
+            conn.close()
+
+
+def build_model_governance_report(db_path: str | Path, *, run_id: int | None = None) -> dict[str, Any]:
+    init_db(db_path)
+    with connect(db_path) as conn:
+        resolved_run_id = run_id or _latest_replay_run_id(conn)
+        if resolved_run_id is None:
+            raise ModelValidationError("No model replay run found")
+        rows = [dict(row) for row in list_model_governance_reviews(conn, resolved_run_id)]
+        if not rows:
+            return generate_model_governance_summary(conn, run_id=resolved_run_id)
+        latest = rows[0]
+        return {
+            "run_id": resolved_run_id,
+            "review_id": latest["id"],
+            "review_month": latest["review_month"],
+            "status": latest["status"],
+            "summary_text": latest["summary_text"],
+            "production_defaults_changed": bool(latest["production_defaults_changed"]),
+            "promotion_review_eligible": bool(latest["promotion_review_eligible"]),
+            "report": json.loads(latest["report_json"] or "{}"),
+        }
 
 
 def _aggregate_replay_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
@@ -280,6 +698,543 @@ def _scored_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
     )
     metrics["mean_confidence"] = mean(float(row.get("confidence") or 0) for row in rows) if rows else None
     return metrics
+
+
+def _model_health_facts(run_id: int, matured: list[dict[str, Any]], *, total_replay_rows: int) -> list[dict[str, Any]]:
+    groups: dict[tuple[str, int, str, str, str, str], list[dict[str, Any]]] = defaultdict(list)
+    for row in matured:
+        model_version = str(row["model_version"])
+        horizon_days = int(row["horizon_days"])
+        asset_type = str(row.get("asset_type") or "unknown")
+        category = str(row.get("same_category_key") or "unknown")
+        month = str(row.get("month") or str(row["prediction_date"])[:7])
+        groups[(model_version, horizon_days, asset_type, category, month, "monthly")].append(row)
+        groups[(model_version, horizon_days, asset_type, "all", month, "monthly")].append(row)
+        groups[(model_version, horizon_days, asset_type, category, "all", "all_history")].append(row)
+        groups[(model_version, horizon_days, asset_type, "all", "all", "all_history")].append(row)
+
+    return [
+        _model_health_fact(run_id, key, rows, total_replay_rows=total_replay_rows)
+        for key, rows in sorted(groups.items(), key=lambda item: tuple(str(value) for value in item[0]))
+    ]
+
+
+def _latest_review_month(profiles: list[dict[str, Any]], shadows: list[dict[str, Any]]) -> str:
+    months = [str(row["prediction_month"]) for row in profiles if row["prediction_month"] != "all"]
+    months.extend(str(row["prediction_month"]) for row in shadows)
+    return max(months) if months else date.today().strftime("%Y-%m")
+
+
+def _governance_report(run_id: int, review_month: str, profiles: list[dict[str, Any]], shadows: list[dict[str, Any]]) -> dict[str, Any]:
+    month_profiles = [row for row in profiles if row["prediction_month"] in {review_month, "all"}]
+    safe_defaults = [
+        _profile_ref(row)
+        for row in month_profiles
+        if row["output_role"] == "primary_forecast" and row["confidence_label"] in {"谨慎观察", "相对稳健"}
+    ]
+    shadow_continue = [
+        {
+            "route_name": row["route_name"],
+            "horizon_days": row["horizon_days"],
+            "prediction_month": row["prediction_month"],
+            "status": row["status"],
+            "realized_turnover": row["realized_turnover"],
+            "comparison": json.loads(row["comparison_json"] or "{}"),
+        }
+        for row in shadows
+        if row["status"] == "shadow_only" and row["prediction_month"] <= review_month
+    ]
+    downgraded = [
+        _profile_ref(row)
+        for row in month_profiles
+        if row["output_role"] in {"observation_only", "risk_reference"} or row["ranking_disabled"] or row["confidence_label"] == "暂不强调"
+    ][:100]
+    promotion_candidates = [
+        _profile_ref(row)
+        for row in month_profiles
+        if row["output_role"] in {"primary_forecast", "allocation_bias", "ranking_signal"}
+        and row["confidence_label"] == "相对稳健"
+        and not row["ranking_disabled"]
+    ]
+    eligible = _promotion_review_eligible(promotion_candidates, shadow_continue)
+    return {
+        "run_id": run_id,
+        "review_month": review_month,
+        "status": "review_only",
+        "questions": {
+            "safe_as_default": safe_defaults,
+            "continue_shadow_mode": shadow_continue,
+            "downgrade_or_disable": downgraded,
+            "promotion_review": {
+                "eligible": eligible,
+                "candidates": promotion_candidates if eligible else [],
+                "blockers": [] if eligible else _promotion_blockers(month_profiles, shadow_continue),
+                "review_only": True,
+            },
+        },
+        "guardrails": {
+            "production_defaults_changed": False,
+            "operational_model_predictions_updated": False,
+            "automatic_promotion": False,
+            "expert_jarvis_advice_phone_portfolio_impact": "none",
+            "stop_conditions": [
+                "do not promote without future product review",
+                "do not use shadow router for same-type ranking",
+                "keep raw confidence as evidence-quality label only",
+            ],
+        },
+        "promotion_review_eligible": eligible,
+    }
+
+
+def _profile_ref(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "model_version": row["model_version"],
+        "horizon_days": row["horizon_days"],
+        "asset_type": row["asset_type"],
+        "same_category_key": row["same_category_key"],
+        "prediction_month": row["prediction_month"],
+        "evaluation_window": row["evaluation_window"],
+        "output_role": row["output_role"],
+        "confidence_label": row["confidence_label"],
+        "ranking_disabled": bool(row["ranking_disabled"]),
+        "degradation_reason": row["degradation_reason"],
+    }
+
+
+def _promotion_review_eligible(candidates: list[dict[str, Any]], shadows: list[dict[str, Any]]) -> bool:
+    if not candidates:
+        return False
+    for row in shadows:
+        comparison = row.get("comparison") or {}
+        if comparison.get("rank_ic_delta") is not None and comparison["rank_ic_delta"] < 0:
+            return False
+        if comparison.get("bucket_spread_delta") is not None and comparison["bucket_spread_delta"] < 0:
+            return False
+        if comparison.get("direction_accuracy_delta") is not None and comparison["direction_accuracy_delta"] < 0:
+            return False
+        if float(row.get("realized_turnover") or 0) > SHADOW_MONTHLY_TURNOVER_CAP:
+            return False
+    return True
+
+
+def _promotion_blockers(profiles: list[dict[str, Any]], shadows: list[dict[str, Any]]) -> list[str]:
+    blockers = []
+    if not any(row["confidence_label"] == "相对稳健" for row in profiles):
+        blockers.append("no scope has 相对稳健 confidence label")
+    if any(row["ranking_disabled"] for row in profiles):
+        blockers.append("some same-type ranking scopes are disabled")
+    if any(_negative_delta((row.get("comparison") or {}).get("rank_ic_delta")) for row in shadows):
+        blockers.append("shadow router has negative Rank IC delta in at least one month")
+    if any(_negative_delta((row.get("comparison") or {}).get("bucket_spread_delta")) for row in shadows):
+        blockers.append("shadow router has negative bucket-spread delta in at least one month")
+    return blockers or ["future product review required before promotion"]
+
+
+def _negative_delta(value: Any) -> bool:
+    return value is not None and float(value) < 0
+
+
+def _governance_summary_text(report: dict[str, Any]) -> str:
+    questions = report["questions"]
+    return (
+        f"{report['review_month']} 模型治理总结："
+        f"默认安全范围 {len(questions['safe_as_default'])} 个，"
+        f"shadow 继续观察 {len(questions['continue_shadow_mode'])} 个，"
+        f"降级/禁用 {len(questions['downgrade_or_disable'])} 个样本范围；"
+        "生产默认保持不变，任何 promotion 仅进入未来评审。"
+    )
+
+
+def _monthly_confidence_pass_counts(metrics: list[dict[str, Any]]) -> dict[tuple[str, int, str, str], int]:
+    counts: dict[tuple[str, int, str, str], int] = defaultdict(int)
+    for metric in metrics:
+        if metric["evaluation_window"] != "monthly":
+            continue
+        if _confidence_base_pass(metric):
+            key = (
+                str(metric["model_version"]),
+                int(metric["horizon_days"]),
+                str(metric["asset_type"]),
+                str(metric["same_category_key"]),
+            )
+            counts[key] += 1
+    return counts
+
+
+def _confidence_label_for_metric(metric: dict[str, Any], monthly_passes: dict[tuple[str, int, str, str], int]) -> tuple[str, dict[str, Any]]:
+    max_calibration_error = _max_calibration_error(metric)
+    high_conf_wrong_rate = metric["raw_high_conf_wrong_rate"]
+    base_pass = _confidence_base_pass(metric)
+    key = (
+        str(metric["model_version"]),
+        int(metric["horizon_days"]),
+        str(metric["asset_type"]),
+        str(metric["same_category_key"]),
+    )
+    stable_windows = monthly_passes.get(key, 0)
+    rationale = {
+        "minimum_sample_met": bool(metric["minimum_sample_met"]),
+        "status": metric["status"],
+        "rank_ic": metric["rank_ic"],
+        "bucket_spread": metric["bucket_spread"],
+        "max_calibration_error": max_calibration_error,
+        "raw_high_conf_wrong_rate": high_conf_wrong_rate,
+        "stable_monthly_windows": stable_windows,
+        "evaluation_window": metric["evaluation_window"],
+        "no_probability_guarantee": True,
+    }
+    if not metric["minimum_sample_met"]:
+        return "暂不强调", {**rationale, "reason": "minimum sample gate not met"}
+    if metric["rank_ic"] is None or float(metric["rank_ic"]) <= 0:
+        return "暂不强调", {**rationale, "reason": "rank evidence is non-positive"}
+    if metric["bucket_spread"] is None or float(metric["bucket_spread"]) <= 0:
+        return "暂不强调", {**rationale, "reason": "bucket spread is non-positive"}
+    if high_conf_wrong_rate is not None and float(high_conf_wrong_rate) >= 0.30:
+        return "暂不强调", {**rationale, "reason": "high-confidence wrong rate is elevated"}
+    if max_calibration_error is not None and max_calibration_error >= 0.15:
+        return "暂不强调", {**rationale, "reason": "probability calibration error is elevated"}
+    if base_pass and metric["evaluation_window"] == "all_history" and stable_windows >= 2:
+        return "相对稳健", {**rationale, "reason": "multiple matured monthly windows show positive separation"}
+    return "谨慎观察", {**rationale, "reason": "watchable evidence but not enough stable windows for strong label"}
+
+
+def _confidence_base_pass(metric: dict[str, Any]) -> bool:
+    if not metric["minimum_sample_met"]:
+        return False
+    if metric["rank_ic"] is None or float(metric["rank_ic"]) <= 0:
+        return False
+    if metric["bucket_spread"] is None or float(metric["bucket_spread"]) <= 0:
+        return False
+    high_conf_wrong_rate = metric["raw_high_conf_wrong_rate"]
+    if high_conf_wrong_rate is not None and float(high_conf_wrong_rate) > 0.20:
+        return False
+    max_calibration_error = _max_calibration_error(metric)
+    if max_calibration_error is not None and max_calibration_error > 0.10:
+        return False
+    return True
+
+
+def _max_calibration_error(metric: dict[str, Any]) -> float | None:
+    payload = json.loads(metric.get("metrics_json") or "{}")
+    calibration = payload.get("probability_calibration") or []
+    errors = [float(item.get("calibration_error") or 0) for item in calibration]
+    return max(errors) if errors else None
+
+
+def _shadow_candidate_rows(conn: Any, run_id: int) -> list[dict[str, Any]]:
+    placeholders = ",".join("?" for _ in SHADOW_ROUTE_MODELS)
+    return [
+        dict(row)
+        for row in conn.execute(
+            f"""
+            SELECT r.*, a.code, a.name, a.asset_type,
+                   substr(r.prediction_date, 1, 7) AS month,
+                   json_extract(r.details_json, '$.same_category_key') AS same_category_key
+            FROM model_replay_predictions r
+            LEFT JOIN assets a ON a.id = r.asset_id
+            WHERE r.replay_run_id = ?
+              AND r.horizon_days = ?
+              AND r.model_version IN ({placeholders})
+            """,
+            (run_id, SHADOW_ROUTE_HORIZON, *SHADOW_ROUTE_MODELS),
+        ).fetchall()
+    ]
+
+
+def _shadow_target_weights(training_rows: list[dict[str, Any]]) -> dict[str, float]:
+    weights = dict(SHADOW_INITIAL_WEIGHTS)
+    grouped = {
+        model: [row for row in training_rows if row["model_version"] == model]
+        for model in SHADOW_ROUTE_MODELS
+    }
+    if not grouped[PRIMARY_MODEL_VERSION]:
+        return weights
+    metrics = {
+        model: _scored_metrics(rows) if rows else {"mean_overall_score": None, "rank_ic": None, "bucket_spread": None}
+        for model, rows in grouped.items()
+    }
+    baseline = metrics[PRIMARY_MODEL_VERSION]
+    candidate_scores = {}
+    for model in SHADOW_ROUTE_MODELS:
+        if model == PRIMARY_MODEL_VERSION:
+            continue
+        values = metrics[model]
+        if not values.get("count"):
+            candidate_scores[model] = 0.0
+            continue
+        rank_ic = float(values.get("rank_ic") or 0)
+        bucket_spread = float(values.get("bucket_spread") or 0)
+        score_delta = float(values.get("mean_overall_score") or 0) - float(baseline.get("mean_overall_score") or 0)
+        candidate_scores[model] = max(0.0, score_delta / 100.0) + max(0.0, rank_ic) + max(0.0, bucket_spread)
+    total = sum(candidate_scores.values())
+    if total <= 0:
+        return weights
+    available = 1.0 - SHADOW_BASELINE_FLOOR
+    weights = {PRIMARY_MODEL_VERSION: SHADOW_BASELINE_FLOOR}
+    for model, score in candidate_scores.items():
+        weights[model] = available * (score / total)
+    return _normalize_weights(weights)
+
+
+def _apply_turnover_cap(
+    previous: dict[str, float],
+    target: dict[str, float],
+    cap: float,
+) -> tuple[dict[str, float], float]:
+    previous = _normalize_weights(previous)
+    target = _normalize_weights(target)
+    turnover = 0.5 * sum(abs(target.get(model, 0.0) - previous.get(model, 0.0)) for model in SHADOW_ROUTE_MODELS)
+    if turnover <= cap or turnover == 0:
+        return target, turnover
+    ratio = cap / turnover
+    blended = {
+        model: previous.get(model, 0.0) + (target.get(model, 0.0) - previous.get(model, 0.0)) * ratio
+        for model in SHADOW_ROUTE_MODELS
+    }
+    blended = _normalize_weights(blended)
+    realized = 0.5 * sum(abs(blended.get(model, 0.0) - previous.get(model, 0.0)) for model in SHADOW_ROUTE_MODELS)
+    return blended, min(realized, cap)
+
+
+def _shadow_month_metrics(
+    holdout_rows: list[dict[str, Any]],
+    weights: dict[str, float],
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    grouped: dict[tuple[Any, ...], dict[str, dict[str, Any]]] = defaultdict(dict)
+    for row in holdout_rows:
+        key = (row["asset_id"], row["prediction_date"], row["target"])
+        grouped[key][str(row["model_version"])] = row
+    shadow_results = []
+    baseline_rows = []
+    for variants in grouped.values():
+        if not all(model in variants for model in SHADOW_ROUTE_MODELS):
+            continue
+        baseline = variants[PRIMARY_MODEL_VERSION]
+        weighted_return = sum(float(variants[model].get("expected_return") or 0) * weights.get(model, 0.0) for model in SHADOW_ROUTE_MODELS)
+        weighted_confidence = sum(float(variants[model].get("confidence") or 0) * weights.get(model, 0.0) for model in SHADOW_ROUTE_MODELS)
+        weighted_probability = sum(float(variants[model].get("up_probability") or 0.5) * weights.get(model, 0.0) for model in SHADOW_ROUTE_MODELS)
+        shadow_row = {**baseline, "expected_return": weighted_return, "confidence": weighted_confidence, "up_probability": weighted_probability}
+        shadow_results.append(shadow_row)
+        baseline_rows.append(baseline)
+    shadow_metrics = _scored_metrics(shadow_results) if shadow_results else _scored_metrics([])
+    baseline_metrics = _scored_metrics(baseline_rows) if baseline_rows else _scored_metrics([])
+    comparison = {
+        "rank_ic_delta": _delta(shadow_metrics.get("rank_ic"), baseline_metrics.get("rank_ic")),
+        "bucket_spread_delta": _delta(shadow_metrics.get("bucket_spread"), baseline_metrics.get("bucket_spread")),
+        "direction_accuracy_delta": _delta(shadow_metrics.get("direction_accuracy"), baseline_metrics.get("direction_accuracy")),
+        "mae_delta": _delta(shadow_metrics.get("mean_return_error"), baseline_metrics.get("mean_return_error")),
+        "high_confidence_wrong_direction_delta": int(shadow_metrics.get("high_confidence_wrong_direction_count") or 0)
+        - int(baseline_metrics.get("high_confidence_wrong_direction_count") or 0),
+        "operational_impact": "none_shadow_only",
+        "same_type_ranking_usage": "disabled",
+    }
+    return shadow_metrics, baseline_metrics, comparison
+
+
+def _normalize_weights(weights: dict[str, float]) -> dict[str, float]:
+    normalized = {model: max(0.0, float(weights.get(model, 0.0))) for model in SHADOW_ROUTE_MODELS}
+    total = sum(normalized.values())
+    if total <= 0:
+        return dict(SHADOW_INITIAL_WEIGHTS)
+    normalized = {model: value / total for model, value in normalized.items()}
+    if normalized[PRIMARY_MODEL_VERSION] < SHADOW_BASELINE_FLOOR:
+        remainder_total = sum(value for model, value in normalized.items() if model != PRIMARY_MODEL_VERSION)
+        available = 1.0 - SHADOW_BASELINE_FLOOR
+        adjusted = {PRIMARY_MODEL_VERSION: SHADOW_BASELINE_FLOOR}
+        for model in SHADOW_ROUTE_MODELS:
+            if model == PRIMARY_MODEL_VERSION:
+                continue
+            adjusted[model] = available * (normalized[model] / remainder_total) if remainder_total else 0.0
+        return adjusted
+    return normalized
+
+
+def _delta(left: Any, right: Any) -> float | None:
+    if left is None or right is None:
+        return None
+    return float(left) - float(right)
+
+
+def _model_health_fact(
+    run_id: int,
+    key: tuple[str, int, str, str, str, str],
+    rows: list[dict[str, Any]],
+    *,
+    total_replay_rows: int,
+) -> dict[str, Any]:
+    model_version, horizon_days, asset_type, category, month, window = key
+    metrics = _scored_metrics(rows)
+    errors = [abs(float(row["expected_return"] or 0) - float(row["actual_return"] or 0)) for row in rows]
+    high_conf_rows = [row for row in rows if float(row.get("confidence") or 0) >= 0.8]
+    high_conf_wrong = [
+        row
+        for row in high_conf_rows
+        if _direction(row.get("expected_return")) != _direction(row.get("actual_return"))
+    ]
+    minimum_sample_met = int((metrics.get("count") or 0) >= 20)
+    status = str(metrics.get("validation_status") or "unvalidated")
+    degradation_reason = _model_health_degradation_reason(metrics, minimum_sample_met=bool(minimum_sample_met))
+    metrics_payload = {
+        **metrics,
+        "evaluation_scope": {
+            "model_version": model_version,
+            "horizon_days": horizon_days,
+            "asset_type": asset_type,
+            "same_category_key": category,
+            "prediction_month": month,
+            "evaluation_window": window,
+        },
+    }
+    return {
+        "replay_run_id": run_id,
+        "model_version": model_version,
+        "horizon_days": horizon_days,
+        "asset_type": asset_type,
+        "same_category_key": category,
+        "prediction_month": month,
+        "evaluation_window": window,
+        "sample_count": int(metrics.get("count") or 0),
+        "direction_accuracy": metrics.get("direction_accuracy"),
+        "rank_ic": metrics.get("rank_ic"),
+        "bucket_spread": metrics.get("bucket_spread"),
+        "top_bottom_decile_spread": _top_bottom_spread(rows, bucket_fraction=0.1),
+        "mae": metrics.get("mean_return_error"),
+        "median_abs_error": median(errors) if errors else None,
+        "raw_high_conf_wrong_rate": (len(high_conf_wrong) / len(high_conf_rows)) if high_conf_rows else None,
+        "coverage_rate": (len(rows) / total_replay_rows) if total_replay_rows else None,
+        "status": status,
+        "output_role": "observation_only",
+        "promotion_status": "not_reviewed",
+        "degradation_reason": degradation_reason,
+        "minimum_sample_met": minimum_sample_met,
+        "consumer_display_level": "internal",
+        "confidence_label": "暂不强调",
+        "confidence_rationale_json": "{}",
+        "last_promoted_at": None,
+        "last_demoted_at": None,
+        "metrics_json": json.dumps(metrics_payload, ensure_ascii=False),
+    }
+
+
+def _model_health_degradation_reason(metrics: dict[str, Any], *, minimum_sample_met: bool) -> str | None:
+    if not minimum_sample_met:
+        return "insufficient_sample"
+    if metrics.get("rank_ic") is None or metrics.get("bucket_spread") is None:
+        return "unvalidated_metric"
+    reasons = []
+    if float(metrics.get("rank_ic") or 0) < 0:
+        reasons.append("negative_rank_ic")
+    if float(metrics.get("bucket_spread") or 0) < 0:
+        reasons.append("negative_bucket_spread")
+    high_conf_wrong = int(metrics.get("high_confidence_wrong_direction_count") or 0)
+    count = int(metrics.get("count") or 0)
+    if count and high_conf_wrong / count >= 0.2:
+        reasons.append("high_confidence_wrong_rate")
+    return ",".join(reasons) if reasons else None
+
+
+def _applicability_profile_from_metric(metric: dict[str, Any]) -> dict[str, Any]:
+    ranking_disabled, ranking_reason = _same_type_ranking_disabled(metric)
+    role, role_reason = _derive_output_role(metric, ranking_disabled=ranking_disabled)
+    promotion_status = "shadow_only" if str(metric["model_version"]).startswith("router_") else "not_reviewed"
+    rationale = {
+        "source_metric_id": metric["id"],
+        "metric_status": metric["status"],
+        "sample_count": metric["sample_count"],
+        "rank_ic": metric["rank_ic"],
+        "bucket_spread": metric["bucket_spread"],
+        "degradation_reason": metric["degradation_reason"],
+        "role_reason": role_reason,
+        "ranking_disable_reason": ranking_reason,
+        "guardrails": [
+            "profile evidence only; no operational prediction update",
+            "no expert, Jarvis, advice, phone, WebUI, or portfolio consumption in TASK-094",
+        ],
+    }
+    return {
+        "replay_run_id": metric["replay_run_id"],
+        "source_metric_id": metric["id"],
+        "model_version": metric["model_version"],
+        "horizon_days": metric["horizon_days"],
+        "asset_type": metric["asset_type"],
+        "same_category_key": metric["same_category_key"],
+        "prediction_month": metric["prediction_month"],
+        "evaluation_window": metric["evaluation_window"],
+        "output_role": role,
+        "ranking_disabled": int(ranking_disabled),
+        "ranking_disable_reason": ranking_reason,
+        "promotion_status": promotion_status,
+        "degradation_reason": metric["degradation_reason"],
+        "minimum_sample_met": metric["minimum_sample_met"],
+        "consumer_display_level": _consumer_display_level(role, ranking_disabled=ranking_disabled),
+        "confidence_label": metric["confidence_label"] if "confidence_label" in metric else "暂不强调",
+        "confidence_rationale_json": metric["confidence_rationale_json"] if "confidence_rationale_json" in metric else "{}",
+        "rationale_json": json.dumps(rationale, ensure_ascii=False),
+    }
+
+
+def _derive_output_role(metric: dict[str, Any], *, ranking_disabled: bool) -> tuple[str, str]:
+    model_version = str(metric["model_version"])
+    horizon_days = int(metric["horizon_days"])
+    same_category_key = str(metric["same_category_key"])
+    status = str(metric["status"])
+    minimum_sample_met = bool(metric["minimum_sample_met"])
+
+    if not minimum_sample_met or status == "insufficient_sample":
+        return "observation_only", "minimum sample gate not met"
+    if model_version.startswith("router_"):
+        if horizon_days == 20 and same_category_key == "all":
+            return "allocation_bias", "router output remains shadow-only broad allocation evidence"
+        return "observation_only", "router output cannot become production or same-type role in this task"
+    if model_version != PRIMARY_MODEL_VERSION:
+        return "observation_only", "candidate model remains research-only before promotion review"
+    if same_category_key != "all":
+        if ranking_disabled:
+            return "observation_only", "same-type ranking disabled by non-positive rank/bucket evidence"
+        return "ranking_signal", "same-type evidence passed rank and bucket spread gates"
+    if horizon_days in {5, 60}:
+        if status == "validated":
+            return "primary_forecast", "baseline remains conservative default for validated 5/60 day broad scope"
+        return "risk_reference", "baseline broad scope degraded; retain only as model-layer risk reference"
+    if horizon_days == 20:
+        if status == "validated":
+            return "allocation_bias", "20-day baseline can inform broad allocation bias but not same-type selection"
+        return "risk_reference", "20-day baseline degraded; keep default evidence cautious and disable ranking elsewhere"
+    return "observation_only", "unsupported horizon remains observation-only"
+
+
+def _same_type_ranking_disabled(metric: dict[str, Any]) -> tuple[bool, str | None]:
+    if str(metric["same_category_key"]) == "all":
+        return False, None
+    reasons = []
+    rank_ic = metric["rank_ic"]
+    bucket_spread = metric["bucket_spread"]
+    if rank_ic is None or float(rank_ic) <= 0:
+        reasons.append("non_positive_same_type_rank_ic")
+    if bucket_spread is None or float(bucket_spread) <= 0:
+        reasons.append("non_positive_same_type_bucket_spread")
+    return bool(reasons), ",".join(reasons) if reasons else None
+
+
+def _consumer_display_level(role: str, *, ranking_disabled: bool) -> str:
+    if role == "primary_forecast":
+        return "default_evidence"
+    if role in {"allocation_bias", "ranking_signal"}:
+        return "model_layer_only"
+    if role == "risk_reference" or ranking_disabled:
+        return "caution"
+    return "internal"
+
+
+def _top_bottom_spread(rows: list[dict[str, Any]], *, bucket_fraction: float) -> float | None:
+    if len(rows) < 10:
+        return None
+    ordered = sorted(rows, key=lambda row: float(row.get("expected_return") or 0), reverse=True)
+    bucket_size = max(1, int(len(ordered) * bucket_fraction))
+    top = ordered[:bucket_size]
+    bottom = ordered[-bucket_size:]
+    return mean(float(row.get("actual_return") or 0) for row in top) - mean(float(row.get("actual_return") or 0) for row in bottom)
 
 
 def _diagnostics(matured: list[dict[str, Any]], by_model_horizon: dict[str, Any]) -> dict[str, Any]:

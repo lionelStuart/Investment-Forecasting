@@ -2,7 +2,7 @@
 
 ## Status
 
-pending
+completed
 
 ## Purpose
 
@@ -68,6 +68,14 @@ day using only information available at that time.
 
 - `python3 -m pytest tests/test_model_validation.py tests/test_db.py -q`
 - CLI smoke with a tiny fixture DB and short date range.
+
+## Completion Notes
+
+- Added `model_replay_runs` and `model_replay_predictions`.
+- Added `investment-forecasting model-validation replay-ytd`.
+- Ran 2026 YTD replay on local history for all assets, horizons `5,20,60`,
+  and all configured model versions without touching operational
+  `model_predictions`.
 
 ## Depends On
 

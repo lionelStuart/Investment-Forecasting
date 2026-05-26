@@ -16,6 +16,10 @@ REQUIRED_TABLES = {
     "features_daily",
     "model_predictions",
     "model_prediction_reliability",
+    "model_health_metrics",
+    "model_applicability_profiles",
+    "model_shadow_routes",
+    "model_governance_reviews",
     "backtest_runs",
     "backtest_results",
     "daily_advice",
@@ -163,11 +167,23 @@ def test_init_db_adds_prediction_reliability_table_to_legacy_database(tmp_path):
         assert "model_prediction_reliability" in table_names(conn)
         assert "model_replay_runs" in table_names(conn)
         assert "model_replay_predictions" in table_names(conn)
+        assert "model_health_metrics" in table_names(conn)
+        assert "model_applicability_profiles" in table_names(conn)
+        assert "model_shadow_routes" in table_names(conn)
+        assert "model_governance_reviews" in table_names(conn)
         columns = {row["name"] for row in conn.execute("PRAGMA table_info(model_prediction_reliability)").fetchall()}
         replay_columns = {row["name"] for row in conn.execute("PRAGMA table_info(model_replay_predictions)").fetchall()}
+        health_columns = {row["name"] for row in conn.execute("PRAGMA table_info(model_health_metrics)").fetchall()}
+        profile_columns = {row["name"] for row in conn.execute("PRAGMA table_info(model_applicability_profiles)").fetchall()}
+        shadow_columns = {row["name"] for row in conn.execute("PRAGMA table_info(model_shadow_routes)").fetchall()}
+        governance_columns = {row["name"] for row in conn.execute("PRAGMA table_info(model_governance_reviews)").fetchall()}
 
     assert {"prediction_id", "rank_score", "same_category_rank", "risk_adjusted_score", "validation_status"}.issubset(columns)
     assert {"replay_run_id", "score_status", "actual_return", "overall_score"}.issubset(replay_columns)
+    assert {"replay_run_id", "rank_ic", "bucket_spread", "minimum_sample_met", "degradation_reason", "confidence_label"}.issubset(health_columns)
+    assert {"source_metric_id", "output_role", "ranking_disabled", "ranking_disable_reason", "confidence_label", "rationale_json"}.issubset(profile_columns)
+    assert {"route_name", "weights_json", "shadow_metrics_json", "baseline_metrics_json", "comparison_json"}.issubset(shadow_columns)
+    assert {"review_month", "summary_text", "report_json", "production_defaults_changed", "promotion_review_eligible"}.issubset(governance_columns)
 
 
 def test_asset_upsert_is_idempotent(tmp_path):

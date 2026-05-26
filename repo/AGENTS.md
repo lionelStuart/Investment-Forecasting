@@ -99,6 +99,11 @@ Follow this loop for every non-trivial development round:
   model defaults. Do not include expert committee predictions, Jarvis
   conclusions, investment advice, MCP/WebUI surfaces, or portfolio outcomes in
   this phase.
+- Model applicability/shadow-routing work must follow `SPEC-015` and
+  `ADR-010`: derive roles from model-health facts, run `router_floor70_cap05`
+  as 20-day shadow-only evidence, disable same-type ranking when same-type Rank
+  IC or bucket spread is non-positive, downgrade raw confidence into
+  evidence-quality labels, and keep operational predictions unchanged.
 - Do not confuse Codex scheduled script automation, `ai_providers` provider
   calls, and Codex agent runtime. Expert/Jarvis product reasoning is intended
   to be agentic through the runtime access layer, while provider calls are only

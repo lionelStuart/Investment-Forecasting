@@ -63,9 +63,19 @@ from investment_forecasting.quant.features import FeatureCalculationError, calcu
 from investment_forecasting.quant.market import MarketSnapshotError, calculate_market_snapshot
 from investment_forecasting.quant.model_validation import (
     ModelValidationError,
+    build_applicability_report,
+    build_confidence_label_report,
+    build_model_health_report,
+    build_model_governance_report,
     build_replay_report,
+    build_shadow_router_report,
     build_tuning_plan,
+    generate_applicability_profiles,
+    generate_confidence_labels,
+    generate_model_governance_summary,
+    generate_model_health_metrics,
     replay_ytd_predictions,
+    run_shadow_router_floor70,
 )
 from investment_forecasting.quant.monitoring import ModelMonitoringError, run_model_monitoring_report
 from investment_forecasting.scheduler import initialize_scheduler, list_scheduler_jobs, run_due_jobs, run_scheduler_job, scheduler_status
@@ -253,6 +263,37 @@ def build_parser() -> argparse.ArgumentParser:
     tuning_parser = model_validation_subparsers.add_parser("tuning-plan", help="Build model tuning recommendations from replay diagnostics")
     tuning_parser.add_argument("--db", type=Path, default=Path("data/investment_forecasting.sqlite3"))
     tuning_parser.add_argument("--run-id", type=int)
+    health_generate_parser = model_validation_subparsers.add_parser("health-generate", help="Persist model-health fact rows from replay evidence")
+    health_generate_parser.add_argument("--db", type=Path, default=Path("data/investment_forecasting.sqlite3"))
+    health_generate_parser.add_argument("--run-id", type=int)
+    health_report_parser = model_validation_subparsers.add_parser("health-report", help="Report persisted model-health fact rows")
+    health_report_parser.add_argument("--db", type=Path, default=Path("data/investment_forecasting.sqlite3"))
+    health_report_parser.add_argument("--run-id", type=int)
+    applicability_generate_parser = model_validation_subparsers.add_parser("applicability-generate", help="Persist model applicability profiles from health facts")
+    applicability_generate_parser.add_argument("--db", type=Path, default=Path("data/investment_forecasting.sqlite3"))
+    applicability_generate_parser.add_argument("--run-id", type=int)
+    applicability_report_parser = model_validation_subparsers.add_parser("applicability-report", help="Report model applicability profiles and same-type ranking disables")
+    applicability_report_parser.add_argument("--db", type=Path, default=Path("data/investment_forecasting.sqlite3"))
+    applicability_report_parser.add_argument("--run-id", type=int)
+    shadow_run_parser = model_validation_subparsers.add_parser("shadow-router-run", help="Run the 20-day floor70 cap05 shadow router from replay evidence")
+    shadow_run_parser.add_argument("--db", type=Path, default=Path("data/investment_forecasting.sqlite3"))
+    shadow_run_parser.add_argument("--run-id", type=int)
+    shadow_report_parser = model_validation_subparsers.add_parser("shadow-router-report", help="Report 20-day floor70 cap05 shadow router metrics")
+    shadow_report_parser.add_argument("--db", type=Path, default=Path("data/investment_forecasting.sqlite3"))
+    shadow_report_parser.add_argument("--run-id", type=int)
+    confidence_generate_parser = model_validation_subparsers.add_parser("confidence-labels-generate", help="Persist conservative confidence labels from model-health evidence")
+    confidence_generate_parser.add_argument("--db", type=Path, default=Path("data/investment_forecasting.sqlite3"))
+    confidence_generate_parser.add_argument("--run-id", type=int)
+    confidence_report_parser = model_validation_subparsers.add_parser("confidence-labels-report", help="Report conservative confidence labels and rationales")
+    confidence_report_parser.add_argument("--db", type=Path, default=Path("data/investment_forecasting.sqlite3"))
+    confidence_report_parser.add_argument("--run-id", type=int)
+    governance_generate_parser = model_validation_subparsers.add_parser("governance-generate", help="Persist monthly model governance summary")
+    governance_generate_parser.add_argument("--db", type=Path, default=Path("data/investment_forecasting.sqlite3"))
+    governance_generate_parser.add_argument("--run-id", type=int)
+    governance_generate_parser.add_argument("--review-month")
+    governance_report_parser = model_validation_subparsers.add_parser("governance-report", help="Report latest monthly model governance summary")
+    governance_report_parser.add_argument("--db", type=Path, default=Path("data/investment_forecasting.sqlite3"))
+    governance_report_parser.add_argument("--run-id", type=int)
 
     advice_parser = subparsers.add_parser("advice", help="Daily advice operations")
     advice_subparsers = advice_parser.add_subparsers(dest="advice_command", required=True)
@@ -748,6 +789,96 @@ def main(argv: list[str] | None = None) -> int:
             result = build_tuning_plan(args.db, run_id=args.run_id)
         except ModelValidationError as exc:
             print(f"Model tuning plan failed: {exc}", file=sys.stderr)
+            return 1
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0
+
+    if args.command == "model-validation" and args.model_validation_command == "health-generate":
+        try:
+            result = generate_model_health_metrics(args.db, run_id=args.run_id)
+        except ModelValidationError as exc:
+            print(f"Model health generation failed: {exc}", file=sys.stderr)
+            return 1
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0
+
+    if args.command == "model-validation" and args.model_validation_command == "health-report":
+        try:
+            result = build_model_health_report(args.db, run_id=args.run_id)
+        except ModelValidationError as exc:
+            print(f"Model health report failed: {exc}", file=sys.stderr)
+            return 1
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0
+
+    if args.command == "model-validation" and args.model_validation_command == "applicability-generate":
+        try:
+            result = generate_applicability_profiles(args.db, run_id=args.run_id)
+        except ModelValidationError as exc:
+            print(f"Model applicability generation failed: {exc}", file=sys.stderr)
+            return 1
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0
+
+    if args.command == "model-validation" and args.model_validation_command == "applicability-report":
+        try:
+            result = build_applicability_report(args.db, run_id=args.run_id)
+        except ModelValidationError as exc:
+            print(f"Model applicability report failed: {exc}", file=sys.stderr)
+            return 1
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0
+
+    if args.command == "model-validation" and args.model_validation_command == "shadow-router-run":
+        try:
+            result = run_shadow_router_floor70(args.db, run_id=args.run_id)
+        except ModelValidationError as exc:
+            print(f"Shadow router run failed: {exc}", file=sys.stderr)
+            return 1
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0
+
+    if args.command == "model-validation" and args.model_validation_command == "shadow-router-report":
+        try:
+            result = build_shadow_router_report(args.db, run_id=args.run_id)
+        except ModelValidationError as exc:
+            print(f"Shadow router report failed: {exc}", file=sys.stderr)
+            return 1
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0
+
+    if args.command == "model-validation" and args.model_validation_command == "confidence-labels-generate":
+        try:
+            result = generate_confidence_labels(args.db, run_id=args.run_id)
+        except ModelValidationError as exc:
+            print(f"Confidence label generation failed: {exc}", file=sys.stderr)
+            return 1
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0
+
+    if args.command == "model-validation" and args.model_validation_command == "confidence-labels-report":
+        try:
+            result = build_confidence_label_report(args.db, run_id=args.run_id)
+        except ModelValidationError as exc:
+            print(f"Confidence label report failed: {exc}", file=sys.stderr)
+            return 1
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0
+
+    if args.command == "model-validation" and args.model_validation_command == "governance-generate":
+        try:
+            result = generate_model_governance_summary(args.db, run_id=args.run_id, review_month=args.review_month)
+        except ModelValidationError as exc:
+            print(f"Model governance generation failed: {exc}", file=sys.stderr)
+            return 1
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0
+
+    if args.command == "model-validation" and args.model_validation_command == "governance-report":
+        try:
+            result = build_model_governance_report(args.db, run_id=args.run_id)
+        except ModelValidationError as exc:
+            print(f"Model governance report failed: {exc}", file=sys.stderr)
             return 1
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0

@@ -2,7 +2,7 @@
 
 ## Status
 
-pending
+completed
 
 ## Purpose
 
@@ -67,6 +67,15 @@ model version, asset type, theme, and market period.
 ## Test Plan
 
 - `python3 -m pytest tests/test_model_validation.py tests/test_backtest.py -q`
+
+## Completion Notes
+
+- Added replay diagnostics on matured rows only, with pending/skipped coverage
+  kept separate.
+- Metrics aggregate by model/horizon, month, asset type, and deterministic
+  category, and include direction accuracy, error, risk hit, benchmark excess,
+  Rank IC, bucket spread, probability calibration, high-confidence wrong
+  direction, and downside-risk misses.
 
 ## Depends On
 
