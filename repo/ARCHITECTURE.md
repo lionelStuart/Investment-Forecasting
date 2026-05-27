@@ -56,7 +56,7 @@ optional documentation pass.
 - News evidence services own provider-neutral news ingestion, deduplication,
   source/time/asset/theme/event/sentiment indexes, time-safe aggregate
   features, and searchable evidence APIs.
-- System scheduler services own job registry, due-job selection, hourly and
+- System scheduler services own job registry, due-job selection, two-hour and
   market-calendar-aware triggers, incremental watermarks, provider request
   budgets, backoff/deferred states, and scheduler run audit.
 - Codex runtime access services own role-scoped agent runs, project skill
@@ -346,6 +346,10 @@ optional documentation pass.
   available only through explicit runtime policy for externally isolated runs.
   Authentication is not bypassed; readiness must pass `codex login status`
   before scheduled runtime execution.
+- Local trigger policy: on macOS, `scheduler install-cron` installs one
+  system-owned LaunchAgent, `local.investment-forecasting.scheduler`, that
+  wakes `scheduler run-due`. These jobs call the same scheduler/runtime adapter
+  paths as manual operations and are not Codex app automations.
 - Expert ordering: active experts run on T day after system evidence is
   prepared. Each expert must complete one virtual action outcome or explicitly
   skip/fail.
@@ -585,7 +589,7 @@ optional documentation pass.
   MCP. Provider work is planned through the central scheduler path with
   `real_provider_calls=false` metadata until product enables selected live
   provider execution.
-- Hourly jobs: retrieve only missing news/market context windows since the last
+- Two-hour jobs: retrieve only missing news/market context windows since the last
   successful watermark, rebuild only affected news feature scopes, refresh
   data freshness and health, and defer provider calls when request budgets or
   backoff policies require it.
@@ -594,6 +598,10 @@ optional documentation pass.
   backtest, advice, and readiness gates when evidence is available.
 - Agent jobs: trigger expert Codex runs after the system has prepared T-day
   evidence, and trigger Jarvis T+1 only after T expert outcomes are terminal.
+  The local macOS schedule is installed by `scheduler install-cron`: one
+  LaunchAgent wakes `scheduler run-due`, experts run at 20:00 Monday-Friday,
+  and Jarvis runs at 08:00 daily with the previous weekday as default evidence
+  date and communication-adapter notification defaults enabled.
 - Forbidden Changes: Do not hide failures or skip logging. Do not introduce
   Codex app automation as a refresh scheduler. Do not schedule full-history
   ingestion or unbounded news scans.
@@ -720,7 +728,7 @@ flowchart TD
   Phone["Phone<br/>allowlisted recipient"]
   Jarvis["Jarvis Assistant<br/>daily focus, model summary,<br/>expert views, risk brief"]
   MCP["MCP Tools<br/>structured agent access"]
-  Scheduler["System Scheduler<br/>hourly incremental refresh,<br/>watermarks, backoff, gates"]
+  Scheduler["System Scheduler<br/>two-hour incremental refresh,<br/>watermarks, backoff, gates"]
   Watermarks["Scheduler State<br/>jobs, runs, watermarks,<br/>provider budgets"]
   Daily["Daily Workflow<br/>post-close preparation,<br/>forecast, advice, logs"]
   Product["Product Experience Layer<br/>today brief, opportunity pool,<br/>expert panel, evidence, settings"]
@@ -776,7 +784,7 @@ flowchart TD
 - SQLite file/database for local persistence.
 - MCP server tools for AI agent integration.
 - Codex agent runtime access layer for role-scoped expert and Jarvis tasks.
-- System-owned scheduler for hourly incremental market/news refresh,
+- System-owned scheduler for two-hour incremental market/news refresh,
   post-close preparation, provider backoff, expert T-day runs, and Jarvis T+1
   analysis.
 - Web browser for the local WebUI.

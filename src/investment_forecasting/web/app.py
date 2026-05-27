@@ -1979,6 +1979,7 @@ def scheduler_health_panel(status: dict[str, Any]) -> str:
     latest_runs = status.get("latest_runs", {})
     watermarks = status.get("watermarks", [])
     rate_limits = status.get("provider_rate_limits", [])
+    today = status.get("today", {})
     latest_success = [run for run in latest_runs.values() if run and run.get("status") == "success"]
     deferred = [run for run in latest_runs.values() if run and run.get("status") == "deferred"]
     failed = [run for run in latest_runs.values() if run and run.get("status") == "failed"]
@@ -1995,6 +1996,7 @@ def scheduler_health_panel(status: dict[str, Any]) -> str:
         {
             "job_key": key,
             "status": run.get("status") if run else "暂无",
+            "execution_mode": run.get("execution_mode") if run else "",
             "scheduled_at": run.get("scheduled_at") if run else "",
             "deferred_reason": run.get("deferred_reason") if run else "",
             "updated_counts": json.dumps(run.get("updated_counts", {}), ensure_ascii=False) if run else "{}",
@@ -2005,10 +2007,44 @@ def scheduler_health_panel(status: dict[str, Any]) -> str:
     headline = "调度正常" if health_class == "ok" else ("调度延后" if health_class == "warn" else "调度异常")
     panel = f'<div class="notice {health_class}"><strong>系统调度：</strong>{escape(headline)}。市场/资讯增量由本系统调度，不依赖 Codex app automation。</div>'
     panel += summary
-    panel += collapsible("最近调度运行", table(run_rows, ["job_key", "status", "scheduled_at", "deferred_reason", "updated_counts"]))
+    panel += scheduler_today_panel(today)
+    panel += collapsible("最近调度运行", table(run_rows, ["job_key", "status", "execution_mode", "scheduled_at", "deferred_reason", "updated_counts"]))
     panel += collapsible("调度 Watermarks", table(watermarks, ["job_key", "provider_key", "source_key", "scope_key", "last_success_cursor", "last_attempted_cursor"]))
     panel += collapsible("Provider Backoff", table(rate_limits, ["provider_key", "backoff_until", "hourly_count", "daily_count", "failure_count", "last_failure_reason"]))
     return panel
+
+
+def scheduler_today_panel(today: dict[str, Any]) -> str:
+    items = today.get("items", [])
+    failures = today.get("task_log_failures", [])
+    counts = today.get("counts", {})
+    status = today.get("overall_status", "ok")
+    label = "今日调度正常" if status == "ok" else ("今日调度需关注" if status == "warn" else "今日调度异常")
+    cards = stat_grid(
+        [
+            ("已成功", counts.get("success", 0)),
+            ("失败", counts.get("failed", 0)),
+            ("延后", counts.get("deferred", 0)),
+            ("未跑", counts.get("missed", 0)),
+        ]
+    )
+    rows = [
+        {
+            "job_key": item["job_key"],
+            "status": item["status"],
+            "due": f"{item['run_count']}/{item['due_count']}",
+            "missed": item["missed_count"],
+            "next_expected_at": item.get("next_expected_at") or "",
+            "reason": item["reason"],
+        }
+        for item in items
+    ]
+    body = f'<div class="notice {escape(status)}"><strong>今日任务：</strong>{escape(label)} · {escape(today.get("date", ""))}</div>'
+    body += cards
+    body += table(rows, ["job_key", "status", "due", "missed", "next_expected_at", "reason"]) if rows else empty("今天没有调度任务。")
+    if failures:
+        body += collapsible("今日失败任务日志", table(failures, ["id", "task_name", "run_date", "started_at", "status", "message", "error"]))
+    return body
 
 
 def run_health_panel(stages: list[dict[str, Any]]) -> str:
@@ -2039,6 +2075,7 @@ def render_page(title: str, body: str, active_path: str) -> str:
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{escape(title)} · Investment Forecasting</title>
   <style>{CSS}</style>
+  <script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>
 </head>
 <body>
   <aside class="sidebar">
@@ -4035,7 +4072,8 @@ def expert_detail_rows(conn: Any, expert_key: str | None = None) -> list[dict[st
             transactions = conn.execute(
                 """
                 SELECT vt.trade_date, vt.side, vt.status, vt.quantity,
-                       vt.price, vt.gross_amount, vt.reason,
+                       vt.price, vt.gross_amount, vt.cost_basis,
+                       vt.realized_pnl, vt.reason,
                        a.code AS asset_code, a.name AS asset_name
                 FROM virtual_transactions vt
                 LEFT JOIN assets a ON a.id = vt.asset_id
@@ -4088,8 +4126,12 @@ def _position_details_from_valuation(details_json: str) -> list[dict[str, Any]]:
             "asset": f"{row.get('asset_code') or ''} {row.get('asset_name') or ''}".strip() or "未命名资产",
             "quantity": row.get("quantity"),
             "average_cost": money(row.get("average_cost")),
+            "current_price": money(row.get("price")),
             "price_date": row.get("price_date") or "暂无",
+            "cost_basis": money(row.get("cost_basis")),
             "market_value": money(row.get("value")),
+            "unrealized_pnl": money(row.get("unrealized_pnl")),
+            "position_return": percent(row.get("position_return")),
         }
         for row in rows
     ]
@@ -4379,6 +4421,8 @@ def expert_plans_and_execution(detail: dict[str, Any]) -> str:
             "quantity": tx["quantity"],
             "price": tx["price"] if tx["price"] is not None else "暂无",
             "amount": money(tx["gross_amount"]),
+            "cost_basis": money(tx["cost_basis"]),
+            "realized_pnl": money(tx["realized_pnl"]),
             "reason": tx["reason"] or "暂无原因",
         }
         for tx in detail["transactions"]
@@ -4387,7 +4431,7 @@ def expert_plans_and_execution(detail: dict[str, Any]) -> str:
     if plan_rows:
         body += "<h3>投资计划</h3>" + table(plan_rows, ["plan_date", "action", "target", "target_weight", "target_amount", "execution_status", "reason", "analysis", "risk_warnings"])
     if tx_rows:
-        body += "<h3>执行记录</h3>" + table(tx_rows, ["trade_date", "side", "status", "asset", "quantity", "price", "amount", "reason"])
+        body += "<h3>执行记录</h3>" + table(tx_rows, ["trade_date", "side", "status", "asset", "quantity", "price", "amount", "cost_basis", "realized_pnl", "reason"])
     return body
 
 
@@ -4441,7 +4485,7 @@ def _json_summary(raw: Any, keys: list[str]) -> str:
 def expert_positions_table(rows: list[dict[str, Any]]) -> str:
     if not rows:
         return empty("当前没有持仓，资金仍在现金中。")
-    return table(rows, ["asset", "quantity", "average_cost", "price_date", "market_value"])
+    return table(rows, ["asset", "quantity", "average_cost", "current_price", "price_date", "cost_basis", "market_value", "unrealized_pnl", "position_return"])
 
 
 def expert_overview_investment_panel(rows: list[dict[str, Any]]) -> str:
@@ -4488,39 +4532,41 @@ def expert_return_series(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def expert_comparison_curve(series: list[dict[str, Any]]) -> str:
-    values = [point["return"] for item in series for point in item["points"]]
-    if not values:
+    return_values = [float(point["return"]) for item in series for point in item["points"] if point["return"] is not None]
+    if not return_values:
         return empty("还没有有效收益点。")
-    low = min(min(values), 0.0)
-    high = max(max(values), 0.0)
-    span = high - low or 1.0
-    width = 720
-    height = 220
-    palette = ["#0f766e", "#2563eb", "#a16207", "#b91c1c", "#6d28d9", "#475569"]
-    lines = []
-    legend = []
-    for index, item in enumerate(series):
-        points = []
-        for point_index, point in enumerate(item["points"]):
-            x = (point_index / max(len(item["points"]) - 1, 1) * width) if len(item["points"]) > 1 else width / 2
-            y = height - ((point["return"] - low) / span * height)
-            points.append(f"{x:.1f},{y:.1f}")
-        color = palette[index % len(palette)]
-        lines.append(f'<polyline class="expert-series-line" style="stroke:{color}" points="{" ".join(points)}"></polyline>')
-        latest = item["points"][-1]
-        legend.append(f'<span><i style="background:{color}"></i>{escape(item["expert_name"])} {market_percent(latest["return"])}</span>')
-    zero_y = height - ((0 - low) / span * height)
+    low, high = _curve_domain(return_values, include_zero=True)
+    dates = sorted({point["valuation_date"] for item in series for point in item["points"]})
+    chart_data = {
+        "dates": dates,
+        "domain": {"low": round(low, 6), "high": round(high, 6)},
+        "series": [
+            {
+                "name": item["expert_name"],
+                "latestReturnLabel": plain_percent(item["points"][-1]["return"], signed=True),
+                "points": [
+                    {
+                        "date": point["valuation_date"],
+                        "returnValue": round(float(point["return"]), 6),
+                        "returnLabel": plain_percent(point["return"], signed=True),
+                        "totalValue": round(float(point["total_value"]), 4),
+                        "totalLabel": _compact_money(float(point["total_value"])),
+                        "isLatest": index == len(item["points"]) - 1,
+                    }
+                    for index, point in enumerate(item["points"])
+                ],
+            }
+            for item in series
+        ],
+    }
     return f"""
     <div class="curve-card comparison-curve">
       <div class="curve-meta">
         <span>不同专家虚拟收益</span>
-        <strong>{market_percent(max(values))}</strong>
+        <strong>{market_percent(max(return_values) if return_values else None)}</strong>
       </div>
-      <svg class="curve" viewBox="0 0 {width} {height}" role="img" aria-label="专家收益对比曲线">
-        <line x1="0" y1="{zero_y:.1f}" x2="{width}" y2="{zero_y:.1f}"></line>
-        {''.join(lines)}
-      </svg>
-      <div class="curve-legend">{''.join(legend)}</div>
+      <div class="echarts-curve expert-comparison-echarts" data-echarts="expert-comparison" role="img" aria-label="专家收益对比曲线"></div>
+      <script type="application/json" class="echarts-data">{json_for_script(chart_data)}</script>
     </div>
     """
 
@@ -4528,37 +4574,119 @@ def expert_comparison_curve(series: list[dict[str, Any]]) -> str:
 def expert_return_curve(rows: list[dict[str, Any]], initial_capital: Any) -> str:
     if not rows or not initial_capital:
         return empty("还没有估值记录；运行计划或评分后会显示收益曲线。")
-    values = [float(row["total_value"]) for row in rows if row["total_value"] is not None]
-    labels = [row["valuation_date"] for row in rows if row["total_value"] is not None]
+    valid_rows = [row for row in rows if row["total_value"] is not None]
+    values = [float(row["total_value"]) for row in valid_rows]
+    labels = [row["valuation_date"] for row in valid_rows]
     if not values:
         return empty("还没有有效估值记录。")
     returns = [(value / float(initial_capital)) - 1.0 for value in values]
-    low = min(min(returns), 0.0)
-    high = max(max(returns), 0.0)
-    span = high - low or 1.0
-    width = 520
-    height = 180
-    points = []
-    for index, value in enumerate(returns):
-        x = (index / max(len(returns) - 1, 1) * width) if len(returns) > 1 else width / 2
-        y = height - ((value - low) / span * height)
-        points.append(f"{x:.1f},{y:.1f}")
-    zero_y = height - ((0 - low) / span * height)
+    _, high = _curve_domain(values, include_zero=False)
     latest_return = returns[-1]
-    circles = "".join(f'<circle cx="{point.split(",")[0]}" cy="{point.split(",")[1]}" r="4"></circle>' for point in points)
+    chart_data = {
+        "points": [
+            {
+                "date": label,
+                "cashValue": round(float(row.get("cash") or 0), 4),
+                "positionsValue": round(float(row.get("positions_value") or 0), 4),
+                "totalValue": round(value, 4),
+                "totalLabel": _compact_money(value),
+                "returnValue": round(return_value, 6),
+                "returnLabel": plain_percent(return_value, signed=True),
+            }
+            for row, label, value, return_value in zip(valid_rows, labels, values, returns)
+        ],
+        "domain": {"low": 0, "high": round(high, 4)},
+    }
     return f"""
     <div class="curve-card compact-curve">
       <div class="curve-meta">
         <span>{escape(labels[0])} 至 {escape(labels[-1])}</span>
         <strong>{market_percent(latest_return)}</strong>
       </div>
-      <svg class="curve expert-curve" viewBox="0 0 {width} {height}" role="img" aria-label="专家收益曲线">
-        <line x1="0" y1="{zero_y:.1f}" x2="{width}" y2="{zero_y:.1f}"></line>
-        <polyline points="{' '.join(points)}"></polyline>
-        {circles}
-      </svg>
+      <div class="echarts-curve expert-return-echarts" data-echarts="expert-return" role="img" aria-label="专家总资产柱状图"></div>
+      <script type="application/json" class="echarts-data">{json_for_script(chart_data)}</script>
     </div>
     """
+
+
+def _curve_domain(values: list[float], *, include_zero: bool = True) -> tuple[float, float]:
+    low = min(values)
+    high = max(values)
+    if include_zero:
+        low = min(low, 0.0)
+        high = max(high, 0.0)
+    span = high - low
+    if span <= 1e-12:
+        base = max(abs(high), 1.0)
+        padding = base * 0.01
+        return low - padding, high + padding
+    padding = max(span * 0.18, max(abs(low), abs(high), 0.01) * 0.04)
+    return low - padding, high + padding
+
+
+def _curve_date_domain(labels: list[str]) -> tuple[date | None, date | None]:
+    dates = [_parse_iso_date(label) for label in labels]
+    dates = [value for value in dates if value is not None]
+    if not dates:
+        return None, None
+    return min(dates), max(dates)
+
+
+def _curve_x(label: str, start: date | None, end: date | None, plot: dict[str, float]) -> float:
+    if start is None or end is None or start == end:
+        return (plot["left"] + plot["right"]) / 2
+    value = _parse_iso_date(label)
+    if value is None:
+        return plot["left"]
+    ratio = (value - start).days / max((end - start).days, 1)
+    ratio = min(max(ratio, 0.0), 1.0)
+    return plot["left"] + ratio * (plot["right"] - plot["left"])
+
+
+def _curve_y(value: float, low: float, high: float, plot: dict[str, float]) -> float:
+    span = high - low or 1.0
+    ratio = (value - low) / span
+    ratio = min(max(ratio, 0.0), 1.0)
+    return plot["bottom"] - ratio * (plot["bottom"] - plot["top"])
+
+
+def _curve_axis_markup(low: float, high: float, start: date | None, end: date | None, plot: dict[str, float]) -> str:
+    mid = (low + high) / 2
+    y_ticks = [high, mid, low]
+    y_parts = []
+    for value in y_ticks:
+        y = _curve_y(value, low, high, plot)
+        y_parts.append(f'<line class="grid-line" x1="{plot["left"]:.1f}" y1="{y:.1f}" x2="{plot["right"]:.1f}" y2="{y:.1f}"></line>')
+        y_parts.append(f'<text class="axis-label y-label" x="{plot["left"] - 8:.1f}" y="{y + 4:.1f}">{escape(_compact_money(value))}</text>')
+    x_parts = [
+        f'<line class="axis-line" x1="{plot["left"]:.1f}" y1="{plot["bottom"]:.1f}" x2="{plot["right"]:.1f}" y2="{plot["bottom"]:.1f}"></line>',
+        f'<line class="axis-line" x1="{plot["left"]:.1f}" y1="{plot["top"]:.1f}" x2="{plot["left"]:.1f}" y2="{plot["bottom"]:.1f}"></line>',
+    ]
+    if start and end:
+        tick_dates = [start] if start == end else [start, start + (end - start) / 2, end]
+        seen = set()
+        for tick in tick_dates:
+            if tick in seen:
+                continue
+            seen.add(tick)
+            x = _curve_x(tick.isoformat(), start, end, plot)
+            x_parts.append(f'<line class="tick-line" x1="{x:.1f}" y1="{plot["bottom"]:.1f}" x2="{x:.1f}" y2="{plot["bottom"] + 5:.1f}"></line>')
+            x_parts.append(f'<text class="axis-label x-label" x="{x:.1f}" y="{plot["bottom"] + 20:.1f}">{escape(tick.strftime("%m-%d"))}</text>')
+    return "".join(y_parts + x_parts)
+
+
+def _compact_money(value: float) -> str:
+    absolute = abs(value)
+    if absolute >= 10000:
+        return f"{value / 10000:.1f}万"
+    return f"{value:.0f}"
+
+
+def _parse_iso_date(value: Any) -> date | None:
+    try:
+        return datetime.fromisoformat(str(value)).date()
+    except (TypeError, ValueError):
+        return None
 
 
 def _portfolio_return_from_values(initial_capital: Any, total_value: Any) -> float | None:
@@ -4766,6 +4894,10 @@ def escape(value: Any) -> str:
     return html.escape(str(value), quote=True)
 
 
+def json_for_script(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":")).replace("</", "<\\/")
+
+
 JS = """
 document.addEventListener('DOMContentLoaded', () => {
   document.querySelectorAll('.tab-bar').forEach((bar) => {
@@ -4794,6 +4926,264 @@ document.addEventListener('DOMContentLoaded', () => {
       }
     });
   });
+  const formatMoneyAxis = (value) => {
+    const number = Number(value);
+    if (!Number.isFinite(number)) {
+      return '-';
+    }
+    const absolute = Math.abs(number);
+    if (absolute >= 10000) {
+      return `${(number / 10000).toFixed(1).replace(/\\.0$/, '')}万`;
+    }
+    return Math.round(number).toLocaleString('zh-CN');
+  };
+  const formatCurrency = (value) => {
+    const number = Number(value);
+    if (!Number.isFinite(number)) {
+      return '-';
+    }
+    return `¥${Math.round(number).toLocaleString('zh-CN')}`;
+  };
+  const formatPercentAxis = (value) => {
+    const number = Number(value);
+    if (!Number.isFinite(number)) {
+      return '-';
+    }
+    return `${(number * 100).toFixed(2)}%`;
+  };
+  const formatDateTick = (value) => {
+    const text = String(value || '');
+    return text.length >= 10 ? text.slice(5, 10) : text;
+  };
+  const initExpertReturnChart = (node, payload) => {
+    if (!window.echarts || !node || !payload || !Array.isArray(payload.points)) {
+      if (node) {
+        node.textContent = '图表组件加载失败，请检查网络后刷新页面。';
+      }
+      return;
+    }
+    const points = payload.points;
+    const chart = window.echarts.init(node, null, { renderer: 'canvas' });
+    const cashData = points.map((point) => ({
+      value: point.cashValue || 0,
+      totalValue: point.totalValue,
+      returnLabel: point.returnLabel,
+      date: point.date,
+      isStackTop: !(point.positionsValue > 0)
+    }));
+    const positionsData = points.map((point) => ({
+      value: point.positionsValue || 0,
+      totalValue: point.totalValue,
+      returnLabel: point.returnLabel,
+      date: point.date,
+      isStackTop: point.positionsValue > 0
+    }));
+    const topLabel = (params) => {
+      const data = params.data || {};
+      return data.isStackTop ? formatMoneyAxis(data.totalValue) : '';
+    };
+    chart.setOption({
+      color: ['#f2c94c', '#0f766e', '#b91c1c'],
+      legend: { top: 8, right: 18, itemWidth: 12, itemHeight: 8, textStyle: { color: '#607177' } },
+      grid: { left: 58, right: 58, top: 68, bottom: points.length > 20 ? 58 : 38, containLabel: true },
+      tooltip: {
+        trigger: 'axis',
+        axisPointer: { type: 'shadow' },
+        confine: true,
+        formatter: (items) => {
+          const list = Array.isArray(items) ? items : [items];
+          const data = list[0] && list[0].data ? list[0].data : {};
+          const point = points.find((item) => item.date === data.date) || {};
+          return [
+            `<strong>${data.date || '-'}</strong>`,
+            `现金：${formatCurrency(point.cashValue)}`,
+            `投资：${formatCurrency(point.positionsValue)}`,
+            `总资产：${formatCurrency(point.totalValue)}`,
+            `收益：${point.returnLabel || '-'}`
+          ].join('<br>');
+        }
+      },
+      xAxis: {
+        type: 'category',
+        data: points.map((point) => point.date),
+        axisTick: { alignWithLabel: true },
+        axisLabel: { color: '#607177', formatter: formatDateTick },
+        axisLine: { lineStyle: { color: '#8fa4aa' } }
+      },
+      yAxis: [
+        {
+          type: 'value',
+          min: payload.domain ? payload.domain.low : null,
+          max: payload.domain ? payload.domain.high : null,
+          axisLabel: { color: '#607177', formatter: formatMoneyAxis },
+          splitLine: { lineStyle: { color: '#c9d4d7', type: 'dashed' } },
+          axisLine: { show: true, lineStyle: { color: '#8fa4aa' } }
+        },
+        {
+          type: 'value',
+          axisLabel: { color: '#9f1d1d', formatter: formatPercentAxis },
+          splitLine: { show: false },
+          axisLine: { show: true, lineStyle: { color: '#b91c1c' } }
+        }
+      ],
+      dataZoom: points.length > 20 ? [
+        { type: 'inside', xAxisIndex: 0, filterMode: 'none' },
+        { type: 'slider', xAxisIndex: 0, height: 20, bottom: 12, borderColor: '#d7e0e3', fillerColor: 'rgba(15,118,110,.12)', handleStyle: { color: '#0f766e' } }
+      ] : [],
+      series: [
+        {
+          name: '现金',
+          type: 'bar',
+          stack: 'asset',
+          barMaxWidth: 44,
+          itemStyle: { borderRadius: [0, 0, 4, 4], opacity: 0.92 },
+          label: { show: true, position: 'top', color: '#607177', fontWeight: 700, formatter: topLabel },
+          data: cashData
+        },
+        {
+          name: '投资',
+          type: 'bar',
+          stack: 'asset',
+          barMaxWidth: 44,
+          itemStyle: { borderRadius: [4, 4, 0, 0], opacity: 0.88 },
+          label: { show: true, position: 'top', color: '#0f5f59', fontWeight: 700, formatter: topLabel },
+          data: positionsData
+        },
+        {
+          name: '收益',
+          type: 'line',
+          yAxisIndex: 1,
+          symbol: 'circle',
+          symbolSize: 7,
+          lineStyle: { width: 3 },
+          itemStyle: { color: '#b91c1c' },
+          label: { show: true, position: 'top', distance: 8, color: '#b91c1c', fontWeight: 750, formatter: (params) => params.dataIndex === points.length - 1 && params.data && params.data.returnLabel ? params.data.returnLabel : '' },
+          data: points.map((point) => ({
+            value: point.returnValue,
+            totalValue: point.totalValue,
+            returnValue: point.returnValue,
+            returnLabel: point.returnLabel,
+            date: point.date
+          }))
+        }
+      ]
+    });
+    const resize = () => chart.resize();
+    window.addEventListener('resize', resize);
+  };
+  const initExpertComparisonChart = (node, payload) => {
+    if (!window.echarts || !node || !payload || !Array.isArray(payload.series)) {
+      if (node) {
+        node.textContent = '图表组件加载失败，请检查网络后刷新页面。';
+      }
+      return;
+    }
+    const chart = window.echarts.init(node, null, { renderer: 'canvas' });
+    const comparisonRowsByDate = new Map();
+    payload.series.forEach((item) => {
+      (item.points || []).forEach((point) => {
+        const rows = comparisonRowsByDate.get(point.date) || [];
+        rows.push({
+          expert: item.name,
+          latestReturnLabel: item.latestReturnLabel || '',
+          returnLabel: point.returnLabel || '-',
+          totalValue: point.totalValue
+        });
+        comparisonRowsByDate.set(point.date, rows);
+      });
+    });
+    chart.setOption({
+      color: ['#0f766e', '#2563eb', '#a16207', '#b91c1c', '#6d28d9', '#475569'],
+      legend: {
+        type: 'scroll',
+        top: 8,
+        left: 12,
+        right: 12,
+        itemWidth: 16,
+        itemHeight: 8,
+        selectedMode: true,
+        textStyle: { color: '#607177' }
+      },
+      grid: { left: 54, right: 28, top: 58, bottom: 40, containLabel: true },
+      tooltip: {
+        trigger: 'axis',
+        confine: true,
+        formatter: (items) => {
+          const list = Array.isArray(items) ? items : [items];
+          const date = list[0] && list[0].axisValue ? list[0].axisValue : '-';
+          const rows = (comparisonRowsByDate.get(date) || []).map((row) => {
+            return `${row.expert}：${row.returnLabel} · 总资产 ${formatCurrency(row.totalValue)}`;
+          });
+          return [`<strong>${date}</strong>`, ...rows].join('<br>');
+        }
+      },
+      xAxis: {
+        type: 'category',
+        data: payload.dates || [],
+        boundaryGap: false,
+        axisTick: { alignWithLabel: true },
+        axisLabel: { color: '#607177', formatter: formatDateTick },
+        axisLine: { lineStyle: { color: '#8fa4aa' } }
+      },
+      yAxis: {
+        type: 'value',
+        min: payload.domain ? payload.domain.low : null,
+        max: payload.domain ? payload.domain.high : null,
+        axisLabel: { color: '#607177', formatter: formatPercentAxis },
+        splitLine: { lineStyle: { color: '#c9d4d7', type: 'dashed' } },
+        axisLine: { show: true, lineStyle: { color: '#8fa4aa' } }
+      },
+      series: payload.series.map((item) => ({
+        name: `${item.name} ${item.latestReturnLabel || ''}`,
+        type: 'line',
+        smooth: true,
+        symbol: 'circle',
+        symbolSize: 7,
+        lineStyle: { width: 3 },
+        label: {
+          show: true,
+          position: 'top',
+          distance: 8,
+          fontWeight: 750,
+          formatter: (params) => params.data && params.data.isLatest ? params.data.returnLabel : ''
+        },
+        emphasis: { focus: 'series' },
+        data: (item.points || []).map((point) => ({
+          value: [point.date, point.returnValue],
+          date: point.date,
+          returnValue: point.returnValue,
+          returnLabel: point.returnLabel,
+          totalValue: point.totalValue,
+          totalLabel: point.totalLabel,
+          isLatest: point.isLatest
+        }))
+      }))
+    });
+    const resize = () => chart.resize();
+    window.addEventListener('resize', resize);
+  };
+  document.querySelectorAll('.echarts-curve[data-echarts="expert-return"]').forEach((node) => {
+    const dataNode = node.parentElement ? node.parentElement.querySelector('script.echarts-data') : null;
+    if (!dataNode) {
+      return;
+    }
+    try {
+      initExpertReturnChart(node, JSON.parse(dataNode.textContent || '{}'));
+    } catch (error) {
+      node.textContent = '图表数据解析失败。';
+    }
+  });
+  document.querySelectorAll('.echarts-curve[data-echarts="expert-comparison"]').forEach((node) => {
+    const dataNode = node.parentElement ? node.parentElement.querySelector('script.echarts-data') : null;
+    if (!dataNode) {
+      return;
+    }
+    try {
+      initExpertComparisonChart(node, JSON.parse(dataNode.textContent || '{}'));
+    } catch (error) {
+      node.textContent = '图表数据解析失败。';
+    }
+  });
 });
 """
 
@@ -4821,11 +5211,11 @@ section{background:var(--panel);border:1px solid var(--line);border-radius:8px;m
 .expert-detail-list{display:grid;gap:14px}.expert-detail{border:1px solid var(--line);border-left:4px solid var(--accent);border-radius:8px;background:#fbfdfd;padding:14px;min-width:0}.expert-detail.state-probation{border-left-color:var(--warn);background:#fffaf0}.expert-detail.state-retired{border-left-color:var(--bad);background:#fff8f8}.expert-detail-head{display:flex;justify-content:space-between;gap:12px;align-items:flex-start;margin-bottom:10px}.expert-detail-head h3{margin:0;font-size:18px}.expert-detail-head span{display:block;color:var(--muted);font-size:12px}.expert-detail-head strong{color:#0f5f59;font-size:22px}.expert-detail .stat-grid{grid-template-columns:repeat(4,minmax(120px,1fr));margin-bottom:12px}.expert-detail-grid{display:grid;grid-template-columns:1.1fr 1fr 1.1fr 1.2fr;gap:12px}.expert-subpanel{min-width:0;border:1px solid var(--line);border-radius:6px;background:#fff;padding:10px}.expert-subpanel h4{margin:0 0 8px;font-size:13px;color:#37474c}.expert-subpanel .table-wrap table{min-width:520px}.expert-plan-summary{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}.expert-plan-summary div{border:1px solid var(--line);border-radius:6px;background:#fbfdfd;padding:8px;min-width:0}.expert-plan-summary span{display:block;color:var(--muted);font-size:12px}.expert-plan-summary strong{display:block;margin-top:4px;overflow-wrap:anywhere}.expert-plan-summary p{grid-column:1/-1;margin:0;color:var(--ink)}.expert-timeline{list-style:none;margin:0;padding:0;display:grid;gap:8px}.expert-timeline li{display:grid;gap:2px;border-left:3px solid #b9ded8;padding-left:8px}.expert-timeline time,.expert-timeline span{color:var(--muted);font-size:12px}.expert-timeline b{font-size:13px}.lesson-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:10px}.lesson-card{border:1px solid var(--line);border-radius:8px;background:#fbfdfd;padding:12px}.lesson-card div{display:flex;justify-content:space-between;gap:10px;align-items:flex-start}.lesson-card span,.lesson-card small{display:block;color:var(--muted);font-size:12px}.lesson-card p{margin:8px 0}.compact-curve{padding:10px}.expert-curve{height:180px}.curve circle{fill:#0f766e;stroke:#fff;stroke-width:2}
 .expert-detail-page section h3{font-size:14px;margin:12px 0 8px}.expert-detail-page td{white-space:normal;overflow:visible;text-overflow:clip;max-width:520px}.expert-profile-head{display:flex;justify-content:space-between;gap:16px;align-items:flex-start;margin-bottom:12px}.expert-profile-head h3{font-size:22px;margin:0}.expert-profile-head span{display:block;color:var(--muted);margin-top:2px}.expert-profile-head p{margin:8px 0 0;max-width:760px}.expert-profile-head strong{color:#0f5f59;font-size:24px}
 .timeline{display:grid;gap:12px}.timeline.compact{gap:8px}.timeline-card{border:1px solid var(--line);border-radius:8px;background:#fbfdfd;padding:12px}.timeline-date{display:flex;justify-content:space-between;gap:12px;align-items:flex-start;margin-bottom:10px}.timeline-date strong{font-size:18px;color:#0f5f59}.timeline-date span{color:var(--muted);text-align:right}.timeline-grid{display:grid;grid-template-columns:repeat(5,minmax(140px,1fr));gap:8px}.timeline-state{border:1px solid var(--line);border-radius:6px;background:#fff;padding:10px;min-height:104px}.timeline-state span,.timeline-state small{display:block;color:var(--muted);font-size:12px}.timeline-state strong{display:block;margin:6px 0;color:var(--ink);overflow-wrap:anywhere}.timeline-state a{color:#0f5f59;font-weight:700;text-decoration:none}.timeline-state.ok{border-color:#b9ded8}.timeline-state.warn{border-color:#e2c66f;background:#fffaf0}.timeline-state.bad,.timeline-state.missing{border-color:#efb4b4;background:#fff8f8}.timeline-state.bad strong,.timeline-state.missing strong{color:var(--bad)}
-.curve-card{border:1px solid var(--line);border-radius:6px;background:#fbfdfd;padding:12px;position:relative}.curve-controls{display:flex;justify-content:space-between;gap:12px;align-items:center;flex-wrap:wrap;margin-bottom:10px}.range-chips{display:flex;gap:6px;flex-wrap:wrap}.range-chip{border:1px solid var(--line);border-radius:6px;background:#fff;color:var(--muted);padding:6px 10px;font-size:13px;text-decoration:none}.range-chip.active{border-color:#0f766e;background:#e3f4f1;color:#0f5f59;font-weight:700}.range-form{display:flex;align-items:end;gap:8px;flex-wrap:wrap}.range-form label{display:grid;gap:3px;color:var(--muted);font-size:12px}.range-form input{border:1px solid var(--line);border-radius:6px;padding:6px 8px;font:inherit;min-width:136px}.range-form button{padding:7px 12px}.curve-meta{display:flex;justify-content:space-between;gap:12px;margin-bottom:8px;color:var(--muted)}.curve-meta strong{color:#0f5f59;font-size:20px}.curve{display:block;width:100%;height:260px;background:#fff;border:1px solid var(--line);border-radius:6px}.curve line{stroke:#c9d4d7;stroke-width:1}.curve .grid-line{stroke-dasharray:4 4}.curve .zero-line{stroke:#9fb3b8;stroke-dasharray:6 5}.curve .axis-line,.curve .tick-line{stroke:#8fa4aa;stroke-dasharray:none}.axis-label{fill:#607177;font-size:12px}.y-label{text-anchor:end}.x-label{text-anchor:middle}.curve polyline{fill:none;stroke:#0f766e;stroke-width:3;stroke-linejoin:round;stroke-linecap:round}.curve-point{pointer-events:none}.curve .point-dot{fill:#0f766e;stroke:#fff;stroke-width:2;opacity:0}.curve .point-guide{stroke:#0f766e;stroke-width:1;stroke-dasharray:3 4;opacity:0}.curve-point:hover .point-dot,.curve-point:focus .point-dot,.curve-point.selected .point-dot{opacity:1}.curve-point:hover .point-guide,.curve-point:focus .point-guide,.curve-point.selected .point-guide{opacity:.55}.curve-capture{fill:transparent;stroke:none;cursor:crosshair}.curve-capture:focus{outline:none}.curve-tooltip{position:absolute;z-index:4;display:none;min-width:150px;border:1px solid #b9ded8;border-radius:6px;background:#ffffff;box-shadow:0 10px 24px rgba(15,35,38,.16);padding:9px 10px;pointer-events:none}.curve-tooltip.visible{display:grid;gap:4px}.curve-tooltip strong{font-size:15px;color:var(--ink)}.curve-tooltip span{color:var(--muted);font-size:12px}.curve-tooltip b{color:#0f5f59;font-size:13px}.expert-series-line{stroke-width:3}.curve-legend{display:flex;gap:10px;flex-wrap:wrap;margin-top:8px}.curve-legend span{display:flex;align-items:center;gap:5px;color:var(--muted);font-size:12px}.curve-legend i{display:inline-block;width:10px;height:10px;border-radius:999px}
+.curve-card{border:1px solid var(--line);border-radius:6px;background:#fbfdfd;padding:12px;position:relative}.curve-controls{display:flex;justify-content:space-between;gap:12px;align-items:center;flex-wrap:wrap;margin-bottom:10px}.range-chips{display:flex;gap:6px;flex-wrap:wrap}.range-chip{border:1px solid var(--line);border-radius:6px;background:#fff;color:var(--muted);padding:6px 10px;font-size:13px;text-decoration:none}.range-chip.active{border-color:#0f766e;background:#e3f4f1;color:#0f5f59;font-weight:700}.range-form{display:flex;align-items:end;gap:8px;flex-wrap:wrap}.range-form label{display:grid;gap:3px;color:var(--muted);font-size:12px}.range-form input{border:1px solid var(--line);border-radius:6px;padding:6px 8px;font:inherit;min-width:136px}.range-form button{padding:7px 12px}.curve-meta{display:flex;justify-content:space-between;gap:12px;margin-bottom:8px;color:var(--muted)}.curve-meta strong{color:#0f5f59;font-size:20px}.curve,.echarts-curve{display:block;width:100%;height:260px;background:#fff;border:1px solid var(--line);border-radius:6px}.echarts-curve{padding:4px}.expert-return-echarts{height:260px}.expert-comparison-echarts{height:300px}.curve line{stroke:#c9d4d7;stroke-width:1}.curve .grid-line{stroke-dasharray:4 4}.curve .zero-line{stroke:#9fb3b8;stroke-dasharray:6 5}.curve .axis-line,.curve .tick-line{stroke:#8fa4aa;stroke-dasharray:none}.axis-label{fill:#607177;font-size:12px}.y-label{text-anchor:end}.x-label{text-anchor:middle}.bar-return-label{fill:#0f5f59;font-size:12px;font-weight:700;text-anchor:middle}.asset-bar{fill:#0f766e;opacity:.86}.curve polyline{fill:none;stroke:#0f766e;stroke-width:3;stroke-linejoin:round;stroke-linecap:round}.curve-point{pointer-events:none}.curve .point-dot{fill:#0f766e;stroke:#fff;stroke-width:2;opacity:0}.curve .point-guide{stroke:#0f766e;stroke-width:1;stroke-dasharray:3 4;opacity:0}.curve-point:hover .point-dot,.curve-point:focus .point-dot,.curve-point.selected .point-dot{opacity:1}.curve-point:hover .point-guide,.curve-point:focus .point-guide,.curve-point.selected .point-guide{opacity:.55}.curve-capture{fill:transparent;stroke:none;cursor:crosshair}.curve-capture:focus{outline:none}.curve-tooltip{position:absolute;z-index:4;display:none;min-width:150px;border:1px solid #b9ded8;border-radius:6px;background:#ffffff;box-shadow:0 10px 24px rgba(15,35,38,.16);padding:9px 10px;pointer-events:none}.curve-tooltip.visible{display:grid;gap:4px}.curve-tooltip strong{font-size:15px;color:var(--ink)}.curve-tooltip span{color:var(--muted);font-size:12px}.curve-tooltip b{color:#0f5f59;font-size:13px}.expert-series-line{stroke-width:3}.curve-legend{display:flex;gap:10px;flex-wrap:wrap;margin-top:8px}.curve-legend span{display:flex;align-items:center;gap:5px;color:var(--muted);font-size:12px}.curve-legend i{display:inline-block;width:10px;height:10px;border-radius:999px}
 .advice-block{border-top:1px solid var(--line);padding-top:14px;margin-top:14px}.advice-head{display:flex;align-items:center;gap:10px;flex-wrap:wrap}.advice-head h2{margin:0}.badge{background:#e3f4f1;color:#0f5f59;border:1px solid #b9ded8;border-radius:999px;padding:3px 8px;font-weight:700}.profile-grid{display:grid;grid-template-columns:repeat(3,minmax(180px,1fr));gap:12px}.profile{border:1px solid var(--line);border-radius:6px;padding:12px;background:#fbfdfd}pre{white-space:pre-wrap;background:#0f1f22;color:#dcefed;border-radius:6px;padding:12px;overflow:auto}
 .empty{border:1px dashed var(--line);border-radius:6px;padding:18px;color:var(--muted);background:#fafcfc}.muted{color:var(--muted)}
 @media(max-width:1180px){.expert-detail-grid{grid-template-columns:1fr 1fr}.expert-detail .stat-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
-@media(max-width:860px){body{display:block}.sidebar{position:static;height:auto}.brand{margin-bottom:10px}.brand small{white-space:normal}nav{display:flex;overflow-x:auto}nav a{white-space:nowrap}nav a.active:before{left:10px;right:10px;top:auto;bottom:3px;width:auto;height:3px}main{padding:14px}header{display:block}header p{margin-top:6px}.stat-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.profile-grid,.settings-form,.filter-form,.timeline-grid,.category-grid,.category-grid.compact,.expert-grid,.expert-detail-grid,.jarvis-focus-grid,.jarvis-evidence-links,.asset-prediction-grid,.dashboard-brief,.run-health-grid{grid-template-columns:1fr}.timeline-date{display:block}.timeline-date span{text-align:left;display:block;margin-top:4px}.settings-form .wide{grid-column:auto}section{padding:12px}.bar-row{grid-template-columns:78px minmax(90px,1fr) 32px}.recommendation{grid-template-columns:1fr}.horizon-grid{grid-template-columns:1fr}.curve{height:180px}.expert-plan-summary{grid-template-columns:1fr}.jarvis-entry,.jarvis-hero,.today-hero{display:block}.jarvis-hero h2,.today-hero h2{font-size:24px}.today-hero strong{display:inline-block;margin-top:10px}table{min-width:680px}}
+@media(max-width:860px){body{display:block}.sidebar{position:static;height:auto}.brand{margin-bottom:10px}.brand small{white-space:normal}nav{display:flex;overflow-x:auto}nav a{white-space:nowrap}nav a.active:before{left:10px;right:10px;top:auto;bottom:3px;width:auto;height:3px}main{padding:14px}header{display:block}header p{margin-top:6px}.stat-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.profile-grid,.settings-form,.filter-form,.timeline-grid,.category-grid,.category-grid.compact,.expert-grid,.expert-detail-grid,.jarvis-focus-grid,.jarvis-evidence-links,.asset-prediction-grid,.dashboard-brief,.run-health-grid{grid-template-columns:1fr}.timeline-date{display:block}.timeline-date span{text-align:left;display:block;margin-top:4px}.settings-form .wide{grid-column:auto}section{padding:12px}.bar-row{grid-template-columns:78px minmax(90px,1fr) 32px}.recommendation{grid-template-columns:1fr}.horizon-grid{grid-template-columns:1fr}.curve,.echarts-curve{height:180px}.expert-return-echarts{height:230px}.expert-comparison-echarts{height:260px}.expert-plan-summary{grid-template-columns:1fr}.jarvis-entry,.jarvis-hero,.today-hero{display:block}.jarvis-hero h2,.today-hero h2{font-size:24px}.today-hero strong{display:inline-block;margin-top:10px}table{min-width:680px}}
 """
 
 

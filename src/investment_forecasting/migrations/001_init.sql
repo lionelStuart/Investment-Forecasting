@@ -810,8 +810,10 @@ CREATE TABLE IF NOT EXISTS virtual_transactions (
   price REAL,
   price_date TEXT,
   gross_amount REAL NOT NULL DEFAULT 0,
+  cost_basis REAL,
   fee REAL NOT NULL DEFAULT 0,
   cash_delta REAL NOT NULL DEFAULT 0,
+  realized_pnl REAL,
   status TEXT NOT NULL CHECK (status IN ('filled', 'unfilled', 'no_trade')),
   reason TEXT,
   created_at TEXT NOT NULL DEFAULT (datetime('now'))

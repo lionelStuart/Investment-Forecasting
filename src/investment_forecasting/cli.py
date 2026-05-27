@@ -78,7 +78,17 @@ from investment_forecasting.quant.model_validation import (
     run_shadow_router_floor70,
 )
 from investment_forecasting.quant.monitoring import ModelMonitoringError, run_model_monitoring_report
-from investment_forecasting.scheduler import initialize_scheduler, list_scheduler_jobs, run_due_jobs, run_scheduler_job, scheduler_status
+from investment_forecasting.scheduler import (
+    initialize_scheduler,
+    install_scheduler_cron,
+    list_scheduler_jobs,
+    refresh_stale_next_runs,
+    run_due_jobs,
+    run_scheduler_job,
+    scheduler_status,
+    scheduler_today_status,
+    uninstall_scheduler_cron,
+)
 from investment_forecasting.web.app import run_web_server
 from investment_forecasting.workflows.daily import default_daily_config, run_daily_workflow
 
@@ -434,6 +444,10 @@ def build_parser() -> argparse.ArgumentParser:
     serve_parser.add_argument("--transport", choices=["stdio", "sse", "streamable-http"], default="stdio")
     serve_parser.add_argument("--host", default="127.0.0.1")
     serve_parser.add_argument("--port", type=int, default=8766)
+    serve_parser.add_argument("--role-scoped", action="store_true", help="Expose only one agent run's manifest-approved tool subset.")
+    serve_parser.add_argument("--agent-run-id", type=int)
+    serve_parser.add_argument("--role-type", choices=["expert", "jarvis"])
+    serve_parser.add_argument("--role-key")
     call_parser = mcp_subparsers.add_parser("call", help="Call one MCP-compatible tool")
     call_parser.add_argument("tool_name")
     call_parser.add_argument("--args", default="{}", help="Tool arguments as a JSON object.")
@@ -547,6 +561,9 @@ def build_parser() -> argparse.ArgumentParser:
     scheduler_list_parser.add_argument("--now", help="Override current time in ISO format for deterministic inspection.")
     scheduler_status_parser = scheduler_subparsers.add_parser("status", help="Show scheduler runs, watermarks, and provider backoff state")
     scheduler_status_parser.add_argument("--db", type=Path, default=Path("data/investment_forecasting.sqlite3"))
+    scheduler_today_parser = scheduler_subparsers.add_parser("today-status", help="Show today's expected, missed, failed, deferred, and completed scheduler jobs")
+    scheduler_today_parser.add_argument("--db", type=Path, default=Path("data/investment_forecasting.sqlite3"))
+    scheduler_today_parser.add_argument("--now", help="Override current time in ISO format for deterministic inspection.")
     scheduler_run_due_parser = scheduler_subparsers.add_parser("run-due", help="Run all due scheduler jobs through the system scheduler")
     scheduler_run_due_parser.add_argument("--db", type=Path, default=Path("data/investment_forecasting.sqlite3"))
     scheduler_run_due_parser.add_argument("--now", help="Override current time in ISO format for deterministic runs.")
@@ -554,6 +571,20 @@ def build_parser() -> argparse.ArgumentParser:
     scheduler_run_job_parser.add_argument("job_key")
     scheduler_run_job_parser.add_argument("--db", type=Path, default=Path("data/investment_forecasting.sqlite3"))
     scheduler_run_job_parser.add_argument("--now", help="Override current time in ISO format for deterministic runs.")
+    scheduler_install_parser = scheduler_subparsers.add_parser("install-cron", help="Install the local system cron runner for scheduler run-due")
+    scheduler_install_parser.add_argument("--db", type=Path, default=Path("data/investment_forecasting.sqlite3"))
+    scheduler_install_parser.add_argument("--project-root", type=Path, default=Path("."))
+    scheduler_install_parser.add_argument("--interval-minutes", type=int, default=5)
+    scheduler_install_parser.add_argument("--python-bin")
+    scheduler_install_parser.add_argument("--no-load", action="store_true", help="Write the LaunchAgent plist without loading it.")
+    scheduler_install_parser.add_argument("--no-run-at-load", action="store_true", help="Do not run scheduler once immediately after loading.")
+    scheduler_install_parser.add_argument("--no-reset-stale-next-runs", action="store_true", help="Keep stale next_run_at values instead of moving them to the next future occurrence.")
+    scheduler_refresh_parser = scheduler_subparsers.add_parser("refresh-next-runs", help="Move stale scheduler next_run_at values to their next future occurrence")
+    scheduler_refresh_parser.add_argument("--db", type=Path, default=Path("data/investment_forecasting.sqlite3"))
+    scheduler_refresh_parser.add_argument("--now", help="Override current time in ISO format for deterministic runs.")
+    scheduler_uninstall_parser = scheduler_subparsers.add_parser("uninstall-cron", help="Unload the local system cron runner")
+    scheduler_uninstall_parser.add_argument("--project-root", type=Path, default=Path("."))
+    scheduler_uninstall_parser.add_argument("--remove-plist", action="store_true")
 
     web_parser = subparsers.add_parser("web", help="Local WebUI operations")
     web_subparsers = web_parser.add_subparsers(dest="web_command", required=True)
@@ -1184,6 +1215,18 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "mcp" and args.mcp_command == "serve":
         server_args = ["--db", str(args.db), "--transport", args.transport, "--host", args.host, "--port", str(args.port)]
+        if args.role_scoped:
+            server_args.extend(
+                [
+                    "--role-scoped",
+                    "--agent-run-id",
+                    str(args.agent_run_id),
+                    "--role-type",
+                    str(args.role_type),
+                    "--role-key",
+                    str(args.role_key),
+                ]
+            )
         return run_mcp_server_main(server_args)
 
     if args.command == "mcp" and args.mcp_command == "call":
@@ -1317,9 +1360,6 @@ def main(argv: list[str] | None = None) -> int:
             project_root=args.project_root,
             codex_bin=args.codex_bin,
             timeout_seconds=args.timeout_seconds,
-            notify_recipient_key=args.notify_recipient_key,
-            notification_channel=args.notification_channel,
-            notification_dry_run=True if args.notification_dry_run else None,
         )
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0 if result.get("ok") else 1
@@ -1332,6 +1372,9 @@ def main(argv: list[str] | None = None) -> int:
             project_root=args.project_root,
             codex_bin=args.codex_bin,
             timeout_seconds=args.timeout_seconds,
+            notify_recipient_key=args.notify_recipient_key,
+            notification_channel=args.notification_channel,
+            notification_dry_run=True if args.notification_dry_run else None,
         )
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0 if result.get("ok") else 1
@@ -1345,6 +1388,10 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(scheduler_status(args.db), ensure_ascii=False, indent=2))
         return 0
 
+    if args.command == "scheduler" and args.scheduler_command == "today-status":
+        print(json.dumps(scheduler_today_status(args.db, now=_parse_optional_datetime(args.now)), ensure_ascii=False, indent=2))
+        return 0
+
     if args.command == "scheduler" and args.scheduler_command == "run-due":
         result = run_due_jobs(args.db, now=_parse_optional_datetime(args.now))
         print(json.dumps(result, ensure_ascii=False, indent=2))
@@ -1354,6 +1401,29 @@ def main(argv: list[str] | None = None) -> int:
         result = run_scheduler_job(args.db, args.job_key, now=_parse_optional_datetime(args.now))
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0 if result.get("status") in {"success", "skipped", "deferred"} else 1
+
+    if args.command == "scheduler" and args.scheduler_command == "install-cron":
+        result = install_scheduler_cron(
+            args.db,
+            project_root=args.project_root,
+            interval_minutes=args.interval_minutes,
+            python_bin=args.python_bin,
+            load=not args.no_load,
+            run_at_load=not args.no_run_at_load,
+            reset_stale_next_runs=not args.no_reset_stale_next_runs,
+        )
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0 if result.get("ok") else 1
+
+    if args.command == "scheduler" and args.scheduler_command == "refresh-next-runs":
+        result = refresh_stale_next_runs(args.db, now=_parse_optional_datetime(args.now))
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0 if result.get("ok") else 1
+
+    if args.command == "scheduler" and args.scheduler_command == "uninstall-cron":
+        result = uninstall_scheduler_cron(project_root=args.project_root, remove_plist=args.remove_plist)
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0 if result.get("ok") else 1
 
     if args.command == "web" and args.web_command == "run":
         run_web_server(args.db, host=args.host, port=args.port)

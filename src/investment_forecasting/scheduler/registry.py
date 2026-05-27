@@ -21,12 +21,12 @@ DEFAULT_JOB_DEFINITIONS: tuple[SchedulerJobDefinition, ...] = (
     SchedulerJobDefinition(
         job_key="news_hourly_incremental",
         job_type="news_incremental",
-        cadence="hourly",
+        cadence="interval_hours",
         enabled=True,
         provider_key="news",
-        time_window={"fixed_minute": 5, "timezone": "Asia/Shanghai"},
+        time_window={"interval_hours": 2, "fixed_minute": 5, "timezone": "Asia/Shanghai"},
         policy={
-            "window_minutes": 65,
+            "window_minutes": 125,
             "request_cap": 200,
             "hourly_request_budget": 240,
             "daily_request_budget": 1200,
@@ -36,15 +36,15 @@ DEFAULT_JOB_DEFINITIONS: tuple[SchedulerJobDefinition, ...] = (
             "sources": ["sina"],
             "watermark_scope": "source",
         },
-        description="每小时固定在 :05 补齐资讯增量窗口。",
+        description="每两小时固定在 :05 补齐资讯增量窗口。",
     ),
     SchedulerJobDefinition(
         job_key="market_context_intraday",
         job_type="market_context_incremental",
-        cadence="fixed_times",
+        cadence="interval_hours",
         enabled=True,
         provider_key="akshare",
-        time_window={"fixed_times": ["09:45", "10:45", "11:45", "13:45", "14:45", "15:20"], "weekdays_only": True, "timezone": "Asia/Shanghai"},
+        time_window={"interval_hours": 2, "fixed_minute": 15, "weekdays_only": True, "timezone": "Asia/Shanghai"},
         policy={
             "request_cap": 40,
             "hourly_request_budget": 80,
@@ -55,7 +55,7 @@ DEFAULT_JOB_DEFINITIONS: tuple[SchedulerJobDefinition, ...] = (
             "watermark_scope": "market_context",
             "stock_limit": 20,
         },
-        description="交易日固定时点同步轻量市场上下文和资金流，不拉全量历史。",
+        description="交易日每两小时同步轻量市场上下文和资金流，不拉全量历史。",
     ),
     SchedulerJobDefinition(
         job_key="price_nav_post_close",
@@ -99,21 +99,21 @@ DEFAULT_JOB_DEFINITIONS: tuple[SchedulerJobDefinition, ...] = (
         job_key="expert_t_day_agents",
         job_type="expert_agents",
         cadence="daily",
-        enabled=False,
+        enabled=True,
         provider_key="codex",
         time_window={"fixed_time": "20:00", "weekdays_only": True, "timezone": "Asia/Shanghai"},
         policy={"requires": ["model_post_close"], "readiness_gate": "t_market_model_evidence"},
-        description="T 日晚间专家 agent 触发定义，默认关闭，等待 TASK-089 编排启用。",
+        description="T 日晚间专家 agent 定时触发。",
     ),
     SchedulerJobDefinition(
         job_key="jarvis_t_plus_one",
         job_type="jarvis_agent",
         cadence="daily",
-        enabled=False,
+        enabled=True,
         provider_key="codex",
         time_window={"fixed_time": "08:00", "timezone": "Asia/Shanghai"},
         policy={"requires": ["expert_t_day_agents"], "readiness_gate": "expert_t_terminal"},
-        description="T+1 早间 Jarvis agent 触发定义，默认关闭，等待 TASK-089 编排启用。",
+        description="T+1 早间 Jarvis 日报和短讯定时触发。",
     ),
 )
 
@@ -123,6 +123,13 @@ def next_run_after(definition: SchedulerJobDefinition | dict[str, Any], after: d
     window = definition.time_window if isinstance(definition, SchedulerJobDefinition) else definition["time_window"]
     if cadence == "hourly":
         return _next_hourly(after, int(window.get("fixed_minute", 0)))
+    if cadence == "interval_hours":
+        return _next_interval_hours(
+            after,
+            interval_hours=int(window.get("interval_hours", 2)),
+            fixed_minute=int(window.get("fixed_minute", 0)),
+            weekdays_only=bool(window.get("weekdays_only")),
+        )
     if cadence == "daily":
         return _next_daily(after, str(window["fixed_time"]), bool(window.get("weekdays_only")))
     if cadence == "fixed_times":
@@ -134,6 +141,20 @@ def _next_hourly(after: datetime, fixed_minute: int) -> datetime:
     candidate = after.replace(minute=fixed_minute, second=0, microsecond=0)
     if candidate <= after:
         candidate += timedelta(hours=1)
+    return candidate
+
+
+def _next_interval_hours(after: datetime, *, interval_hours: int, fixed_minute: int, weekdays_only: bool) -> datetime:
+    interval = max(1, interval_hours)
+    candidate = after.replace(minute=fixed_minute, second=0, microsecond=0)
+    if candidate <= after:
+        candidate += timedelta(hours=1)
+    while candidate.hour % interval != 0:
+        candidate += timedelta(hours=1)
+    while weekdays_only and candidate.weekday() >= 5:
+        candidate = (candidate.replace(hour=0, minute=fixed_minute, second=0, microsecond=0) + timedelta(days=1))
+        while candidate.hour % interval != 0:
+            candidate += timedelta(hours=1)
     return candidate
 
 

@@ -18,7 +18,7 @@ from investment_forecasting.agent_runtime.prompts import (
 from investment_forecasting.agent_runtime.service import build_launch_request, list_runtime_agent_runs
 from investment_forecasting.communication.config import notification_defaults
 from investment_forecasting.db import connect, update_agent_run
-from investment_forecasting.experts.planning import run_expert_agent_plan_from_output
+from investment_forecasting.experts.planning import latest_expert_evidence_date, run_expert_agent_plan_from_output
 from investment_forecasting.experts.roster import initialize_default_experts, list_roster
 from investment_forecasting.jarvis.synthesis import generate_jarvis_brief
 from investment_forecasting.agent_runtime.manifests import record_agent_tool_result, validate_agent_tool_call
@@ -33,7 +33,8 @@ def run_expert_codex_agents(
     timeout_seconds: int = 180,
     expert_key: str | None = None,
 ) -> dict[str, Any]:
-    target_date = _date_text(run_date) if run_date else date.today().isoformat()
+    requested_date = _date_text(run_date) if run_date else date.today().isoformat()
+    target_date = latest_expert_evidence_date(db_path, requested_date) or requested_date
     initialize_default_experts(db_path)
     experts = [expert for expert in list_roster(db_path, lifecycle_state="active") if not expert_key or expert["expert_key"] == expert_key]
     adapter = CodexCliRuntimeAdapter(db_path, project_root=project_root, codex_bin=codex_bin)
@@ -215,6 +216,7 @@ def jarvis_agent_readiness(db_path: str | Path, target_evidence_date: str) -> di
     pending = {key: value for key, value in statuses.items() if value not in terminal}
     completed = sum(1 for value in statuses.values() if value == "completed")
     degraded = sum(1 for value in statuses.values() if value in {"skipped", "failed", "validation_failed"})
+    upstream = _jarvis_upstream_evidence_status(db_path, target_evidence_date)
     return {
         "ready": not pending and len(statuses) == len(experts),
         "status": "complete" if not pending and degraded == 0 else ("degraded" if not pending else "pending"),
@@ -225,6 +227,42 @@ def jarvis_agent_readiness(db_path: str | Path, target_evidence_date: str) -> di
         "statuses": statuses,
         "run_ids": run_ids,
         "pending": pending,
+        "upstream_evidence_status": upstream,
+    }
+
+
+def _jarvis_upstream_evidence_status(db_path: str | Path, target_evidence_date: str) -> dict[str, Any]:
+    required = ("news_hourly_incremental", "market_context_intraday", "price_nav_post_close", "features_post_close", "model_post_close")
+    with connect(db_path) as conn:
+        rows = {
+            row["job_key"]: row
+            for row in conn.execute(
+                """
+                SELECT *
+                FROM scheduler_runs
+                WHERE substr(scheduled_at, 1, 10) = ?
+                  AND job_key IN ('news_hourly_incremental', 'market_context_intraday', 'price_nav_post_close', 'features_post_close', 'model_post_close')
+                ORDER BY started_at DESC, id DESC
+                """,
+                (target_evidence_date,),
+            ).fetchall()
+        }
+    missing = [key for key in required if key not in rows]
+    not_success = [key for key, row in rows.items() if row["status"] != "success"]
+    readiness_only = []
+    for key, row in rows.items():
+        metadata = json.loads(row["metadata_json"] or "{}")
+        if key == "model_post_close" and not metadata.get("real_model_run"):
+            readiness_only.append(key)
+        if key in {"news_hourly_incremental", "market_context_intraday", "price_nav_post_close"} and not metadata.get("real_provider_calls"):
+            readiness_only.append(key)
+        if key == "features_post_close" and not metadata.get("real_calculation") and row["status"] == "success":
+            readiness_only.append(key)
+    return {
+        "ready": not missing and not not_success and not readiness_only,
+        "missing_jobs": missing,
+        "not_success_jobs": not_success,
+        "readiness_only_jobs": sorted(set(readiness_only)),
     }
 
 

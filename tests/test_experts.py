@@ -18,11 +18,12 @@ from investment_forecasting.db import (
     upsert_price_daily,
     upsert_communication_adapter_config,
     upsert_communication_recipient,
+    upsert_agent_run,
 )
 from investment_forecasting.ai_analysis import AIAnalysisValidationError, validate_ai_analysis_record
-from investment_forecasting.experts.planning import ExpertPlanningError, check_expert_plan_compliance, run_expert_daily_plans
+from investment_forecasting.experts.planning import ExpertPlanningError, check_expert_plan_compliance, run_expert_agent_plan_from_output, run_expert_daily_plans
 from investment_forecasting.experts.roster import DEFAULT_ACTIVE_EXPERT_COUNT, DEFAULT_EXPERTS, initialize_default_experts, list_roster
-from investment_forecasting.portfolio.accounting import ensure_expert_portfolios
+from investment_forecasting.portfolio.accounting import ensure_expert_portfolios, record_virtual_order
 
 
 def test_initialize_default_experts_is_idempotent(tmp_path):
@@ -181,6 +182,231 @@ def test_run_expert_daily_plans_persists_one_plan_per_active_expert(tmp_path):
     assert all("虚拟研究组合模拟" in row["risk_warnings"] for row in plans)
     assert analysis_log["status"] == "success"
     assert positions >= 1
+
+
+def test_expert_plans_resolve_to_latest_fresh_price_feature_evidence_date(tmp_path):
+    db_path = seed_expert_planning_db(tmp_path)
+    with connect(db_path) as conn:
+        asset = conn.execute("SELECT * FROM assets WHERE code = '510300'").fetchone()
+        upsert_feature_daily(
+            conn,
+            {
+                "asset_id": asset["id"],
+                "feature_date": "2026-05-24",
+                "return_1d": 0.02,
+                "return_5d": 0.04,
+                "return_20d": 0.09,
+                "return_60d": 0.13,
+                "volatility_20d": 0.02,
+                "max_drawdown_60d": -0.03,
+                "sharpe_60d": 1.3,
+                "calmar_60d": 1.6,
+                "win_rate_60d": 0.64,
+                "momentum_20d": 0.09,
+                "market_state": "bullish",
+                "source": "test",
+            },
+        )
+        upsert_model_prediction(
+            conn,
+            {
+                "asset_id": asset["id"],
+                "prediction_date": "2026-05-24",
+                "horizon_days": 20,
+                "model_version": "test_model",
+                "target": "return",
+                "up_probability": 0.72,
+                "expected_return": 0.12,
+                "expected_return_low": 0.03,
+                "expected_return_high": 0.18,
+                "downside_risk": -0.02,
+                "confidence": 0.95,
+                "input_window_start": "2026-04-01",
+                "input_window_end": "2026-05-24",
+                "assumptions": "stale price should not be tradable",
+            },
+        )
+
+    plans = run_expert_daily_plans(db_path, plan_date="2026-05-24")
+
+    assert {plan["plan_date"] for plan in plans} == {"2026-05-23"}
+    with connect(db_path) as conn:
+        rows = conn.execute("SELECT DISTINCT plan_date FROM expert_plans ORDER BY plan_date").fetchall()
+    assert [row["plan_date"] for row in rows] == ["2026-05-23"]
+
+
+def test_expert_agent_sell_action_executes_virtual_sell(tmp_path):
+    db_path = seed_expert_planning_db(tmp_path)
+    with connect(db_path) as conn:
+        expert = get_expert(conn, "bai_gui")
+        portfolio = conn.execute("SELECT * FROM virtual_portfolios WHERE owner_type = 'expert' AND owner_id = ?", (expert["id"],)).fetchone()
+        asset = conn.execute("SELECT * FROM assets WHERE code = '510300'").fetchone()
+        record_virtual_order(conn, portfolio_id=portfolio["id"], trade_date="2026-05-23", side="buy", asset_id=asset["id"], quantity=2)
+        agent_run_id = upsert_agent_run(
+            conn,
+            {
+                "role_type": "expert",
+                "role_key": "bai_gui",
+                "run_date": "2026-05-24",
+                "target_evidence_date": "2026-05-24",
+                "trigger_reason": "test",
+                "status": "running",
+                "overview_skill": "investment-expert-agent",
+                "skill_bundle": [],
+                "prompt_ref": {},
+                "tool_manifest_ref": {},
+                "output_contract": {},
+                "runtime_policy": {},
+                "launch_request": {},
+                "runtime_metadata": {},
+                "idempotency_key": "test-bai-gui-sell",
+            },
+        )
+        conn.execute(
+            """
+            INSERT INTO agent_tool_calls(
+                agent_run_id, tool_name, role_type, role_key, arguments_json,
+                idempotency_key, status, result_summary_json
+            )
+            VALUES (?, 'submit_expert_virtual_action', 'expert', 'bai_gui', ?, 'sell-action', 'submitted', '{}')
+            """,
+            (
+                agent_run_id,
+                json.dumps(
+                    {
+                        "payload": {
+                            "action": "sell",
+                            "target_asset_id": asset["id"],
+                            "quantity": 2,
+                            "target_amount": 200,
+                            "rationale": "测试卖出虚拟持仓。",
+                        }
+                    },
+                    ensure_ascii=False,
+                ),
+            ),
+        )
+
+    plan = run_expert_agent_plan_from_output(
+        db_path,
+        plan_date="2026-05-24",
+        expert_key="bai_gui",
+        agent_run_id=agent_run_id,
+        agent_output={
+            "status": "ok",
+            "role": "expert",
+            "role_key": "bai_gui",
+            "outcome": "plan_action",
+            "summary": "测试卖出。",
+            "action": "sell",
+            "reason": "测试卖出虚拟持仓。",
+            "analysis": "测试卖出虚拟持仓。",
+            "reflection": "测试卖出虚拟持仓。",
+            "risk_note": "该操作仅用于虚拟研究组合模拟，不构成真实买卖指令。",
+            "evidence_ids": ["prediction:1"],
+            "news_evidence_ids": [],
+        },
+    )
+
+    with connect(db_path) as conn:
+        transaction = conn.execute("SELECT * FROM virtual_transactions WHERE id = ?", (plan["transaction_id"],)).fetchone()
+        position = conn.execute("SELECT * FROM virtual_positions WHERE portfolio_id = ? AND asset_id = ?", (portfolio["id"], asset["id"])).fetchone()
+
+    assert plan["action"] == "sell"
+    assert plan["execution_status"] == "filled"
+    assert transaction["side"] == "sell"
+    assert transaction["quantity"] == 2
+    assert transaction["cost_basis"] == 200
+    assert position["quantity"] == 0
+
+
+def test_expert_agent_buy_action_persists_virtual_buy(tmp_path):
+    db_path = seed_expert_planning_db(tmp_path)
+    with connect(db_path) as conn:
+        expert = get_expert(conn, "bai_gui")
+        portfolio = conn.execute("SELECT * FROM virtual_portfolios WHERE owner_type = 'expert' AND owner_id = ?", (expert["id"],)).fetchone()
+        asset = conn.execute("SELECT * FROM assets WHERE code = '510300'").fetchone()
+        agent_run_id = upsert_agent_run(
+            conn,
+            {
+                "role_type": "expert",
+                "role_key": "bai_gui",
+                "run_date": "2026-05-24",
+                "target_evidence_date": "2026-05-24",
+                "trigger_reason": "test",
+                "status": "running",
+                "overview_skill": "investment-expert-agent",
+                "skill_bundle": [],
+                "prompt_ref": {},
+                "tool_manifest_ref": {},
+                "output_contract": {},
+                "runtime_policy": {},
+                "launch_request": {},
+                "runtime_metadata": {},
+                "idempotency_key": "test-bai-gui-buy",
+            },
+        )
+        conn.execute(
+            """
+            INSERT INTO agent_tool_calls(
+                agent_run_id, tool_name, role_type, role_key, arguments_json,
+                idempotency_key, status, result_summary_json
+            )
+            VALUES (?, 'submit_expert_virtual_action', 'expert', 'bai_gui', ?, 'buy-action', 'submitted', '{}')
+            """,
+            (
+                agent_run_id,
+                json.dumps(
+                    {
+                        "payload": {
+                            "action": "buy",
+                            "target_asset_id": asset["id"],
+                            "quantity": 3,
+                            "target_amount": 300,
+                            "rationale": "测试买入虚拟持仓。",
+                        }
+                    },
+                    ensure_ascii=False,
+                ),
+            ),
+        )
+
+    plan = run_expert_agent_plan_from_output(
+        db_path,
+        plan_date="2026-05-24",
+        expert_key="bai_gui",
+        agent_run_id=agent_run_id,
+        agent_output={
+            "status": "ok",
+            "role": "expert",
+            "role_key": "bai_gui",
+            "outcome": "plan_action",
+            "summary": "测试买入。",
+            "action": "buy",
+            "reason": "测试买入虚拟持仓。",
+            "analysis": "测试买入虚拟持仓。",
+            "reflection": "测试买入虚拟持仓。",
+            "risk_note": "该操作仅用于虚拟研究组合模拟，不构成真实买卖指令。",
+            "evidence_ids": ["prediction:1"],
+            "news_evidence_ids": [],
+        },
+    )
+
+    with connect(db_path) as conn:
+        transaction = conn.execute("SELECT * FROM virtual_transactions WHERE id = ?", (plan["transaction_id"],)).fetchone()
+        position = conn.execute("SELECT * FROM virtual_positions WHERE portfolio_id = ? AND asset_id = ?", (portfolio["id"], asset["id"])).fetchone()
+        valuation = conn.execute("SELECT * FROM virtual_valuations WHERE portfolio_id = ? AND valuation_date = '2026-05-23'", (portfolio["id"],)).fetchone()
+
+    assert plan["action"] == "buy"
+    assert plan["plan_date"] == "2026-05-23"
+    assert plan["execution_status"] == "filled"
+    assert transaction["side"] == "buy"
+    assert transaction["quantity"] == 3
+    assert transaction["cost_basis"] == pytest.approx(300)
+    assert transaction["realized_pnl"] == 0
+    assert position["quantity"] == 3
+    assert position["average_cost"] == pytest.approx(100)
+    assert valuation is not None
 
 
 def test_degraded_model_evidence_is_watch_only_for_expert_plans(tmp_path):

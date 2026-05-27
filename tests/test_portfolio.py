@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from investment_forecasting.db import connect, init_db, upsert_asset, upsert_price_daily
 from investment_forecasting.cli import main as cli_main
 from investment_forecasting.experts.roster import DEFAULT_ACTIVE_EXPERT_COUNT
@@ -67,14 +69,91 @@ def test_buy_sell_and_daily_valuation_use_stored_prices(tmp_path):
 
     assert buy["status"] == "filled"
     assert buy["price"] == 100
+    assert buy["cost_basis"] == 1001
+    assert buy["realized_pnl"] == 0
     assert sell["status"] == "filled"
     assert sell["price"] == 110
+    assert sell["cost_basis"] == pytest.approx(400.4)
+    assert sell["realized_pnl"] == pytest.approx(38.6)
     assert position["quantity"] == 6
     assert portfolio["cash"] == 10_000 - 1_001 + 439
     assert valuation["positions_value"] == 660
     assert valuation["total_value"] == portfolio["cash"] + 660
+    assert round((valuation["total_value"] / 10_000) - 1, 6) == 0.0098
     assert valuation["missing_prices"] == []
+    detail = valuation["details"][0]
+    assert detail["asset_id"] == asset_id
+    assert detail["asset_code"] == "000300"
+    assert detail["asset_name"] == "沪深300"
+    assert detail["quantity"] == 6
+    assert detail["average_cost"] == pytest.approx(100.1)
+    assert detail["cost_basis"] == pytest.approx(600.6)
+    assert detail["price"] == 110
+    assert detail["price_date"] == "2026-05-21"
+    assert detail["value"] == pytest.approx(660)
+    assert detail["unrealized_pnl"] == pytest.approx(59.4)
+    assert detail["position_return"] == pytest.approx((110 / 100.1) - 1)
     assert cash_rows == 3
+
+
+def test_partial_sell_after_multiple_buys_uses_average_cost(tmp_path):
+    db_path = init_db(tmp_path / "portfolio-multi-buy.sqlite3")
+    with connect(db_path) as conn:
+        asset_id = upsert_asset(
+            conn,
+            {
+                "code": "510300",
+                "name": "沪深300ETF",
+                "asset_type": "etf",
+                "market": "CN",
+                "currency": "CNY",
+                "status": "active",
+                "source": "test",
+            },
+        )
+        for trade_date, close in [("2026-05-20", 100), ("2026-05-21", 120), ("2026-05-22", 150)]:
+            upsert_price_daily(
+                conn,
+                asset_id,
+                "test",
+                {
+                    "trade_date": trade_date,
+                    "open": close,
+                    "high": close,
+                    "low": close,
+                    "close": close,
+                    "volume": None,
+                    "amount": None,
+                    "pct_change": None,
+                    "adjusted_close": None,
+                    "nav": None,
+                    "accumulated_nav": None,
+                    "raw_payload": "{}",
+                },
+            )
+        portfolio_id = create_virtual_portfolio(
+            conn,
+            owner_type="user",
+            owner_id=1,
+            name="测试组合",
+            initial_capital=10_000,
+        )
+
+        first_buy = record_virtual_order(conn, portfolio_id=portfolio_id, trade_date="2026-05-20", side="buy", asset_id=asset_id, quantity=10, fee=0)
+        second_buy = record_virtual_order(conn, portfolio_id=portfolio_id, trade_date="2026-05-21", side="buy", asset_id=asset_id, quantity=10, fee=0)
+        sell = record_virtual_order(conn, portfolio_id=portfolio_id, trade_date="2026-05-22", side="sell", asset_id=asset_id, quantity=5, fee=0)
+        valuation = value_virtual_portfolio(conn, portfolio_id=portfolio_id, valuation_date="2026-05-22")
+        position = conn.execute("SELECT * FROM virtual_positions WHERE portfolio_id = ? AND asset_id = ?", (portfolio_id, asset_id)).fetchone()
+
+    assert first_buy["cost_basis"] == 1000
+    assert second_buy["cost_basis"] == 1200
+    assert position["quantity"] == 15
+    assert position["average_cost"] == pytest.approx(110)
+    assert sell["cost_basis"] == pytest.approx(550)
+    assert sell["realized_pnl"] == pytest.approx(200)
+    assert valuation["details"][0]["cost_basis"] == pytest.approx(1650)
+    assert valuation["details"][0]["unrealized_pnl"] == pytest.approx(600)
+    assert valuation["total_value"] == pytest.approx(10_000 + 800)
 
 
 def test_hold_no_trade_records_decision_without_cash_change(tmp_path):

@@ -31,6 +31,7 @@ def run_expert_daily_plans(
     target_date = _date_text(plan_date)
     ensure_expert_portfolios(db_path)
     with connect(db_path) as conn:
+        target_date = _resolve_expert_plan_date(conn, target_date)
         log_id = start_task_log(conn, "expert_daily_planning", target_date, "Running expert daily plans")
         analysis_log_id = start_task_log(conn, "expert_ai_analysis", target_date, "Running expert AI analyses")
         try:
@@ -96,6 +97,7 @@ def run_expert_agent_plan_from_output(
     ensure_expert_portfolios(db_path)
     _validate_expert_agent_output(expert_key, agent_output)
     with connect(db_path) as conn:
+        target_date = _resolve_expert_plan_date(conn, target_date)
         expert = conn.execute(
             "SELECT * FROM experts WHERE expert_key = ? AND lifecycle_state = 'active'",
             (expert_key,),
@@ -104,6 +106,12 @@ def run_expert_agent_plan_from_output(
             raise ExpertPlanningError(f"Cannot persist agent plan without active expert: {expert_key}")
         existing = _existing_plan(conn, int(expert["id"]), target_date)
         portfolio = _expert_portfolio(conn, int(expert["id"]))
+        agent_output = _merge_agent_submission_payload(conn, agent_run_id, int(portfolio["id"]), agent_output)
+        if existing is not None and agent_output.get("action") == "no_trade":
+            _attach_agent_evidence(conn, int(existing["id"]), agent_run_id, agent_output)
+            _mark_existing_plan_no_trade(conn, int(existing["id"]), agent_output)
+            value_virtual_portfolio(conn, portfolio_id=int(existing["portfolio_id"]), valuation_date=target_date)
+            return _deserialize_plan(conn.execute("SELECT * FROM expert_plans WHERE id = ?", (existing["id"],)).fetchone())
         candidates = _latest_candidates(conn, target_date)
         if not candidates:
             raise ExpertPlanningError("Cannot persist expert agent plan without model prediction evidence")
@@ -118,10 +126,18 @@ def run_expert_agent_plan_from_output(
         if existing is not None:
             updated = _ensure_existing_plan_ai_analysis(conn, existing, ai_analysis_id)
             _attach_agent_evidence(conn, int(updated["id"]), agent_run_id, agent_output)
-            if agent_output.get("outcome") in {"skipped", "failed"}:
+            if agent_output.get("outcome") in {"skipped", "failed"} or agent_output.get("action") == "no_trade":
                 _mark_existing_plan_no_trade(conn, int(updated["id"]), agent_output)
-            value_virtual_portfolio(conn, portfolio_id=int(updated["portfolio_id"]), valuation_date=target_date)
-            return _deserialize_plan(conn.execute("SELECT * FROM expert_plans WHERE id = ?", (updated["id"],)).fetchone())
+                value_virtual_portfolio(conn, portfolio_id=int(updated["portfolio_id"]), valuation_date=target_date)
+                return _deserialize_plan(conn.execute("SELECT * FROM expert_plans WHERE id = ?", (updated["id"],)).fetchone())
+            plan = _existing_plan_with_agent_action(updated, agent_output)
+            check_expert_plan_compliance(plan)
+            transaction = _execute_plan(conn, int(updated["portfolio_id"]), plan)
+            valuation = value_virtual_portfolio(conn, portfolio_id=int(updated["portfolio_id"]), valuation_date=target_date)
+            plan_id = _upsert_expert_plan(conn, plan, transaction)
+            _upsert_plan_item(conn, plan_id, plan)
+            saved = _deserialize_plan(conn.execute("SELECT * FROM expert_plans WHERE id = ?", (plan_id,)).fetchone())
+            return {**saved, "transaction": transaction, "valuation": valuation}
         plan = build_expert_plan(expert, portfolio, candidates, market, target_date, ai_analysis_id, analysis)
         plan["evidence"]["agent_run_id"] = agent_run_id
         plan["evidence"]["agent_output"] = agent_output
@@ -132,6 +148,8 @@ def run_expert_agent_plan_from_output(
             plan["target_amount"] = 0.0
             plan["quantity"] = 0
             plan["rationale"] = f"{expert['name']} agent outcome={agent_output.get('outcome')}：{agent_output.get('reason') or agent_output.get('summary')}"
+        elif agent_output.get("action") in {"buy", "sell"}:
+            _apply_agent_action_to_plan(plan, agent_output)
         check_expert_plan_compliance(plan)
         transaction = _execute_plan(conn, portfolio["id"], plan)
         valuation = value_virtual_portfolio(conn, portfolio_id=portfolio["id"], valuation_date=target_date)
@@ -246,10 +264,11 @@ def _validate_expert_agent_output(expert_key: str, output: dict[str, Any]) -> No
 
 
 def _attach_agent_evidence(conn, plan_id: int, agent_run_id: int, agent_output: dict[str, Any]) -> None:
-    row = conn.execute("SELECT evidence_json, rationale FROM expert_plans WHERE id = ?", (plan_id,)).fetchone()
+    row = conn.execute("SELECT evidence_json FROM expert_plans WHERE id = ?", (plan_id,)).fetchone()
     evidence = json.loads(row["evidence_json"])
     evidence["agent_run_id"] = agent_run_id
     evidence["agent_output"] = agent_output
+    rationale = f"Agent outcome={agent_output.get('outcome')}：{agent_output.get('reason') or agent_output.get('summary')}"
     conn.execute(
         """
         UPDATE expert_plans
@@ -260,7 +279,7 @@ def _attach_agent_evidence(conn, plan_id: int, agent_run_id: int, agent_output: 
         """,
         (
             json.dumps(evidence, ensure_ascii=False),
-            f"{row['rationale']} Agent补充：{agent_output.get('summary')}",
+            rationale,
             plan_id,
         ),
     )
@@ -292,8 +311,101 @@ def _mark_existing_plan_no_trade(conn, plan_id: int, agent_output: dict[str, Any
     )
 
 
+def _merge_agent_submission_payload(conn, agent_run_id: int, portfolio_id: int, agent_output: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(agent_output)
+    rows = conn.execute(
+        """
+        SELECT arguments_json
+        FROM agent_tool_calls
+        WHERE agent_run_id = ?
+          AND tool_name = 'submit_expert_virtual_action'
+          AND status IN ('allowed', 'submitted')
+        ORDER BY id ASC
+        """,
+        (agent_run_id,),
+    ).fetchall()
+    for row in rows:
+        try:
+            payload = json.loads(row["arguments_json"] or "{}").get("payload") or {}
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if payload.get("action") == merged.get("action"):
+            for key in ("target_asset_id", "target_asset_code", "target_asset_name", "target_amount", "target_weight", "quantity", "rationale"):
+                if payload.get(key) is not None and merged.get(key) is None:
+                    merged[key] = payload[key]
+    if merged.get("action") == "sell":
+        _fill_sell_target_from_position(conn, portfolio_id, merged)
+    return merged
+
+
+def _fill_sell_target_from_position(conn, portfolio_id: int, agent_output: dict[str, Any]) -> None:
+    asset_id = agent_output.get("target_asset_id")
+    asset_code = agent_output.get("target_asset_code")
+    if asset_id is None and asset_code:
+        row = conn.execute("SELECT id FROM assets WHERE code = ? ORDER BY id LIMIT 1", (str(asset_code),)).fetchone()
+        if row:
+            asset_id = int(row["id"])
+            agent_output["target_asset_id"] = asset_id
+    if asset_id is None:
+        positions = conn.execute(
+            """
+            SELECT p.asset_id, p.quantity
+            FROM virtual_positions p
+            WHERE p.portfolio_id = ? AND p.quantity > 0
+            ORDER BY p.quantity DESC
+            """,
+            (portfolio_id,),
+        ).fetchall()
+        if len(positions) == 1:
+            asset_id = int(positions[0]["asset_id"])
+            agent_output["target_asset_id"] = asset_id
+            agent_output.setdefault("quantity", float(positions[0]["quantity"]))
+    if asset_id is not None and not agent_output.get("quantity"):
+        position = conn.execute(
+            "SELECT quantity FROM virtual_positions WHERE portfolio_id = ? AND asset_id = ?",
+            (portfolio_id, asset_id),
+        ).fetchone()
+        if position:
+            agent_output["quantity"] = float(position["quantity"])
+
+
+def _existing_plan_with_agent_action(row: Any, agent_output: dict[str, Any]) -> dict[str, Any]:
+    plan = _deserialize_plan(row)
+    plan["quantity"] = 0
+    _apply_agent_action_to_plan(plan, agent_output)
+    return plan
+
+
+def _apply_agent_action_to_plan(plan: dict[str, Any], agent_output: dict[str, Any]) -> None:
+    action = str(agent_output.get("action") or "no_trade")
+    if action not in {"buy", "sell"}:
+        plan["action"] = "no_trade"
+        plan["target_asset_id"] = None
+        plan["target_weight"] = 0.0
+        plan["target_amount"] = 0.0
+        plan["quantity"] = 0
+        plan["rationale"] = f"Agent outcome={agent_output.get('outcome')}：{agent_output.get('reason') or agent_output.get('summary')}"
+        return
+    target_asset_id = agent_output.get("target_asset_id")
+    quantity = float(agent_output.get("quantity") or 0)
+    if target_asset_id is None or quantity <= 0:
+        plan["action"] = "no_trade"
+        plan["target_asset_id"] = None
+        plan["target_weight"] = 0.0
+        plan["target_amount"] = 0.0
+        plan["quantity"] = 0
+        plan["rationale"] = f"Agent action={action} 缺少可执行资产或数量，降级为 no_trade：{agent_output.get('reason') or agent_output.get('summary')}"
+        return
+    plan["action"] = action
+    plan["target_asset_id"] = int(target_asset_id)
+    plan["target_weight"] = float(agent_output.get("target_weight") or 0.0)
+    plan["target_amount"] = float(agent_output.get("target_amount") or 0.0)
+    plan["quantity"] = quantity
+    plan["rationale"] = agent_output.get("rationale") or f"Agent outcome={agent_output.get('outcome')}：{agent_output.get('reason') or agent_output.get('summary')}"
+
+
 def _execute_plan(conn, portfolio_id: int, plan: dict[str, Any]) -> dict[str, Any]:
-    if plan["action"] != "buy":
+    if plan["action"] not in {"buy", "sell"}:
         return record_virtual_order(
             conn,
             portfolio_id=portfolio_id,
@@ -305,7 +417,7 @@ def _execute_plan(conn, portfolio_id: int, plan: dict[str, Any]) -> dict[str, An
         conn,
         portfolio_id=portfolio_id,
         trade_date=plan["plan_date"],
-        side="buy",
+        side=plan["action"],
         asset_id=plan["target_asset_id"],
         quantity=plan["quantity"],
         reason=plan["rationale"],
@@ -356,27 +468,52 @@ def _latest_candidates(conn, target_date: str):
         LEFT JOIN model_prediction_reliability r ON r.prediction_id = p.id
         LEFT JOIN features_daily f
           ON f.asset_id = p.asset_id
-         AND f.feature_date = (
-            SELECT MAX(feature_date) FROM features_daily WHERE asset_id = p.asset_id AND feature_date <= ?
-         )
+         AND f.feature_date = p.prediction_date
         LEFT JOIN price_daily pr
           ON pr.asset_id = p.asset_id
-         AND pr.trade_date = (
-            SELECT MAX(trade_date)
-            FROM price_daily
-            WHERE asset_id = p.asset_id
-              AND trade_date <= ?
-              AND COALESCE(close, nav, adjusted_close) IS NOT NULL
-         )
+         AND pr.trade_date = p.prediction_date
+         AND COALESCE(pr.close, pr.nav, pr.adjusted_close) IS NOT NULL
         WHERE p.prediction_date = (
             SELECT MAX(prediction_date) FROM model_predictions WHERE prediction_date <= ?
         )
           AND p.horizon_days = 20
+          AND f.asset_id IS NOT NULL
           AND pr.id IS NOT NULL
         ORDER BY p.confidence DESC, p.expected_return DESC
         """,
-        (target_date, target_date, target_date),
+        (target_date,),
     ).fetchall()
+
+
+def latest_expert_evidence_date(db_path: str | Path, requested_date: str | None = None) -> str | None:
+    init_db(db_path)
+    target_date = _date_text(requested_date)
+    with connect(db_path) as conn:
+        return _latest_expert_evidence_date(conn, target_date)
+
+
+def _resolve_expert_plan_date(conn, requested_date: str) -> str:
+    return _latest_expert_evidence_date(conn, requested_date) or requested_date
+
+
+def _latest_expert_evidence_date(conn, requested_date: str) -> str | None:
+    row = conn.execute(
+        """
+        SELECT MAX(p.prediction_date) AS evidence_date
+        FROM model_predictions p
+        JOIN features_daily f
+          ON f.asset_id = p.asset_id
+         AND f.feature_date = p.prediction_date
+        JOIN price_daily pr
+          ON pr.asset_id = p.asset_id
+         AND pr.trade_date = p.prediction_date
+         AND COALESCE(pr.close, pr.nav, pr.adjusted_close) IS NOT NULL
+        WHERE p.prediction_date <= ?
+          AND p.horizon_days = 20
+        """,
+        (requested_date,),
+    ).fetchone()
+    return row["evidence_date"] if row and row["evidence_date"] else None
 
 
 def _latest_market_snapshot(conn, target_date: str):

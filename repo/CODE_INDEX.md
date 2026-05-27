@@ -13,6 +13,7 @@ tables, or task families are added, removed, renamed, or materially repurposed.
 | MCP server | `src/investment_forecasting/mcp/server.py` | Official MCP stdio transport. |
 | MCP tools | `src/investment_forecasting/mcp/tools.py` | JSON-callable tool registry for assets, research workflows, advice, expert committee operations, Jarvis brief retrieval/generation, role-scoped agent manifests, agent output validation preview, and audited expert/Jarvis submission envelopes. |
 | Daily workflow | `src/investment_forecasting/workflows/daily.py` | Orchestrates ingestion, features, market snapshot, forecast, backtest, advice, model monitoring, optional Jarvis generation, optional mobile notifications, and logs. |
+| Scheduler cron registration | `src/investment_forecasting/scheduler/service.py`, `src/investment_forecasting/cli.py` | `scheduler install-cron` installs one local macOS LaunchAgent, `local.investment-forecasting.scheduler`, that wakes `scheduler run-due` every 5 minutes. Business cadence is owned by `scheduler_jobs`: market/news every two hours, post-close price/features/model services, expert T-day daily, and Jarvis T+1 daily with default phone notification environment. `scheduler today-status` exposes today's successful, failed, deferred, missed, and not-yet-due jobs, while latest runs expose `execution_mode` (`real_provider`, `real_calculation`, `real_model_run`, `agent_runtime`, or `readiness_only`). |
 | Restart script | `scripts/restart_web.sh` | Restarts local WebUI and prints database health. |
 
 ## Core Modules
@@ -22,14 +23,14 @@ tables, or task families are added, removed, renamed, or materially repurposed.
 | Persistence | `src/investment_forecasting/db.py`, `src/investment_forecasting/migrations/001_init.sql` | SQLite connection, schema, migrations, upsert/query helpers. |
 | Data ingestion | `src/investment_forecasting/data/ingestion.py`, `src/investment_forecasting/data/quality.py`, `src/investment_forecasting/data/macro.py`, `src/investment_forecasting/data/capital_flow.py`, `src/investment_forecasting/data/fund_holdings.py`, `src/investment_forecasting/data/classification.py`, `src/investment_forecasting/data/news.py` | Asset universe ingestion, incremental date-range policy, data quality, macro observations, provider-neutral capital-flow observations, fund-holding reports, bounded news evidence ingestion, and deterministic industry/theme classification. |
 | Providers | `src/investment_forecasting/providers/*.py` | AKShare default provider and optional Tushare provider, provider-specific fetching, normalization, retry/backoff, polite access policy, diagnostics, and optional Tushare news retrieval. |
-| Scheduler | `src/investment_forecasting/scheduler/*` | System-owned fixed job registry, due-job selection, incremental news/market/price/features handlers, scheduler watermarks, provider request budgets/backoff state, task readiness gates, and CLI/WebUI/MCP status/manual run commands. |
+| Scheduler | `src/investment_forecasting/scheduler/*` | System-owned fixed job registry, due-job selection, real incremental news/market/price/features handlers, post-close forecast/backtest/market/advice/monitoring orchestration, scheduler watermarks, provider request budgets/backoff state, task readiness gates, execution-mode reporting, and CLI/WebUI/MCP status/manual run commands. |
 | Quant | `src/investment_forecasting/quant/*.py` | Features, forecasts, backtests, benchmark selection, calibration, model monitoring, market snapshots, rank validation, candidate-model comparison, and model reliability metadata. |
 | Model validation replay | `src/investment_forecasting/quant/model_validation.py` | Current-year daily forecast replay from stored local history, replay run/prediction persistence, matured outcome scoring, diagnostics by model/horizon/asset group/month/regime, and evidence-backed tuning recommendations for model accuracy and confidence only. Replay rows must not overwrite operational `model_predictions` and must not evaluate expert/Jarvis/advice outputs. |
 | Model applicability governance | `src/investment_forecasting/quant/model_validation.py` | Context-specific model-health facts, model applicability profiles, same-type ranking disable rules, 20-day shadow router `router_floor70_cap05`, confidence labels, and monthly governance summaries. Production `model_predictions` remain unchanged. |
 | Advice | `src/investment_forecasting/advice/*.py` | Daily advice generation, target-volatility allocation proposals, correlation risk-budget evidence, capital-flow evidence summaries, benchmark-aware outcome scoring, compliance-oriented language. |
 | AI analysis | `src/investment_forecasting/ai_analysis.py` | Versioned expert/Jarvis prompt and output-schema contracts, bounded evidence packets, provider request builders, structured analysis output, compliance checks, unsupported prediction/news evidence validation, persisted provider/fallback metadata, and deterministic fallback. |
 | AI providers | `src/investment_forecasting/ai_providers/*` | Provider request/response/config contracts, environment config discovery, fake-provider dry runs, timeout/error fallback mapping, source metadata, and future model SDK/API calls. No other module should import model SDKs directly. |
-| Codex runtime access | `src/investment_forecasting/agent_runtime/*` | System-owned role-scoped Codex agent run protocol, launch request/result/status dataclasses, runtime policy, service helpers, fake adapter, local Codex CLI adapter/readiness/smoke, per-run artifact layout, role manifests, prompt rendering, run/tool-call audit persistence, expert execution, Jarvis readiness, and CLI inspection. |
+| Codex runtime access | `src/investment_forecasting/agent_runtime/*` | System-owned role-scoped Codex agent run protocol, launch request/result/status dataclasses, runtime policy, service helpers, fake adapter, local Codex CLI adapter/readiness/smoke, per-run artifact layout, role manifests, prompt rendering, run/tool-call audit persistence, expert execution, Jarvis readiness including upstream scheduler evidence status, and CLI inspection. |
 | Portfolio | `src/investment_forecasting/portfolio/*.py` | Simulated portfolios, transactions, positions, cash ledger, unfilled exceptions, and valuation. |
 | Experts | `src/investment_forecasting/experts/*.py` | Expert roster initialization, daily evidence-backed planning, simulated execution handoff, scorecards, lifecycle reviews, retirement lessons, and replacement hiring. |
 | Communication | `src/investment_forecasting/communication/*.py` | Channel-neutral outbound message service, notification templates, delivery policy checks, dry-run/failing adapters, iMessage adapter boundary, setup health, idempotency, allowlist enforcement, and communication logs. |
@@ -109,6 +110,8 @@ readiness, submission audit, and persistence links.
 | Expert submission tools | Implemented as audited submission envelopes for expert analysis draft, virtual action, and skipped/failed outcome. Expert Codex artifacts are validated and persisted into `expert_plans` with `evidence.agent_run_id`. |
 | Jarvis submission tools | Implemented as audited submission envelopes for Jarvis analysis draft or daily brief. Jarvis Codex artifacts are validated and persisted into `jarvis_daily_briefs` with `evidence.agent_run_id` and readiness metadata. |
 | Jarvis readiness gate | Blocks T+1 Jarvis execution until T expert runs are completed or explicitly skipped/failed. |
+| Local scheduled runner | Implemented through the unified LaunchAgent installed by `scheduler install-cron`. The runner invokes `scheduler run-due`; the scheduler then triggers market/news incremental jobs, expert Codex runs, and Jarvis Codex runs through the same validated service paths that manual operations use. It is not a Codex app automation. |
+| Today task status | Implemented through `scheduler today-status`, MCP `get_scheduler_today_status`, and the 设置 page system-health panel. It compares today's expected scheduler occurrences with `scheduler_runs` and today's failed `task_logs`, then marks jobs as `success`, `failed`, `deferred`, `missed`, `partial`, `not_yet_due`, or `no_run_expected`. |
 
 ## Important Database Areas
 
@@ -270,8 +273,13 @@ readiness, submission audit, and persistence links.
   audit records. Do not let Codex write SQLite directly, scrape WebUI, mutate
   state through shell commands, or run Jarvis before T expert outcomes are
   complete or explicitly skipped/failed.
+- For local scheduled operations, use `scheduler install-cron` to install one
+  system-owned macOS LaunchAgent. Do not create separate Codex app automations
+  or separate expert/Jarvis cron jobs. Jarvis notifications should flow through
+  the communication adapter layer and default environment variables, not direct
+  iMessage calls.
 - For scheduler work, follow `SPEC-013` and `ADR-009`: use the system scheduler,
-  not Codex app automation; run hourly market/news updates as incremental
+  not Codex app automation; run two-hour market/news updates as incremental
   watermark-based jobs; cap request windows; skip current scopes; persist
   provider backoff/deferred states; and never schedule full-history refresh.
 - Prefer shared formatting/view-model helpers in `web/app.py` over repeating

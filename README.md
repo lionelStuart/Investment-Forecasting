@@ -295,28 +295,29 @@ generate_daily_advice
 
 MCP 返回结构应尽量使用 JSON，保证可解析、可存档、可回测。
 
-## Codex 定时任务
+## 系统调度与 Codex Runtime
 
-需要建立一个每日定时任务：
+当前调度目标已经从“Codex 自己每天醒来跑全流程”调整为“系统 scheduler 拥有业务时钟，Codex 只作为专家团和 Jarvis 的受控 runtime”。系统通过一个本地 LaunchAgent 定期执行 `scheduler run-due`，再由 scheduler 按固定 cadence 触发各类任务。
 
 ```text
-时间：每天 08:00
-动作：自动请求 Codex CLI
-目标：完成一次数据更新、量化分析、模型预测、风险评估和每日理财指导建议生成
-输出：写入 SQLite，并在 WebUI 可查看
+市场/资讯增量：每 2 小时补齐一次 bounded window，不做全量历史抓取
+收盘后：补齐行情/净值，计算特征，运行预测、回测、监控和建议
+T 日晚间：系统调用本地 Codex CLI 作为专家 runtime，生成专家虚拟动作
+T+1 早间：系统调用本地 Codex CLI 作为 Jarvis runtime，生成日报并按默认配置发送短讯
+输出：所有数据、计划、简报、通知和任务状态写入 SQLite，并在 WebUI 可查看
 ```
 
-每日任务流程：
+系统调度流程：
 
 ```text
-1. 拉取最新行情、基金净值和市场数据
-2. 更新 SQLite
+1. 按水位拉取最新行情、基金净值、资金流和资讯增量
+2. 更新 SQLite，并记录 provider 预算、backoff、watermark 和 task_logs
 3. 计算最新特征和风险指标
-4. 执行预测模型
+4. 执行预测模型、回测、模型监控和成熟建议评分
 5. 生成激进、中等、保守三类建议
-6. 对比历史建议表现并更新评分
-7. 生成今日理财指导摘要
-8. 写入 daily_advice 和 task_logs
+6. T 日执行专家团 Codex runtime，记录虚拟计划、交易、收益曲线和反思
+7. T+1 执行 Jarvis Codex runtime，综合市场、模型、专家和任务健康
+8. 写入 jarvis_daily_briefs 和 outbound_messages，WebUI 暴露成功、失败、延期和缺失任务
 ```
 
 ## WebUI 需求

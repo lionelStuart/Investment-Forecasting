@@ -5,6 +5,7 @@ import os
 import shutil
 import signal
 import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Any, Callable
@@ -117,7 +118,7 @@ class CodexCliRuntimeAdapter:
             launch_request = _json(row["launch_request_json"])
             runtime_policy = launch_request.get("runtime_policy") or {}
             prompt_text = Path(paths["prompt_md"]).read_text(encoding="utf-8")
-            command = self._command(runtime_policy, paths, prompt_text)
+            command = self._command(runtime_policy, paths, prompt_text, row=row, launch_request=launch_request)
             events_file = open(paths["events_jsonl"], "a", encoding="utf-8")
             stderr_file = open(paths["stderr_log"], "a", encoding="utf-8")
             process = self.runner(
@@ -169,7 +170,15 @@ class CodexCliRuntimeAdapter:
         }
         return complete_agent_run(self.db_path, agent_run_id, status="completed_via_artifact", output=output)
 
-    def _command(self, runtime_policy: dict[str, Any], paths: dict[str, str], prompt_text: str) -> list[str]:
+    def _command(
+        self,
+        runtime_policy: dict[str, Any],
+        paths: dict[str, str],
+        prompt_text: str,
+        *,
+        row: Any | None = None,
+        launch_request: dict[str, Any] | None = None,
+    ) -> list[str]:
         command = [
             self.codex_bin,
             "--cd",
@@ -189,6 +198,7 @@ class CodexCliRuntimeAdapter:
                     str(runtime_policy.get("sandbox") or "workspace-write"),
                 ]
             )
+        command.extend(self._mcp_config_args(row=row, launch_request=launch_request))
         command.extend(
             [
                 "exec",
@@ -201,6 +211,47 @@ class CodexCliRuntimeAdapter:
             ]
         )
         return command
+
+    def _mcp_config_args(self, *, row: Any | None, launch_request: dict[str, Any] | None) -> list[str]:
+        if os.environ.get("INVESTMENT_FORECASTING_CODEX_MCP_ENABLED", "true").strip().lower() in {"0", "false", "no", "off"}:
+            return []
+        if row is None or launch_request is None:
+            return []
+        role_type = str(launch_request.get("role_type") or row["role_type"])
+        role_key = str(launch_request.get("role_key") or row["role_key"])
+        agent_run_id = int(row["id"])
+        server_name = "investment_forecasting_agent"
+        db_path = str(self.db_path.resolve())
+        src_path = str((self.project_root / "src").resolve())
+        args = [
+            "-m",
+            "investment_forecasting.cli",
+            "mcp",
+            "serve",
+            "--db",
+            db_path,
+            "--transport",
+            "stdio",
+            "--role-scoped",
+            "--agent-run-id",
+            str(agent_run_id),
+            "--role-type",
+            role_type,
+            "--role-key",
+            role_key,
+        ]
+        env = {
+            "PYTHONPATH": src_path,
+            "INVESTMENT_FORECASTING_DB": db_path,
+        }
+        return [
+            "-c",
+            f"mcp_servers.{server_name}.command={json.dumps(sys.executable)}",
+            "-c",
+            f"mcp_servers.{server_name}.args={json.dumps(args)}",
+            "-c",
+            f"mcp_servers.{server_name}.env={_toml_inline_table(env)}",
+        ]
 
     def _login_status(self) -> dict[str, Any]:
         try:
@@ -244,3 +295,8 @@ def _redacted_command(command: list[str]) -> list[str]:
     if not command:
         return []
     return [*command[:-1], "<prompt>"]
+
+
+def _toml_inline_table(values: dict[str, str]) -> str:
+    items = ", ".join(f"{key}={json.dumps(value)}" for key, value in sorted(values.items()))
+    return "{" + items + "}"

@@ -91,8 +91,10 @@ def record_virtual_order(
             price=None,
             price_date=None,
             gross_amount=0.0,
+            cost_basis=0.0,
             fee=0.0,
             cash_delta=0.0,
+            realized_pnl=0.0,
             status="no_trade",
             reason=reason or "No trade requested.",
         )
@@ -119,8 +121,10 @@ def record_virtual_order(
             price=None,
             price_date=None,
             gross_amount=0.0,
+            cost_basis=0.0,
             fee=0.0,
             cash_delta=0.0,
+            realized_pnl=0.0,
             status="unfilled",
             reason="Missing stored close/nav price for or before trade date.",
         )
@@ -148,17 +152,24 @@ def value_virtual_portfolio(conn, *, portfolio_id: int, valuation_date: str) -> 
     missing_prices = []
     positions_value = 0.0
     for position in positions:
+        quantity = float(position["quantity"])
+        average_cost = float(position["average_cost"] or 0.0)
+        cost_basis = quantity * average_cost
         price = _latest_price(conn, position["asset_id"], valuation_date)
         if price is None:
             missing_prices.append({"asset_id": position["asset_id"], "asset_code": position["asset_code"]})
             value = 0.0
             price_value = None
             price_date = None
+            unrealized_pnl = None
+            position_return = None
         else:
             price_value = float(price["price_value"])
             price_date = price["trade_date"]
-            value = float(position["quantity"]) * price_value
+            value = quantity * price_value
             positions_value += value
+            unrealized_pnl = value - cost_basis
+            position_return = (price_value / average_cost) - 1.0 if average_cost > 0 else None
         details.append(
             {
                 "asset_id": position["asset_id"],
@@ -166,9 +177,12 @@ def value_virtual_portfolio(conn, *, portfolio_id: int, valuation_date: str) -> 
                 "asset_name": position["asset_name"],
                 "quantity": position["quantity"],
                 "average_cost": position["average_cost"],
+                "cost_basis": cost_basis,
                 "price": price_value,
                 "price_date": price_date,
                 "value": value,
+                "unrealized_pnl": unrealized_pnl,
+                "position_return": position_return,
             }
         )
     total_value = float(portfolio["cash"]) + positions_value
@@ -218,8 +232,10 @@ def _record_buy(conn, portfolio_id, asset_id, trade_date, quantity, price, gross
             price=price["price_value"],
             price_date=price["trade_date"],
             gross_amount=gross_amount,
+            cost_basis=0.0,
             fee=fee,
             cash_delta=0.0,
+            realized_pnl=0.0,
             status="unfilled",
             reason="Insufficient virtual cash.",
         )
@@ -242,8 +258,10 @@ def _record_buy(conn, portfolio_id, asset_id, trade_date, quantity, price, gross
         price=price["price_value"],
         price_date=price["trade_date"],
         gross_amount=gross_amount,
+        cost_basis=gross_amount + fee,
         fee=fee,
         cash_delta=cash_delta,
+        realized_pnl=0.0,
         status="filled",
         reason=reason,
     )
@@ -264,14 +282,18 @@ def _record_sell(conn, portfolio_id, asset_id, trade_date, quantity, price, gros
             price=price["price_value"],
             price_date=price["trade_date"],
             gross_amount=gross_amount,
+            cost_basis=0.0,
             fee=fee,
             cash_delta=0.0,
+            realized_pnl=0.0,
             status="unfilled",
             reason="Insufficient virtual position.",
         )
         return dict(_get_transaction(conn, transaction_id))
 
     new_quantity = float(position["quantity"]) - quantity
+    cost_basis = float(position["average_cost"]) * quantity
+    realized_pnl = gross_amount - fee - cost_basis
     _upsert_position(conn, portfolio_id, asset_id, new_quantity, float(position["average_cost"]))
     cash_delta = gross_amount - fee
     _update_cash(conn, portfolio_id, cash_delta)
@@ -285,8 +307,10 @@ def _record_sell(conn, portfolio_id, asset_id, trade_date, quantity, price, gros
         price=price["price_value"],
         price_date=price["trade_date"],
         gross_amount=gross_amount,
+        cost_basis=cost_basis,
         fee=fee,
         cash_delta=cash_delta,
+        realized_pnl=realized_pnl,
         status="filled",
         reason=reason,
     )
@@ -364,8 +388,10 @@ def _insert_transaction(
     price: float | None,
     price_date: str | None,
     gross_amount: float,
+    cost_basis: float | None,
     fee: float,
     cash_delta: float,
+    realized_pnl: float | None,
     status: str,
     reason: str | None,
 ) -> int:
@@ -373,9 +399,9 @@ def _insert_transaction(
         """
         INSERT INTO virtual_transactions(
             portfolio_id, asset_id, trade_date, side, quantity, price, price_date,
-            gross_amount, fee, cash_delta, status, reason
+            gross_amount, cost_basis, fee, cash_delta, realized_pnl, status, reason
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         RETURNING id
         """,
         (
@@ -387,8 +413,10 @@ def _insert_transaction(
             price,
             price_date,
             gross_amount,
+            cost_basis,
             fee,
             cash_delta,
+            realized_pnl,
             status,
             reason,
         ),

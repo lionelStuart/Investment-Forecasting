@@ -69,6 +69,32 @@
   definitions are observable through scheduler status without Codex app
   automation.
 
+- Follow-up operational fix on 2026-05-26: scheduling is now centralized under
+  one project-owned cron registration command. `scheduler install-cron`
+  installs `local.investment-forecasting.scheduler`, which wakes
+  `scheduler run-due` every 5 minutes. The scheduler owns all business cadence:
+  market and news incremental jobs every 2 hours, expert T-day Codex runs at
+  20:00 Monday-Friday, and Jarvis T+1 daily brief plus default `owner_phone`
+  communication-adapter notification at 08:00 daily. Separate expert/Jarvis
+  LaunchAgents are removed from the intended operational path. The scheduler
+  now also exposes today's task履约 through `scheduler today-status`, MCP
+  `get_scheduler_today_status`, and 设置 / 系统健康, including failed,
+  deferred, missed, partial, successful, and not-yet-due job states.
+
+- Follow-up scheduler defect fix on 2026-05-27: the P0 audit findings in
+  `repo/audits/SCHEDULER_PIPELINE_DEFECTS_2026-05-27.md` were addressed for
+  the front half of the timed pipeline. Scheduler handlers now call the real
+  news, capital-flow, price/NAV, feature, forecast/backtest, market snapshot,
+  advice, advice-scoring, and monitoring services instead of only advancing
+  watermarks or readiness gates. Scheduler runs now expose `execution_mode`
+  so CLI/MCP/WebUI can distinguish `real_provider`, `real_calculation`,
+  `real_model_run`, `agent_runtime`, and `readiness_only`. Jarvis readiness
+  now reports whether upstream scheduler evidence for the target date was
+  truly executed, so a completed expert committee no longer hides stale
+  market/model evidence. Regression coverage was added for scheduler success
+  semantics, expert buy/sell action persistence, and virtual portfolio
+  average-cost/realized/unrealized return calculations.
+
 - Earlier Jarvis-first IA narrowing is closed, not the current active pause.
   `TASK-061` through `TASK-065` are complete: the AI provider boundary,
   expert/Jarvis prompt and evidence schemas, provider-backed orchestration,
@@ -552,14 +578,14 @@
   submission envelopes, expert plan/action persistence with `agent_run_id`
   evidence links, Jarvis T+1 readiness gates, and Jarvis brief persistence with
   producing agent-run/readiness evidence are now in place.
-- `TASK-086` through `TASK-089` are complete: scheduler tables, fixed job
+- `TASK-086` through `TASK-089` are complete, with the 2026-05-26 operational
+  follow-up folded into the active implementation: scheduler tables, fixed job
   definitions, CLI inspection/manual run commands, incremental watermarks,
-  provider budgets/backoff, scheduler health surfaces, and task-log summaries
-  are now implemented. The fixed sync timing is: news hourly at `:05`; market
-  context on trading days at `09:45`, `10:45`, `11:45`, `13:45`, `14:45`, and
-  `15:20`; price/NAV post-close at `17:30`; features at `18:10`; model/advice
-  preparation at `18:40`; expert and Jarvis definitions are present but
-  disabled/gated until evidence readiness is explicitly enabled.
+  provider budgets/backoff, scheduler health surfaces, task-log summaries, and
+  `scheduler install-cron` are now implemented. The current sync timing is:
+  news and market context every two hours; price/NAV post-close at `17:30`;
+  features at `18:10`; model/advice preparation at `18:40`; experts at `20:00`
+  on T; and Jarvis daily brief plus phone notification at `08:00` on T+1.
 
 ## Next Steps
 

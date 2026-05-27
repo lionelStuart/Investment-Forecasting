@@ -68,6 +68,18 @@ def _ensure_legacy_columns(conn: sqlite3.Connection) -> None:
     if expert_plan_columns and "ai_analysis_id" not in expert_plan_columns:
         conn.execute("ALTER TABLE expert_plans ADD COLUMN ai_analysis_id INTEGER REFERENCES ai_analysis_records(id) ON DELETE SET NULL")
 
+    virtual_transaction_columns = {
+        row["name"]
+        for row in conn.execute("PRAGMA table_info(virtual_transactions)").fetchall()
+    }
+    expected_virtual_transaction_columns = {
+        "cost_basis": "REAL",
+        "realized_pnl": "REAL",
+    }
+    for column, column_type in expected_virtual_transaction_columns.items():
+        if virtual_transaction_columns and column not in virtual_transaction_columns:
+            conn.execute(f"ALTER TABLE virtual_transactions ADD COLUMN {column} {column_type}")
+
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS model_prediction_reliability (

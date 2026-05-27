@@ -19,7 +19,7 @@ from investment_forecasting.jarvis import get_jarvis_brief
 from investment_forecasting.jarvis.synthesis import generate_jarvis_brief
 from investment_forecasting.portfolio.accounting import ensure_expert_portfolios
 from investment_forecasting.quant.backtest import run_backtest, run_latest_forecasts
-from investment_forecasting.scheduler import scheduler_status
+from investment_forecasting.scheduler import scheduler_status, scheduler_today_status
 
 
 class ToolError(RuntimeError):
@@ -223,6 +223,10 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
     },
     "get_scheduler_status": {
         "description": "Return system scheduler jobs, latest runs, watermarks, and provider backoff state for evidence freshness checks.",
+        "input_schema": {"type": "object", "properties": {}, "additionalProperties": False},
+    },
+    "get_scheduler_today_status": {
+        "description": "Return today's expected scheduler jobs and whether each is successful, failed, deferred, missed, or not yet due.",
         "input_schema": {"type": "object", "properties": {}, "additionalProperties": False},
     },
     "get_agent_tool_manifest": {
@@ -543,6 +547,10 @@ def get_scheduler_status_tool(db_path: Path, arguments: dict[str, Any]) -> dict[
     return scheduler_status(db_path)
 
 
+def get_scheduler_today_status_tool(db_path: Path, arguments: dict[str, Any]) -> dict[str, Any]:
+    return scheduler_today_status(db_path)
+
+
 def get_agent_tool_manifest_tool(db_path: Path, arguments: dict[str, Any]) -> dict[str, Any]:
     role_type = _required(arguments, "role_type")
     role_key = arguments.get("role_key")
@@ -783,6 +791,7 @@ _HANDLERS: dict[str, ToolHandler] = {
     "generate_jarvis_daily_brief": generate_jarvis_daily_brief_tool,
     "search_news_evidence": search_news_evidence_tool,
     "get_scheduler_status": get_scheduler_status_tool,
+    "get_scheduler_today_status": get_scheduler_today_status_tool,
     "get_agent_tool_manifest": get_agent_tool_manifest_tool,
     "validate_agent_output": validate_agent_output_tool,
     "submit_expert_analysis_draft": submit_agent_envelope_tool,

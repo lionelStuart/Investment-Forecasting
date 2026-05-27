@@ -274,17 +274,24 @@ def test_search_news_evidence_tool_is_bounded_and_structured(tmp_path):
     assert "requires" in broad["error"]["message"]
 
 
-def test_scheduler_status_tool_exposes_watermarks_and_backoff(tmp_path):
+def test_scheduler_status_tool_exposes_watermarks_and_backoff(tmp_path, monkeypatch):
+    import investment_forecasting.scheduler.service as service
+
+    monkeypatch.setattr(service, "_news_provider", lambda: _FakeNewsProvider())
     db_path = prepare_tool_db(tmp_path)
     initialize_scheduler(db_path)
     run_scheduler_job(db_path, "news_hourly_incremental")
 
     response = call_tool(db_path, "get_scheduler_status", {})
+    today = call_tool(db_path, "get_scheduler_today_status", {})
 
     assert response["ok"] is True
     assert response["result"]["jobs"]
     assert response["result"]["latest_runs"]["news_hourly_incremental"]["status"] == "success"
+    assert response["result"]["latest_runs"]["news_hourly_incremental"]["execution_mode"] == "real_provider"
     assert response["result"]["watermarks"]
+    assert today["ok"] is True
+    assert today["result"]["items"]
 
 
 def test_tool_errors_are_structured(tmp_path):
@@ -298,3 +305,18 @@ def test_tool_errors_are_structured(tmp_path):
         "result": None,
         "error": {"message": "Unknown asset: NOPE/CN/akshare"},
     }
+
+
+class _FakeNewsProvider:
+    source = "fake"
+
+    def news(self, *, source: str, start_datetime: str, end_datetime: str):
+        return [
+            {
+                "id": "fake-news-1",
+                "title": "TEST 指数政策利好",
+                "content": "TEST 指数政策利好，市场情绪回暖。",
+                "published_at": end_datetime,
+                "url": "https://example.test/news/1",
+            }
+        ]

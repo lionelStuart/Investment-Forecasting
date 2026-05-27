@@ -19,7 +19,7 @@ from investment_forecasting.quant.features import calculate_features_for_db
 from investment_forecasting.quant.market import calculate_market_snapshot
 from investment_forecasting.quant.monitoring import run_model_monitoring_report
 from investment_forecasting.scheduler import initialize_scheduler, record_provider_failure, run_scheduler_job
-from investment_forecasting.web.app import render_route
+from investment_forecasting.web.app import expert_return_curve, render_route
 from tests.test_daily_workflow import seed_asset_with_prices
 
 
@@ -450,7 +450,10 @@ def test_table_heavy_pages_use_progressive_disclosure(tmp_path):
     assert logs.index("运行健康摘要") < logs.index("技术明细")
 
 
-def test_settings_page_shows_scheduler_backoff_and_latest_runs(tmp_path):
+def test_settings_page_shows_scheduler_backoff_and_latest_runs(tmp_path, monkeypatch):
+    import investment_forecasting.scheduler.service as service
+
+    monkeypatch.setattr(service, "_news_provider", lambda: _FakeNewsProvider())
     db_path = prepare_web_db(tmp_path)
     initialize_scheduler(db_path)
     run_scheduler_job(db_path, "news_hourly_incremental")
@@ -459,7 +462,10 @@ def test_settings_page_shows_scheduler_backoff_and_latest_runs(tmp_path):
     settings = render_route(db_path, "/settings", {})
 
     assert "系统调度" in settings
+    assert "今日任务" in settings
     assert "news_hourly_incremental" in settings
+    assert "execution_mode" in settings
+    assert "real_provider" in settings
     assert "Provider Backoff" in settings
     assert "HTTP 429 rate limit" in settings
 
@@ -558,6 +564,9 @@ def test_experts_page_empty_active_and_retired_states(tmp_path):
     assert "总览投资 / 收益曲线" not in html
     overview_curve_html = html.split("<h2>专家收益对比</h2>", 1)[1].split("<h2>复盘与经验</h2>", 1)[0]
     assert "<table" not in overview_curve_html
+    assert "<svg" not in overview_curve_html
+    assert 'data-echarts="expert-comparison"' in overview_curve_html
+    assert '"returnValue":' in overview_curve_html
     assert "benchmark_excess" not in overview_curve_html
     assert "benchmark_return" not in overview_curve_html
     assert "<table" not in html
@@ -583,12 +592,40 @@ def test_experts_page_empty_active_and_retired_states(tmp_path):
     return_curve_html = detail_html.split("<h2>收益曲线</h2>", 1)[1].split("<h2>分析与反思</h2>", 1)[0]
     assert "<table" not in return_curve_html
     assert "valuation_date" not in return_curve_html
+    assert 'data-echarts="expert-return"' in return_curve_html
+    assert '"totalValue":' in return_curve_html
     assert "分析与反思" in detail_html
     assert "reason" in detail_html
     assert "reflection" in detail_html
     assert "总资产" in detail_html
     assert "已投资" in detail_html
     assert "最新计划与执行" not in detail_html
+
+
+def test_expert_return_curve_keeps_points_inside_plot_area():
+    html = expert_return_curve(
+        [
+            {"valuation_date": "2026-05-23", "cash": 500000, "positions_value": 0, "total_value": 500000},
+            {"valuation_date": "2026-05-24", "cash": 500000, "positions_value": 0, "total_value": 500000},
+            {"valuation_date": "2026-05-25", "cash": 450000, "positions_value": 53048.15, "total_value": 503048.15},
+            {"valuation_date": "2026-05-26", "cash": 445000, "positions_value": 59172.4, "total_value": 504172.4},
+            {"valuation_date": "2026-05-27", "cash": 445000, "positions_value": 59172.4, "total_value": 504172.4},
+        ],
+        500000,
+    )
+
+    assert "<svg" not in html
+    assert 'data-echarts="expert-return"' in html
+    assert html.count('"totalValue":') == 5
+    assert '"cashValue":445000.0' in html
+    assert '"positionsValue":59172.4' in html
+    assert '"returnLabel":"+0.83%"' in html
+    assert "+0.83%" in html
+    chart_json = html.split('<script type="application/json" class="echarts-data">', 1)[1].split("</script>", 1)[0]
+    assert "&lt;span" not in chart_json
+    assert '<span class="market' not in chart_json
+    assert "05-23" in html
+    assert "05-27" in html
 
 
 def test_portfolios_page_shows_holdings_transactions_and_equity_curve(tmp_path):
@@ -800,3 +837,18 @@ def seed_communication_web_state(db_path) -> None:
             )
             """
         )
+
+
+class _FakeNewsProvider:
+    source = "fake"
+
+    def news(self, *, source: str, start_datetime: str, end_datetime: str):
+        return [
+            {
+                "id": "fake-web-news-1",
+                "title": "系统调度测试新闻",
+                "content": "系统调度测试新闻，市场情绪回暖。",
+                "published_at": end_datetime,
+                "url": "https://example.test/news/1",
+            }
+        ]

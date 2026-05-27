@@ -29,7 +29,7 @@ capital protection, guaranteed returns, or direct instructions to buy or sell.
 - Run system-owned scheduled workflows that update data, evaluate the market,
   generate forecasts, record scores, invoke role-scoped Codex agent runtime
   tasks when needed, and write daily advice or Jarvis briefs.
-- Run hourly system-owned incremental update jobs for market/news freshness.
+- Run two-hour system-owned incremental update jobs for market/news freshness.
   Scheduled jobs must use watermarks, bounded windows, provider request caps,
   and backoff instead of repeated full-history ingestion.
 - Provide a Jarvis-first WebUI organized around the user's daily decision
@@ -205,7 +205,7 @@ capital protection, guaranteed returns, or direct instructions to buy or sell.
 - `Agent Run`: A persisted expert or Jarvis runtime attempt with role, run
   date, target evidence date, status, runtime metadata, tool-call audit, output
   links, and error/fallback reason.
-- `System Scheduler`: The product-owned scheduler that runs hourly and
+- `System Scheduler`: The product-owned scheduler that runs two-hour and
   time-windowed update jobs, records scheduler runs and watermarks, and invokes
   downstream expert/Jarvis jobs only when readiness gates pass.
 - `Scheduler Watermark`: A persisted cursor/date/datetime used by scheduled

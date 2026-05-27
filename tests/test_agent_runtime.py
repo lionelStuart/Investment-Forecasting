@@ -5,6 +5,7 @@ import subprocess
 from types import SimpleNamespace
 
 import investment_forecasting.agent_runtime.execution as execution
+import investment_forecasting.cli as cli_module
 from investment_forecasting.agent_runtime import (
     CodexCliRuntimeAdapter,
     FakeCodexRuntimeAdapter,
@@ -22,6 +23,7 @@ from investment_forecasting.db import connect, get_agent_run, init_db, update_ag
 from investment_forecasting.experts.planning import run_expert_agent_plan_from_output
 from investment_forecasting.experts.roster import initialize_default_experts, list_roster
 from investment_forecasting.mcp.tools import call_agent_tool
+from investment_forecasting.mcp.server import create_agent_mcp_server
 from tests.test_jarvis import seed_jarvis_synthesis_state
 
 
@@ -172,6 +174,10 @@ def test_codex_cli_adapter_prepares_project_artifacts_and_command(tmp_path):
     assert "--sandbox" in command
     assert "workspace-write" in command
     assert "--json" in command
+    assert any(value.startswith("mcp_servers.investment_forecasting_agent.command=") for value in command)
+    assert any(value.startswith("mcp_servers.investment_forecasting_agent.args=") for value in command)
+    assert "--role-scoped" in " ".join(command)
+    assert str(prepared.agent_run_id) in " ".join(command)
     assert command[-1] == "专家运行提示"
 
 
@@ -225,6 +231,26 @@ def test_role_tool_manifests_are_bounded_and_distinct():
     for forbidden in ("shell", "sql", "webui_scrape", "live_trade", "send_outbound_message"):
         assert forbidden in expert["tools"]["forbidden"]
         assert forbidden in jarvis["tools"]["forbidden"]
+
+
+def test_agent_mcp_server_exposes_only_role_scoped_subset(tmp_path):
+    db_path = init_db(tmp_path / "agent_mcp.sqlite3")
+    handle = create_or_prepare_agent_run(db_path, expert_launch_request())
+    server = create_agent_mcp_server(db_path, agent_run_id=handle.agent_run_id, role_type="expert", role_key="bai_gui")
+
+    import anyio
+
+    async def tool_names():
+        tools = await server.list_tools()
+        return {tool.name for tool in tools}
+
+    names = anyio.run(tool_names)
+
+    assert "get_asset_list" in names
+    assert "submit_expert_virtual_action" in names
+    assert "submit_jarvis_daily_brief" not in names
+    assert "run_forecast" not in names
+    assert "send_outbound_message" not in names
 
 
 def test_agent_tool_call_requires_running_role_and_audits_rejections(tmp_path):
@@ -335,6 +361,55 @@ def test_jarvis_readiness_blocks_pending_expert_agent_runs(tmp_path):
     ready = jarvis_agent_readiness(db_path, "2026-05-24")
     assert ready["ready"] is True
     assert ready["status"] == "complete"
+    assert ready["upstream_evidence_status"]["ready"] is False
+    assert "model_post_close" in ready["upstream_evidence_status"]["missing_jobs"]
+
+
+def test_jarvis_readiness_reports_real_upstream_scheduler_evidence(tmp_path):
+    db_path = init_db(tmp_path / "readiness-upstream.sqlite3")
+    experts = initialize_default_experts(db_path)
+    for expert in experts:
+        request = build_launch_request(
+            role_type="expert",
+            role_key=expert["expert_key"],
+            run_date="2026-05-25",
+            target_evidence_date="2026-05-25",
+            trigger_reason="expert_agent_daily_execution",
+            overview_skill="investment-expert-agent",
+            skill_bundle=get_role_tool_manifest("expert", expert["expert_key"]).skill_bundle,
+            prompt_ref={"kind": "test", "prompt_hash": f"sha256:{expert['expert_key']}"},
+            tool_manifest_ref={"kind": "inline", "manifest_hash": "sha256:test"},
+            output_contract={"schema_version": "expert_agent_output_v1", "submission_tool": "submit_expert_virtual_action"},
+        )
+        handle = create_or_prepare_agent_run(db_path, request)
+        with connect(db_path) as conn:
+            update_agent_run(conn, handle.agent_run_id, status="completed")
+    with connect(db_path) as conn:
+        scheduler_rows = [
+            ("news_hourly_incremental", '{"real_provider_calls": true}'),
+            ("market_context_intraday", '{"real_provider_calls": true}'),
+            ("price_nav_post_close", '{"real_provider_calls": true}'),
+            ("features_post_close", '{"real_calculation": true}'),
+            ("model_post_close", '{"real_model_run": true}'),
+        ]
+        for index, (job_key, metadata) in enumerate(scheduler_rows, start=1):
+            conn.execute(
+                """
+                INSERT INTO scheduler_runs(job_key, scheduled_at, started_at, finished_at, status, metadata_json)
+                VALUES (?, '2026-05-25T18:00:00', ?, ?, 'success', ?)
+                """,
+                (job_key, f"2026-05-25 18:00:0{index}", f"2026-05-25 18:00:1{index}", metadata),
+            )
+
+    ready = jarvis_agent_readiness(db_path, "2026-05-25")
+
+    assert ready["ready"] is True
+    assert ready["upstream_evidence_status"] == {
+        "ready": True,
+        "missing_jobs": [],
+        "not_success_jobs": [],
+        "readiness_only_jobs": [],
+    }
 
 
 def test_expert_agent_output_persists_plan_with_agent_run_evidence(tmp_path):
@@ -434,3 +509,71 @@ def test_jarvis_agent_task_uses_environment_notification_defaults(tmp_path, monk
     assert captured["notify_recipient_key"] == "owner_phone"
     assert captured["notification_channel"] == "imessage"
     assert captured["notification_dry_run"] is True
+
+
+def test_jarvis_codex_cli_passes_notification_arguments(tmp_path, monkeypatch, capsys):
+    db_path = init_db(tmp_path / "jarvis-cli-notify.sqlite3")
+    captured: dict[str, object] = {}
+
+    def fake_run_jarvis_codex_agent(*args, **kwargs):
+        captured["db_path"] = args[0]
+        captured.update(kwargs)
+        return {"ok": True, "run_date": "2026-05-26", "runs": []}
+
+    monkeypatch.setattr(cli_module, "run_jarvis_codex_agent", fake_run_jarvis_codex_agent)
+
+    result = cli_module.main(
+        [
+            "agent-runs",
+            "run-jarvis-codex",
+            "--db",
+            str(db_path),
+            "--date",
+            "2026-05-26",
+            "--target-evidence-date",
+            "2026-05-25",
+            "--notify-recipient-key",
+            "owner_phone",
+            "--notification-channel",
+            "imessage",
+            "--notification-dry-run",
+        ]
+    )
+
+    assert result == 0
+    assert captured["db_path"] == db_path
+    assert captured["notify_recipient_key"] == "owner_phone"
+    assert captured["notification_channel"] == "imessage"
+    assert captured["notification_dry_run"] is True
+    assert json.loads(capsys.readouterr().out)["ok"] is True
+
+
+def test_expert_codex_cli_does_not_require_notification_arguments(tmp_path, monkeypatch):
+    db_path = init_db(tmp_path / "expert-cli.sqlite3")
+    captured: dict[str, object] = {}
+
+    def fake_run_expert_codex_agents(*args, **kwargs):
+        captured["db_path"] = args[0]
+        captured.update(kwargs)
+        return {"ok": True, "run_date": "2026-05-26", "runs": []}
+
+    monkeypatch.setattr(cli_module, "run_expert_codex_agents", fake_run_expert_codex_agents)
+
+    result = cli_module.main(
+        [
+            "agent-runs",
+            "run-experts-codex",
+            "--db",
+            str(db_path),
+            "--date",
+            "2026-05-26",
+            "--project-root",
+            str(tmp_path),
+        ]
+    )
+
+    assert result == 0
+    assert captured["db_path"] == db_path
+    assert captured["run_date"] == "2026-05-26"
+    assert captured["project_root"] == tmp_path
+    assert "notify_recipient_key" not in captured
