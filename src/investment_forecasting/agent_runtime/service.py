@@ -98,6 +98,7 @@ def complete_agent_run(
             agent_run_id,
             status=status,
             submission_result=submission_result or output or {"status": status},
+            clear_failure_reason=True,
         )
         row = get_agent_run(conn, agent_run_id)
         return CodexAgentRunResult(

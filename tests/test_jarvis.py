@@ -264,6 +264,44 @@ def test_generate_jarvis_brief_can_send_phone_summary_dry_run(tmp_path):
     assert "Jarvis 投资研究摘要" in messages[0]["body"]
 
 
+def test_generate_jarvis_brief_keeps_failed_notification_visible_without_failing_brief(tmp_path):
+    db_path = seed_jarvis_synthesis_state(tmp_path)
+    with connect(db_path) as conn:
+        upsert_communication_adapter_config(conn, {"channel": "imessage", "enabled": 0, "dry_run_default": 0})
+        upsert_communication_recipient(
+            conn,
+            {
+                "recipient_key": "owner_phone",
+                "display_name": "Owner",
+                "channel": "imessage",
+                "address": "+10000000000",
+                "allowlisted": 1,
+                "enabled": 1,
+                "rate_limit_per_hour": 10,
+            },
+        )
+
+    brief = generate_jarvis_brief(
+        db_path,
+        brief_date="20260523",
+        notify_recipient_key="owner_phone",
+        notification_dry_run=False,
+    )
+
+    with connect(db_path) as conn:
+        saved = get_jarvis_daily_brief(conn, "2026-05-23", "jarvis_v1")
+        message = conn.execute("SELECT * FROM outbound_messages WHERE template_key = 'jarvis_daily_summary'").fetchone()
+        log = conn.execute("SELECT status FROM task_logs WHERE task_name = 'jarvis_brief_generation' ORDER BY id DESC LIMIT 1").fetchone()
+
+    assert brief["id"] == saved["id"]
+    assert brief["notification"]["status"] == "failed"
+    assert "not enabled" in brief["notification"]["error"]
+    assert message["status"] == "failed"
+    assert "not enabled" in message["error"]
+    assert message["sent_at"] is None
+    assert log["status"] == "success"
+
+
 def test_jarvis_cli_generate_uses_environment_notification_defaults(tmp_path, capsys, monkeypatch):
     db_path = seed_jarvis_synthesis_state(tmp_path)
     seed_notification_recipient(db_path)
@@ -370,6 +408,27 @@ def test_generate_jarvis_brief_records_missing_and_stale_evidence(tmp_path):
     stale_sources = {item["source"] for item in stale_brief["stale_evidence"]}
     assert {"market_snapshots", "model_predictions", "expert_plans", "expert_ai_analysis", "expert_scorecards", "virtual_valuations"}.issubset(stale_sources)
     assert "存在过期证据" in stale_brief["risk_warnings"]
+
+
+def test_jarvis_brief_records_stale_capital_flow_as_evidence_risk(tmp_path):
+    db_path = seed_jarvis_synthesis_state(tmp_path)
+
+    brief = generate_jarvis_brief(db_path, brief_date="20260530")
+
+    capital_flow_stale = [item for item in brief["stale_evidence"] if item["source"] == "capital_flow_observations"]
+    assert capital_flow_stale == [{"source": "capital_flow_observations", "last_date": "2026-05-23", "age_days": 7}]
+    assert brief["model_summary"]["capital_flow"]["latest_date"] == "2026-05-23"
+    assert "存在过期证据" in brief["risk_warnings"]
+    assert brief["evidence"]["capital_flow_ids"]
+
+
+def test_jarvis_brief_marks_stale_capital_flow_summary_as_degraded(tmp_path):
+    db_path = seed_jarvis_synthesis_state(tmp_path)
+
+    brief = generate_jarvis_brief(db_path, brief_date="20260530")
+
+    assert brief["model_summary"]["capital_flow"]["status"] == "degraded"
+    assert brief["model_summary"]["capital_flow"]["stale"] is True
 
 
 def seed_jarvis_synthesis_state(tmp_path):

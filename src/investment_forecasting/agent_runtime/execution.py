@@ -15,7 +15,7 @@ from investment_forecasting.agent_runtime.prompts import (
     render_expert_agent_prompt,
     render_jarvis_agent_prompt,
 )
-from investment_forecasting.agent_runtime.service import build_launch_request, list_runtime_agent_runs
+from investment_forecasting.agent_runtime.service import build_launch_request, fail_agent_run, list_runtime_agent_runs
 from investment_forecasting.communication.config import notification_defaults
 from investment_forecasting.db import connect, update_agent_run
 from investment_forecasting.experts.planning import latest_expert_evidence_date, run_expert_agent_plan_from_output
@@ -91,6 +91,7 @@ def run_expert_codex_agents(
                         handle.agent_run_id,
                         status="completed",
                         submission_result={**run, "artifact_paths": run.get("artifact_paths")},
+                        clear_failure_reason=True,
                     )
                 run["status"] = "completed"
             except Exception as exc:
@@ -184,7 +185,13 @@ def run_jarvis_codex_agent(
                 run["notification"] = brief["notification"]
             run["persisted"] = True
             with connect(db_path) as conn:
-                update_agent_run(conn, handle.agent_run_id, status="completed", submission_result={**run, "artifact_paths": run.get("artifact_paths")})
+                update_agent_run(
+                    conn,
+                    handle.agent_run_id,
+                    status="completed",
+                    submission_result={**run, "artifact_paths": run.get("artifact_paths")},
+                    clear_failure_reason=True,
+                )
             run["status"] = "completed"
         except Exception as exc:
             with connect(db_path) as conn:
@@ -312,6 +319,7 @@ def _wait_for_artifact(
             }
         time.sleep(2)
     adapter.cancel_run(agent_run_id, f"{role_type} Codex execution timed out")
+    fail_agent_run(db_path, agent_run_id, error=f"{role_type} Codex execution timed out", status="timed_out")
     return {
         "ok": False,
         "agent_run_id": agent_run_id,

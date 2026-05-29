@@ -8,7 +8,7 @@ from investment_forecasting.cli import main
 from investment_forecasting.data.ingestion import MVP_UNIVERSE, ingest_mvp_universe
 from investment_forecasting.db import connect
 from investment_forecasting.providers.akshare_provider import ProviderDataError
-from investment_forecasting.providers.tushare_provider import TushareProvider
+from investment_forecasting.providers.tushare_provider import TushareProvider, TushareRetryConfig
 
 
 class FakeTusharePro:
@@ -21,6 +21,11 @@ class FakeTusharePro:
     def fund_nav(self, **kwargs):
         return [
             {"nav_date": "20260521", "unit_nav": "1.234", "accum_nav": "1.888", "pct_chg": "0.3"},
+        ]
+
+    def fund_daily(self, **kwargs):
+        return [
+            {"trade_date": "20260521", "open": 3.0, "high": 3.1, "low": 2.9, "close": 3.05, "pct_chg": 0.5, "vol": 1000, "amount": 3000},
         ]
 
     def stock_basic(self, **kwargs):
@@ -137,6 +142,34 @@ class RateLimitedMoneyflowModule(FakeTushareModule):
         self.pro = RateLimitedMoneyflowPro()
 
 
+class FailingNewsPro(FakeTusharePro):
+    def news(self, **kwargs):
+        raise OSError("api.waditu.com DNS failure")
+
+
+class FailingNewsModule(FakeTushareModule):
+    def __init__(self):
+        super().__init__()
+        self.pro = FailingNewsPro()
+
+
+class ProxyRecoveringNewsPro(FakeTusharePro):
+    def __init__(self):
+        self.calls = []
+
+    def news(self, **kwargs):
+        self.calls.append(os.environ.get("https_proxy") or "")
+        if "127.0.0.1:7890" not in (os.environ.get("https_proxy") or ""):
+            raise OSError("api.waditu.com DNS failure")
+        return super().news(**kwargs)
+
+
+class ProxyRecoveringNewsModule(FakeTushareModule):
+    def __init__(self):
+        super().__init__()
+        self.pro = ProxyRecoveringNewsPro()
+
+
 def test_tushare_provider_requires_explicit_token(monkeypatch):
     monkeypatch.delenv("TUSHARE_TOKEN", raising=False)
     monkeypatch.delenv("TS_TOKEN", raising=False)
@@ -150,6 +183,8 @@ def test_tushare_provider_normalizes_index_stock_and_fund_history():
     provider = TushareProvider(ts_module=module, token="test-token")
 
     index_rows = provider.history(MVP_UNIVERSE[0], "20260520", "20260521")
+    etf = next(asset for asset in MVP_UNIVERSE if asset.asset_type == "etf")
+    etf_rows = provider.history(etf, "20260520", "20260521")
     stock_rows = provider.history(MVP_UNIVERSE[-1], "20260520", "20260521")
     fund = next(asset for asset in MVP_UNIVERSE if asset.asset_type == "fund")
     fund_rows = provider.history(fund, "20260520", "20260521")
@@ -158,6 +193,8 @@ def test_tushare_provider_normalizes_index_stock_and_fund_history():
     assert index_rows[0]["trade_date"] == "2026-05-20"
     assert index_rows[-1]["close"] == 3905.0
     assert module.pro_bar_calls[0]["ts_code"] == "600519.SH"
+    assert module.pro_bar_calls[0]["api"] is provider.pro
+    assert etf_rows[0]["close"] == 3.05
     assert stock_rows[0]["adjusted_close"] == 10.5
     assert fund_rows[0]["nav"] == 1.234
     assert fund_rows[0]["accumulated_nav"] == 1.888
@@ -209,6 +246,44 @@ def test_tushare_provider_fetches_news_with_bounded_datetime_params():
     rows = provider.news(source="sina", start_datetime="20260523 09:00:00", end_datetime="20260523 10:00:00")
 
     assert rows[0]["title"] == "贵州茅台盘中异动"
+
+
+def test_tushare_provider_reports_token_presence_without_exposing_token_and_keeps_network_failure_distinct():
+    provider = TushareProvider(
+        ts_module=FailingNewsModule(),
+        token="redacted-credential",
+        retry_config=TushareRetryConfig(attempts=1, fallback_to_direct=False, fallback_to_local_proxy=False),
+    )
+
+    diagnostics = provider.diagnostics()
+
+    assert diagnostics["provider"] == "tushare"
+    assert diagnostics["credential_source"] == "token_present"
+    assert "redacted-credential" not in str(diagnostics)
+    with pytest.raises(ProviderDataError, match="Tushare news fetch failed for source:sina") as exc_info:
+        provider.news(source="sina", start_datetime="20260523 09:00:00", end_datetime="20260523 10:00:00")
+    message = str(exc_info.value)
+    assert "api.waditu.com DNS failure" in message
+    assert "requires TUSHARE_TOKEN" not in message
+    assert "redacted-credential" not in message
+
+
+def test_tushare_news_retries_with_local_proxy_when_direct_network_fails(monkeypatch):
+    for key in ("https_proxy", "HTTPS_PROXY", "http_proxy", "HTTP_PROXY", "all_proxy", "ALL_PROXY"):
+        monkeypatch.delenv(key, raising=False)
+    module = ProxyRecoveringNewsModule()
+    provider = TushareProvider(
+        ts_module=module,
+        token="test-token",
+        retry_config=TushareRetryConfig(attempts=1),
+    )
+
+    rows = provider.news(source="sina", start_datetime="20260523 09:00:00", end_datetime="20260523 10:00:00")
+
+    assert rows[0]["title"] == "贵州茅台盘中异动"
+    assert provider.diagnostics()["network_profiles"] == ["environment", "direct", "local_proxy_127.0.0.1:7890"]
+    assert any("127.0.0.1:7890" in call for call in module.pro.calls)
+    assert os.environ.get("https_proxy") is None
 
 
 def test_ingestion_with_tushare_provider_records_provider_source(tmp_path):

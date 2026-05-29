@@ -12,8 +12,8 @@ from typing import Any
 
 from investment_forecasting.advice.generator import generate_daily_advice
 from investment_forecasting.advice.scoring import score_matured_advice
-from investment_forecasting.data.news import ingest_news
-from investment_forecasting.db import complete_task_log, connect, init_db, start_task_log, upsert_capital_flow_observation, upsert_price_daily
+from investment_forecasting.data.news import index_news_item, normalize_news_row
+from investment_forecasting.db import complete_task_log, connect, init_db, start_task_log, upsert_capital_flow_observation, upsert_news_item, upsert_price_daily
 from investment_forecasting.providers.akshare_provider import AkshareProvider
 from investment_forecasting.providers.tushare_provider import TushareProvider
 from investment_forecasting.quant.backtest import run_backtest, run_latest_forecasts
@@ -131,6 +131,13 @@ def scheduler_today_status(db_path: str | Path, *, now: datetime | None = None) 
                 (today_text,),
             ).fetchall()
         ]
+    run_rows = [run for run in run_rows if not run.get("metadata", {}).get("manual_interrupted")]
+    task_rows = [
+        row
+        for row in task_rows
+        if "manual " not in str(row.get("error") or "").lower()
+        and "manual " not in str(row.get("message") or "").lower()
+    ]
     runs_by_job: dict[str, list[dict[str, Any]]] = {}
     for run in run_rows:
         runs_by_job.setdefault(run["job_key"], []).append(run)
@@ -169,7 +176,7 @@ def run_due_jobs(db_path: str | Path, *, now: datetime | None = None) -> dict[st
     return {"ok": all(run["status"] in TERMINAL_STATUSES and run["status"] != "failed" for run in runs), "due_count": len(rows), "runs": runs}
 
 
-def run_scheduler_job(db_path: str | Path, job_key: str, *, now: datetime | None = None) -> dict[str, Any]:
+def run_scheduler_job(db_path: str | Path, job_key: str, *, now: datetime | None = None, scheduled_at: datetime | str | None = None) -> dict[str, Any]:
     initialize_scheduler(db_path, now=now)
     current = now or datetime.now()
     with connect(db_path) as conn:
@@ -177,9 +184,11 @@ def run_scheduler_job(db_path: str | Path, job_key: str, *, now: datetime | None
         if row is None:
             raise ValueError(f"scheduler job not found: {job_key}")
         job = _job_row_to_dict(row)
-        scheduled_at = job["next_run_at"] or current.isoformat(timespec="seconds")
-        task_log_id = start_task_log(conn, "scheduler_job", date.today().isoformat(), f"Running scheduler job {job_key}")
-        run_id = _insert_scheduler_run(conn, job_key=job_key, scheduled_at=scheduled_at)
+        explicit_scheduled_at = scheduled_at is not None
+        scheduled_for = _format_dt(_parse_cursor(scheduled_at) if isinstance(scheduled_at, str) else scheduled_at) or job["next_run_at"] or current.isoformat(timespec="seconds")
+        scheduled_date = (_parse_cursor(scheduled_for) or current).date().isoformat()
+        task_log_id = start_task_log(conn, "scheduler_job", scheduled_date, f"Running scheduler job {job_key}")
+        run_id = _insert_scheduler_run(conn, job_key=job_key, scheduled_at=scheduled_for)
     try:
         if job["job_type"] in {"expert_agents", "jarvis_agent"}:
             result = _run_agent_runtime_job(db_path, job, current)
@@ -213,10 +222,11 @@ def run_scheduler_job(db_path: str | Path, job_key: str, *, now: datetime | None
                     run_id,
                 ),
             )
-            conn.execute(
-                "UPDATE scheduler_jobs SET next_run_at = ?, updated_at = datetime('now') WHERE job_key = ?",
-                (next_run, job_key),
-            )
+            if not explicit_scheduled_at:
+                conn.execute(
+                    "UPDATE scheduler_jobs SET next_run_at = ?, updated_at = datetime('now') WHERE job_key = ?",
+                    (next_run, job_key),
+                )
             task_log_status = "failed" if status == "failed" else "success"
             complete_task_log(conn, task_log_id, task_log_status, json.dumps({"job_key": job_key, **result}, ensure_ascii=False, sort_keys=True))
     except Exception as exc:
@@ -239,15 +249,16 @@ def install_scheduler_cron(
     load: bool = True,
     run_at_load: bool = True,
     reset_stale_next_runs: bool = True,
+    launch_agents_dir: str | Path | None = None,
 ) -> dict[str, Any]:
     initialize_scheduler(db_path)
     if reset_stale_next_runs:
         refresh_stale_next_runs(db_path)
     root = Path(project_root).resolve()
     resolved_db = Path(db_path).resolve()
-    launch_agents_dir = Path.home() / "Library" / "LaunchAgents"
-    launch_agents_dir.mkdir(parents=True, exist_ok=True)
-    plist_path = launch_agents_dir / f"{CRON_LABEL}.plist"
+    resolved_launch_agents_dir = Path(launch_agents_dir) if launch_agents_dir else Path.home() / "Library" / "LaunchAgents"
+    resolved_launch_agents_dir.mkdir(parents=True, exist_ok=True)
+    plist_path = resolved_launch_agents_dir / f"{CRON_LABEL}.plist"
     py = python_bin or sys.executable
     interval_seconds = max(60, int(interval_minutes) * 60)
     env = {
@@ -261,6 +272,10 @@ def install_scheduler_cron(
     codex_bin = os.environ.get("INVESTMENT_FORECASTING_CODEX_BIN") or shutil.which("codex", path=env["PATH"])
     if codex_bin:
         env["INVESTMENT_FORECASTING_CODEX_BIN"] = codex_bin
+    for token_key in ("TUSHARE_TOKEN", "TS_TOKEN"):
+        token_value = os.environ.get(token_key)
+        if token_value:
+            env[token_key] = token_value
     plist = _launchd_plist(
         label=CRON_LABEL,
         program_arguments=[py, "-m", "investment_forecasting.cli", "scheduler", "run-due", "--db", str(resolved_db)],
@@ -289,6 +304,7 @@ def install_scheduler_cron(
         "ok": True,
         "label": CRON_LABEL,
         "plist_path": str(plist_path),
+        "launch_agents_dir": str(resolved_launch_agents_dir),
         "db_path": str(resolved_db),
         "project_root": str(root),
         "interval_seconds": interval_seconds,
@@ -360,10 +376,12 @@ def _today_status_item(job: dict[str, Any], runs: list[dict[str, Any]], *, today
     due = [item for item in expected if item <= now]
     due_runs = [run for run in runs if (_parse_cursor(run.get("scheduled_at")) or now) <= now]
     latest = due_runs[0] if due_runs else None
-    failed = [run for run in due_runs if run.get("status") == "failed"]
-    deferred = [run for run in due_runs if run.get("status") == "deferred"]
-    success = [run for run in due_runs if run.get("status") == "success"]
-    missed_count = max(0, len(due) - len(due_runs))
+    occurrence_statuses = _latest_due_occurrence_statuses(due, due_runs)
+    failed = [run for run in occurrence_statuses if run.get("status") == "failed"]
+    deferred = [run for run in occurrence_statuses if run.get("status") == "deferred"]
+    success = [run for run in occurrence_statuses if run.get("status") == "success"]
+    missed_count = max(0, len(due) - len(occurrence_statuses))
+    recovered_count = _recovered_due_occurrence_count(due, due_runs)
     if success and len(success) >= len(due):
         status = "success"
         reason = "今天到点任务已运行"
@@ -397,12 +415,33 @@ def _today_status_item(job: dict[str, Any], runs: list[dict[str, Any]], *, today
         "success_count": len(success),
         "failed_count": len(failed),
         "deferred_count": len(deferred),
+        "recovered_count": recovered_count,
         "missed_count": missed_count,
         "next_expected_at": _format_dt(next((item for item in expected if item > now), None)),
         "last_run_status": latest.get("status") if latest else None,
         "last_run_started_at": latest.get("started_at") if latest else None,
         "last_run_scheduled_at": latest.get("scheduled_at") if latest else None,
     }
+
+
+def _latest_due_occurrence_statuses(due: list[datetime], due_runs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    statuses: list[dict[str, Any]] = []
+    for occurrence in due:
+        occurrence_key = _format_dt(occurrence)
+        matches = [run for run in due_runs if _format_dt(_parse_cursor(run.get("scheduled_at"))) == occurrence_key]
+        if matches:
+            statuses.append(matches[0])
+    return statuses
+
+
+def _recovered_due_occurrence_count(due: list[datetime], due_runs: list[dict[str, Any]]) -> int:
+    recovered = 0
+    for occurrence in due:
+        occurrence_key = _format_dt(occurrence)
+        matches = [run for run in due_runs if _format_dt(_parse_cursor(run.get("scheduled_at"))) == occurrence_key]
+        if matches and matches[0].get("status") == "success" and any(run.get("status") in {"failed", "deferred"} for run in matches[1:]):
+            recovered += 1
+    return recovered
 
 
 def _expected_occurrences_for_date(job: dict[str, Any], day: date) -> list[datetime]:
@@ -577,13 +616,28 @@ def _run_deterministic_job(db_path: str | Path, conn: Any, job: dict[str, Any], 
     provider_key = job.get("provider_key")
     policy = job.get("policy", {})
     deferred = _provider_defer_reason(conn, provider_key, policy, now)
-    if deferred:
+    unrecovered_primary_failure = (
+        job["job_type"] == "market_context_incremental"
+        and _provider_has_unrecovered_failure(conn, provider_key)
+    )
+    has_market_context_fallback = job["job_type"] == "market_context_incremental" and _market_context_has_fallback_provider()
+    if deferred and not has_market_context_fallback:
         return {
             "status": "deferred",
             "deferred_reason": deferred,
             "provider_request_counts": {provider_key: 0} if provider_key else {},
             "updated_counts": {},
             "metadata": {"real_provider_calls": False, "job_type": job["job_type"]},
+        }
+    if (deferred or unrecovered_primary_failure) and has_market_context_fallback:
+        job = {
+            **job,
+            "policy": {
+                **policy,
+                "_skip_primary_provider": True,
+                "_primary_deferred_reason": deferred,
+                "_primary_unrecovered_failure": unrecovered_primary_failure,
+            },
         }
 
     try:
@@ -604,9 +658,9 @@ def _run_deterministic_job(db_path: str | Path, conn: Any, job: dict[str, Any], 
             "updated_counts": {},
             "metadata": {"real_provider_calls": True, "job_type": job["job_type"], "failed_stage": "deterministic_job"},
         }
-    request_count = sum(int(value) for value in result.get("provider_request_counts", {}).values())
-    if provider_key and request_count:
-        _record_provider_success(conn, provider_key, request_count, policy, now)
+    for counted_provider_key, request_count in result.get("provider_request_counts", {}).items():
+        if counted_provider_key and int(request_count):
+            _record_provider_success(conn, counted_provider_key, int(request_count), policy, now)
     return result
 
 
@@ -656,8 +710,8 @@ def _run_news_incremental(db_path: str | Path, conn: Any, job: dict[str, Any], n
     request_count = 0
     fetched_count = 0
     inserted_count = 0
-    provider = _news_provider()
     for source in sources:
+        provider = _news_provider_for_source(source)
         watermark = _get_watermark(conn, job["job_key"], provider_key, source, "news")
         start = _parse_cursor(watermark["last_success_cursor"] if watermark else None) or (now - timedelta(minutes=window_minutes))
         if start >= now:
@@ -676,14 +730,25 @@ def _run_news_incremental(db_path: str | Path, conn: Any, job: dict[str, Any], n
         start_text = start.isoformat(timespec="seconds")
         end_text = now.isoformat(timespec="seconds")
         max_items = int(policy.get("request_cap") or 200)
-        summary = ingest_news(
-            db_path,
-            provider=provider,
-            source=source,
-            start_datetime=start_text,
-            end_datetime=end_text,
-            max_items=max_items,
-        )
+        raw_rows = list(provider.news(source=source, start_datetime=start_text, end_datetime=end_text))
+        inserted = 0
+        duplicates = 0
+        for row in raw_rows[:max_items]:
+            news_item_id, was_inserted = upsert_news_item(
+                conn,
+                normalize_news_row(row, provider=getattr(provider, "source", provider.__class__.__name__), source=source),
+            )
+            index_news_item(conn, news_item_id)
+            if was_inserted:
+                inserted += 1
+            else:
+                duplicates += 1
+        summary = {
+            "fetched_count": len(raw_rows),
+            "inserted_count": inserted,
+            "duplicate_count": duplicates,
+            "skipped_count": max(0, len(raw_rows) - max_items),
+        }
         request_count += 1
         fetched_count += int(summary.get("fetched_count") or 0)
         inserted_count += int(summary.get("inserted_count") or 0)
@@ -716,21 +781,36 @@ def _run_market_context_incremental(db_path: str | Path, conn: Any, job: dict[st
         (stock_limit,),
     ).fetchall()
     subjects = [{"scope": "market", "subject": "market"}] + [{"scope": "stock", "subject": row["code"], "asset_id": row["id"]} for row in stock_rows]
+    if policy.get("_skip_primary_provider"):
+        subjects = [item for item in subjects if item["scope"] == "market"]
     request_cap = int(policy.get("request_cap") or 40)
     planned = subjects[:request_cap]
-    provider = _market_provider()
+    providers = _market_context_providers(skip_primary=bool(policy.get("_skip_primary_provider")))
     inserted_count = 0
+    errors_by_subject: dict[str, str] = {}
+    provider_by_subject: dict[str, str] = {}
     max_days = int(policy.get("max_days") or 5)
     for item in planned:
-        if item["scope"] == "market":
-            rows = list(provider.market_capital_flow())[-max_days:]
-            summary = {"market": _persist_capital_flow_rows(conn, rows)}
-        else:
-            rows = list(provider.stock_capital_flow(str(item["subject"])))[-max_days:]
-            for row in rows:
-                row["asset_id"] = int(item["asset_id"])
-                row["subject_code"] = str(item["subject"])
+        subject_key = f"{item['scope']}:{item['subject']}"
+        summary: dict[str, int] = {}
+        provider_source = ""
+        item_error = ""
+        try:
+            rows, provider_source = _capital_flow_rows_with_fallback(
+                providers,
+                item,
+                primary_provider_key=None if policy.get("_skip_primary_provider") else provider_key,
+            )
+            rows = rows[-max_days:]
+            if item["scope"] != "market":
+                for row in rows:
+                    row["asset_id"] = int(item["asset_id"])
+                    row["subject_code"] = str(item["subject"])
             summary = {str(item["subject"]): _persist_capital_flow_rows(conn, rows)}
+            provider_by_subject[subject_key] = provider_source
+        except Exception as exc:
+            item_error = str(exc)
+            errors_by_subject[subject_key] = item_error
         item_inserted = sum(int(value) for value in summary.values())
         inserted_count += item_inserted
         _upsert_watermark(
@@ -741,15 +821,49 @@ def _run_market_context_incremental(db_path: str | Path, conn: Any, job: dict[st
             scope_key=f"capital_flow:{item['scope']}",
             success_cursor=now.date().isoformat() if item_inserted else None,
             attempted_cursor=now.date().isoformat(),
-            metadata={"incremental": True, "real_provider_calls": True, "source": "capital_flow_observations", "summary": summary},
+            metadata={
+                "incremental": True,
+                "real_provider_calls": True,
+                "source": "capital_flow_observations",
+                "summary": summary,
+                "provider_source": provider_source,
+                "error": item_error,
+            },
         )
+    failed_subjects = len(errors_by_subject)
+    provider_request_counts: dict[str, int] = {}
+    for provider_source in provider_by_subject.values():
+        provider_request_counts[provider_source] = provider_request_counts.get(provider_source, 0) + 1
+    if not provider_request_counts and provider_key:
+        provider_request_counts[provider_key] = 0
+    error = None
+    if not inserted_count and planned:
+        error = "provider returned no capital flow rows for planned subjects"
+        if errors_by_subject:
+            error = f"{error}: {errors_by_subject}"
+    elif failed_subjects:
+        error = f"{failed_subjects} planned capital-flow subjects failed while other rows were written"
     return {
         "status": "success" if inserted_count else ("skipped" if not planned else "failed"),
         "skipped_reason": None if planned else "no tracked market context subjects",
-        "error": None if inserted_count or not planned else "provider returned no capital flow rows for planned subjects",
-        "updated_counts": {"capital_flow_subjects": len(planned), "capital_flow_rows": inserted_count, "skipped_by_cap": max(0, len(subjects) - len(planned))},
-        "provider_request_counts": {provider_key: len(planned)} if provider_key else {},
-        "metadata": {"real_provider_calls": True, "incremental": True, "planned_subjects": planned, "policy": _policy_summary(policy)},
+        "error": error,
+        "updated_counts": {
+            "capital_flow_subjects": len(planned),
+            "capital_flow_rows": inserted_count,
+            "failed_subjects": failed_subjects,
+            "skipped_by_cap": max(0, len(subjects) - len(planned)),
+        },
+        "provider_request_counts": provider_request_counts,
+        "metadata": {
+            "real_provider_calls": True,
+            "incremental": True,
+            "planned_subjects": planned,
+            "provider_by_subject": provider_by_subject,
+            "errors_by_subject": errors_by_subject,
+            "policy": _policy_summary(policy),
+            "primary_deferred_reason": policy.get("_primary_deferred_reason"),
+            "primary_unrecovered_failure": bool(policy.get("_primary_unrecovered_failure")),
+        },
     }
 
 
@@ -776,17 +890,32 @@ def _run_price_nav_incremental(conn: Any, job: dict[str, Any], now: datetime) ->
         """
         SELECT a.id, a.code, a.asset_type, a.market, a.source, MAX(p.trade_date) AS latest_trade_date
         FROM assets a
-        LEFT JOIN price_daily p ON p.asset_id = a.id AND p.source = a.source
+        LEFT JOIN price_daily p ON p.asset_id = a.id
         WHERE a.status = 'active'
         GROUP BY a.id
         ORDER BY a.asset_type, a.code
         """
     ).fetchall()
     request_cap = int(policy.get("request_cap") or 500)
-    stale = [row for row in rows if not row["latest_trade_date"] or str(row["latest_trade_date"]) < target_date]
+    previous_market_date = _previous_market_date(datetime.fromisoformat(target_date)).isoformat()
+    nav_pending = [
+        row
+        for row in rows
+        if row["asset_type"] == "fund"
+        and row["latest_trade_date"]
+        and previous_market_date <= str(row["latest_trade_date"]) < target_date
+    ]
+    stale = [
+        row
+        for row in rows
+        if (not row["latest_trade_date"] or str(row["latest_trade_date"]) < target_date)
+        and row not in nav_pending
+    ]
     planned = stale[:request_cap]
-    provider = _market_provider()
+    providers = _market_price_providers()
     written_by_asset: dict[str, int] = {}
+    errors_by_asset: dict[str, str] = {}
+    provider_by_asset: dict[str, str] = {}
     for row in rows:
         source_key = f"{row['asset_type']}:{row['code']}"
         latest = row["latest_trade_date"] or ""
@@ -797,13 +926,23 @@ def _run_price_nav_incremental(conn: Any, job: dict[str, Any], now: datetime) ->
             asset = _provider_asset(row)
             start_date = _next_market_date(latest).strftime("%Y%m%d") if latest else target_date.replace("-", "")
             end_date = target_date.replace("-", "")
-            prices = provider.history(asset, start_date=start_date, end_date=end_date)
-            source = str(row["source"] or getattr(provider, "source", provider_key or "akshare"))
-            for price in prices:
-                upsert_price_daily(conn, asset_id=int(row["id"]), source=source, price=price)
-                written += 1
-            if written:
-                success_cursor = max(str(price["trade_date"]) for price in prices)
+            provider_errors: list[str] = []
+            for provider in _price_providers_for_asset(asset, providers):
+                source = str(getattr(provider, "source", provider_key or "akshare"))
+                try:
+                    prices = provider.history(asset, start_date=start_date, end_date=end_date)
+                    for price in prices:
+                        upsert_price_daily(conn, asset_id=int(row["id"]), source=source, price=price)
+                        written += 1
+                    if written:
+                        success_cursor = max(str(price["trade_date"]) for price in prices)
+                        provider_by_asset[source_key] = source
+                        break
+                    provider_errors.append(f"{source}: no rows")
+                except Exception as exc:
+                    provider_errors.append(f"{source}: {exc}")
+            if not written:
+                errors_by_asset[source_key] = " | ".join(provider_errors) or "no price rows"
             written_by_asset[str(row["code"])] = written
         _upsert_watermark(
             conn,
@@ -819,16 +958,43 @@ def _run_price_nav_incremental(conn: Any, job: dict[str, Any], now: datetime) ->
                 "target_date": target_date,
                 "already_current": row not in planned,
                 "written_rows": written,
+                "error": errors_by_asset.get(source_key),
+                "provider_source": provider_by_asset.get(source_key),
             },
         )
     written_rows = sum(written_by_asset.values())
+    failed_assets = len(errors_by_asset)
+    status = "success" if written_rows else ("skipped" if not planned else "failed")
+    error = None
+    if not written_rows and planned:
+        error = "provider returned no price rows for planned stale assets"
+    elif failed_assets:
+        error = f"{failed_assets} planned assets failed while other price rows were written"
     return {
-        "status": "success" if written_rows else ("skipped" if not planned else "failed"),
+        "status": status,
         "skipped_reason": None if planned else f"all tracked assets are current for {target_date}",
-        "error": None if written_rows or not planned else "provider returned no price rows for planned stale assets",
-        "updated_counts": {"stale_assets": len(stale), "planned_assets": len(planned), "written_price_rows": written_rows, "current_assets": len(rows) - len(stale), "skipped_by_cap": max(0, len(stale) - len(planned))},
+        "error": error,
+        "updated_counts": {
+            "stale_assets": len(stale),
+            "planned_assets": len(planned),
+            "failed_assets": failed_assets,
+            "written_price_rows": written_rows,
+            "current_assets": len(rows) - len(stale),
+            "nav_pending_assets": len(nav_pending),
+            "skipped_by_cap": max(0, len(stale) - len(planned)),
+        },
         "provider_request_counts": {provider_key: len(planned)} if provider_key else {},
-        "metadata": {"real_provider_calls": bool(planned), "incremental": True, "target_date": target_date, "planned_assets": [_asset_plan(row, target_date) for row in planned], "written_by_asset": written_by_asset, "policy": _policy_summary(policy)},
+        "metadata": {
+            "real_provider_calls": bool(planned),
+            "incremental": True,
+            "target_date": target_date,
+            "planned_assets": [_asset_plan(row, target_date) for row in planned],
+            "nav_pending_assets": [_asset_plan(row, target_date) for row in nav_pending],
+            "provider_by_asset": provider_by_asset,
+            "written_by_asset": written_by_asset,
+            "errors_by_asset": errors_by_asset,
+            "policy": _policy_summary(policy),
+        },
     }
 
 
@@ -995,8 +1161,48 @@ def _news_provider() -> Any:
     return TushareProvider()
 
 
+def _news_provider_for_source(source: str) -> Any:
+    if source in {"eastmoney_global", "sina_global"}:
+        return AkshareProvider()
+    return _news_provider()
+
+
 def _market_provider() -> Any:
     return AkshareProvider()
+
+
+def _market_context_providers(*, skip_primary: bool = False) -> list[Any]:
+    providers: list[Any] = [] if skip_primary else [_market_provider()]
+    try:
+        providers.append(TushareProvider())
+    except Exception:
+        pass
+    return providers
+
+
+def _market_context_has_fallback_provider() -> bool:
+    try:
+        TushareProvider()
+    except Exception:
+        return False
+    return True
+
+
+def _capital_flow_rows_with_fallback(providers: list[Any], item: dict[str, Any], *, primary_provider_key: str | None = None) -> tuple[list[dict[str, Any]], str]:
+    errors = []
+    for index, provider in enumerate(providers):
+        provider_source = primary_provider_key if index == 0 and primary_provider_key else str(getattr(provider, "source", provider.__class__.__name__))
+        try:
+            if item["scope"] == "market":
+                rows = list(provider.market_capital_flow())
+            else:
+                rows = list(provider.stock_capital_flow(str(item["subject"])))
+            if rows:
+                return rows, provider_source
+            errors.append(f"{provider_source}: no rows")
+        except Exception as exc:
+            errors.append(f"{provider_source}: {exc}")
+    raise RuntimeError("capital flow providers failed: " + " | ".join(errors))
 
 
 def _provider_asset(row: Any) -> Any:
@@ -1021,6 +1227,23 @@ def _provider_symbol(asset_type: str, code: str) -> str | None:
     return f"{prefix}{code}"
 
 
+def _market_price_providers() -> list[Any]:
+    providers: list[Any] = [_market_provider()]
+    try:
+        providers.append(TushareProvider())
+    except Exception:
+        pass
+    return providers
+
+
+def _price_providers_for_asset(asset: Any, providers: list[Any]) -> list[Any]:
+    if getattr(asset, "asset_type", None) not in {"stock", "etf"}:
+        return providers
+    tushare = [provider for provider in providers if str(getattr(provider, "source", "")) == "tushare"]
+    others = [provider for provider in providers if str(getattr(provider, "source", "")) != "tushare"]
+    return tushare + others
+
+
 def _next_market_date(latest: str) -> date:
     try:
         value = datetime.fromisoformat(str(latest)).date()
@@ -1030,6 +1253,14 @@ def _next_market_date(latest: str) -> date:
     while value.weekday() >= 5:
         value += timedelta(days=1)
     return value
+
+
+def _previous_market_date(value: datetime | date) -> date:
+    target = value.date() if isinstance(value, datetime) else value
+    target -= timedelta(days=1)
+    while target.weekday() >= 5:
+        target -= timedelta(days=1)
+    return target
 
 
 def _provider_defer_reason(conn: Any, provider_key: str | None, policy: dict[str, Any], now: datetime) -> str | None:
@@ -1076,6 +1307,14 @@ def _record_provider_success(conn: Any, provider_key: str, request_count: int, p
 def _record_provider_failure_conn(conn: Any, provider_key: str, reason: str, *, now: datetime, backoff_minutes: int) -> None:
     factor = 2 if _looks_throttled(reason) else 1
     backoff_until = now + timedelta(minutes=max(1, backoff_minutes) * factor)
+    rate_limit = conn.execute("SELECT * FROM provider_rate_limits WHERE provider_key = ?", (provider_key,)).fetchone()
+    metadata = _json_loads(rate_limit["metadata_json"], {}) if rate_limit else {}
+    metadata.update(
+        {
+            "likely_throttled": _looks_throttled(reason),
+            "last_failure_at": now.isoformat(timespec="seconds"),
+        }
+    )
     conn.execute(
         """
         INSERT INTO provider_rate_limits(provider_key, backoff_until, failure_count, last_failure_reason, metadata_json)
@@ -1091,7 +1330,7 @@ def _record_provider_failure_conn(conn: Any, provider_key: str, reason: str, *, 
             provider_key,
             backoff_until.isoformat(timespec="seconds"),
             reason,
-            json.dumps({"likely_throttled": _looks_throttled(reason), "recorded_at": now.isoformat(timespec="seconds")}, ensure_ascii=False, sort_keys=True),
+            json.dumps(metadata, ensure_ascii=False, sort_keys=True),
         ),
     )
 
@@ -1100,16 +1339,37 @@ def _provider_counts_for_window(rate_limit: Any, now: datetime) -> tuple[int, in
     if rate_limit is None:
         return (0, 0)
     metadata = _json_loads(rate_limit["metadata_json"], {})
-    last_success_at = metadata.get("last_success_at")
-    if not last_success_at:
+    last_count_at = metadata.get("last_success_at") or metadata.get("last_failure_at") or rate_limit["updated_at"]
+    if not last_count_at:
         return (int(rate_limit["hourly_count"] or 0), int(rate_limit["daily_count"] or 0))
     try:
-        last_success = datetime.fromisoformat(str(last_success_at))
+        last_count = datetime.fromisoformat(str(last_count_at))
     except ValueError:
         return (int(rate_limit["hourly_count"] or 0), int(rate_limit["daily_count"] or 0))
-    hourly_count = int(rate_limit["hourly_count"] or 0) if last_success.date() == now.date() and last_success.hour == now.hour else 0
-    daily_count = int(rate_limit["daily_count"] or 0) if last_success.date() == now.date() else 0
+    hourly_count = int(rate_limit["hourly_count"] or 0) if last_count.date() == now.date() and last_count.hour == now.hour else 0
+    daily_count = int(rate_limit["daily_count"] or 0) if last_count.date() == now.date() else 0
     return hourly_count, daily_count
+
+
+def _provider_has_unrecovered_failure(conn: Any, provider_key: str | None) -> bool:
+    if not provider_key:
+        return False
+    row = conn.execute("SELECT * FROM provider_rate_limits WHERE provider_key = ?", (provider_key,)).fetchone()
+    if row is None or not row["last_failure_reason"]:
+        return False
+    metadata = _json_loads(row["metadata_json"], {})
+    last_failure_at = _parse_optional_datetime(metadata.get("last_failure_at"))
+    last_success_at = _parse_optional_datetime(metadata.get("last_success_at"))
+    return last_failure_at is not None and (last_success_at is None or last_failure_at > last_success_at)
+
+
+def _parse_optional_datetime(value: Any) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value))
+    except ValueError:
+        return None
 
 
 def _json_loads(raw: Any, default: Any) -> Any:

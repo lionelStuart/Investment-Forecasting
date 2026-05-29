@@ -9,6 +9,7 @@ from collections.abc import Iterator
 from collections.abc import Iterable, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
 from urllib.parse import urlencode
 
@@ -144,6 +145,35 @@ class AkshareProvider:
         if "fund" in asset_types:
             assets.extend(self._fund_universe())
         return assets
+
+    def news(self, *, source: str, start_datetime: str, end_datetime: str) -> list[dict[str, Any]]:
+        if source == "eastmoney_global":
+            raw = self._with_retry("news:eastmoney_global", lambda: self.ak.stock_info_global_em())
+            rows = [
+                {
+                    "id": str(_value(row, "链接", "url") or _value(row, "标题") or ""),
+                    "title": str(_value(row, "标题") or ""),
+                    "content": str(_value(row, "摘要", "内容") or _value(row, "标题") or ""),
+                    "published_at": str(_value(row, "发布时间", "时间") or ""),
+                    "url": str(_value(row, "链接", "url") or ""),
+                }
+                for row in _records(raw)
+            ]
+        elif source == "sina_global":
+            raw = self._with_retry("news:sina_global", lambda: self.ak.stock_info_global_sina())
+            rows = [
+                {
+                    "id": str(_value(row, "时间") or "") + ":" + str(_value(row, "内容") or "")[:40],
+                    "title": str(_value(row, "内容") or "")[:80],
+                    "content": str(_value(row, "内容") or ""),
+                    "published_at": str(_value(row, "时间") or ""),
+                    "url": "",
+                }
+                for row in _records(raw)
+            ]
+        else:
+            raise ProviderDataError(f"Unsupported AKShare news source: {source}")
+        return [row for row in rows if _within_news_window(row.get("published_at"), start_datetime, end_datetime)]
 
     def _stock_universe(self) -> list[dict[str, Any]]:
         try:
@@ -745,6 +775,16 @@ def _records(raw_rows: Any) -> list[Mapping[str, Any]]:
     if isinstance(raw_rows, Iterable) and not isinstance(raw_rows, (str, bytes, Mapping)):
         return list(raw_rows)
     raise ProviderDataError("Provider response must be a dataframe or iterable of mappings")
+
+
+def _within_news_window(value: Any, start_datetime: str, end_datetime: str) -> bool:
+    try:
+        published = datetime.fromisoformat(str(value).replace(" ", "T"))
+        start = datetime.fromisoformat(str(start_datetime).replace(" ", "T"))
+        end = datetime.fromisoformat(str(end_datetime).replace(" ", "T"))
+    except ValueError:
+        return False
+    return start <= published <= end
 
 
 def _value(row: Mapping[str, Any], *names: str) -> Any:

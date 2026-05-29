@@ -2,18 +2,41 @@ from __future__ import annotations
 
 import json
 import os
+import time
+from collections.abc import Iterator
+from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import date, timedelta
 from typing import Any
 
 from investment_forecasting.providers.akshare_provider import ProviderDataError
 
 
+@dataclass(frozen=True)
+class TushareRetryConfig:
+    attempts: int = 2
+    fallback_to_direct: bool = True
+    fallback_to_local_proxy: bool = True
+    backoff_base_seconds: float = 0.5
+    max_backoff_seconds: float = 5.0
+
+
 class TushareProvider:
     source = "tushare"
 
-    def __init__(self, ts_module: Any | None = None, token: str | None = None, capital_flow_lookback_days: int = 180) -> None:
+    def __init__(
+        self,
+        ts_module: Any | None = None,
+        token: str | None = None,
+        capital_flow_lookback_days: int = 180,
+        retry_config: TushareRetryConfig | None = None,
+        sleep_func: Any | None = None,
+    ) -> None:
         self.token = token or os.environ.get("TUSHARE_TOKEN") or os.environ.get("TS_TOKEN")
         self.capital_flow_lookback_days = capital_flow_lookback_days
+        self.retry_config = retry_config or TushareRetryConfig()
+        self._sleep = sleep_func or time.sleep
+        self.network_profiles: list[str] = []
         if not self.token:
             raise ProviderDataError("Tushare provider requires TUSHARE_TOKEN or --tushare-token; AKShare remains the default free provider.")
         if ts_module is None:
@@ -25,22 +48,29 @@ class TushareProvider:
         self.pro = ts_module.pro_api(self.token)
 
     def diagnostics(self) -> dict[str, Any]:
-        return {"provider": self.source, "credential_source": "token_present"}
+        return {
+            "provider": self.source,
+            "credential_source": "token_present",
+            "network_profiles": list(self.network_profiles),
+        }
 
     def history(self, asset: Any, start_date: str, end_date: str) -> list[dict[str, Any]]:
         ts_code = _ts_code(asset.code, asset.asset_type)
         if asset.asset_type == "index":
             raw = self.pro.index_daily(ts_code=ts_code, start_date=start_date, end_date=end_date)
             rows = [_normalize_market_row(row) for row in _records(raw)]
-        elif asset.asset_type in {"stock", "etf"}:
+        elif asset.asset_type == "stock":
             raw = self.ts.pro_bar(
                 ts_code=ts_code,
                 start_date=start_date,
                 end_date=end_date,
                 adj="qfq",
                 asset="E",
-                pro_api=self.pro,
+                api=self.pro,
             )
+            rows = [_normalize_market_row(row) for row in _records(raw)]
+        elif asset.asset_type == "etf":
+            raw = self.pro.fund_daily(ts_code=ts_code, start_date=start_date, end_date=end_date)
             rows = [_normalize_market_row(row) for row in _records(raw)]
         elif asset.asset_type == "fund":
             raw = self.pro.fund_nav(ts_code=ts_code, start_date=start_date, end_date=end_date)
@@ -117,17 +147,32 @@ class TushareProvider:
         return sorted((_normalize_hsgt_moneyflow_row(row) for row in deduped.values()), key=lambda row: row["flow_date"])
 
     def news(self, *, source: str, start_datetime: str, end_datetime: str) -> list[dict[str, Any]]:
-        try:
-            rows = _records(
-                self.pro.news(
+        return _records(
+            self._with_network_profiles(
+                f"news fetch failed for source:{source}",
+                lambda: self.pro.news(
                     src=source,
                     start_date=_news_datetime_param(start_datetime),
                     end_date=_news_datetime_param(end_datetime),
-                )
+                ),
             )
-        except Exception as exc:
-            raise ProviderDataError(f"Tushare news fetch failed for source:{source}: {exc}") from exc
-        return rows
+        )
+
+    def _with_network_profiles(self, label: str, fetch: Any) -> Any:
+        errors = []
+        last_error: Exception | None = None
+        for profile_name, proxy_env in _network_profiles(self.retry_config):
+            self.network_profiles.append(profile_name)
+            with _temporary_proxy_env(proxy_env):
+                for attempt_index in range(max(1, self.retry_config.attempts)):
+                    try:
+                        return fetch()
+                    except Exception as exc:
+                        last_error = exc
+                        if attempt_index < max(1, self.retry_config.attempts) - 1:
+                            self._sleep(_backoff_seconds(self.retry_config, attempt_index))
+                errors.append(f"{profile_name}: {_redact_token(str(last_error), self.token)}")
+        raise ProviderDataError(f"Tushare {label} after {self.retry_config.attempts} attempt(s) across {len(errors)} network profile(s): {' | '.join(errors)}")
 
     def _stock_universe(self) -> list[dict[str, Any]]:
         rows = _records(self.pro.stock_basic(exchange="", list_status="L", fields="ts_code,symbol,name"))
@@ -391,3 +436,68 @@ def _records(raw_rows: Any) -> list[dict[str, Any]]:
     if hasattr(raw_rows, "to_dict"):
         return list(raw_rows.to_dict(orient="records"))
     return [dict(row) for row in raw_rows or []]
+
+
+PROXY_ENV_KEYS = (
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+    "no_proxy",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "NO_PROXY",
+)
+
+
+LOCAL_PROXY_ENV = {
+    "https_proxy": "http://127.0.0.1:7890",
+    "http_proxy": "http://127.0.0.1:7890",
+    "all_proxy": "socks5://127.0.0.1:7890",
+    "HTTPS_PROXY": "http://127.0.0.1:7890",
+    "HTTP_PROXY": "http://127.0.0.1:7890",
+    "ALL_PROXY": "socks5://127.0.0.1:7890",
+}
+
+
+def _network_profiles(retry_config: TushareRetryConfig) -> list[tuple[str, dict[str, str | None]]]:
+    profiles: list[tuple[str, dict[str, str | None]]] = [("environment", {})]
+    if retry_config.fallback_to_direct:
+        profiles.append(("direct", {**{key: None for key in PROXY_ENV_KEYS}, "NO_PROXY": "*", "no_proxy": "*"}))
+    if retry_config.fallback_to_local_proxy and not _is_local_proxy_env():
+        profiles.append(("local_proxy_127.0.0.1:7890", LOCAL_PROXY_ENV))
+    return profiles
+
+
+def _is_local_proxy_env() -> bool:
+    proxy_values = {os.environ.get(key, "") for key in PROXY_ENV_KEYS}
+    return any("127.0.0.1:7890" in value or "localhost:7890" in value for value in proxy_values)
+
+
+@contextmanager
+def _temporary_proxy_env(proxy_env: dict[str, str | None]) -> Iterator[None]:
+    original = {key: os.environ.get(key) for key in PROXY_ENV_KEYS}
+    try:
+        for key, value in proxy_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        yield
+    finally:
+        for key, value in original.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+def _backoff_seconds(retry_config: TushareRetryConfig, attempt_index: int) -> float:
+    base = max(0.0, retry_config.backoff_base_seconds)
+    return min(max(0.0, retry_config.max_backoff_seconds), base * (2**attempt_index))
+
+
+def _redact_token(text: str, token: str | None) -> str:
+    if token:
+        return text.replace(token, "[redacted]")
+    return text

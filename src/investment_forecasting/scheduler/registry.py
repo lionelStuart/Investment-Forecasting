@@ -33,7 +33,7 @@ DEFAULT_JOB_DEFINITIONS: tuple[SchedulerJobDefinition, ...] = (
             "min_delay_seconds": 1,
             "jitter_seconds": 1,
             "backoff_minutes": 30,
-            "sources": ["sina"],
+            "sources": ["sina", "eastmoney_global", "sina_global"],
             "watermark_scope": "source",
         },
         description="每两小时固定在 :05 补齐资讯增量窗口。",

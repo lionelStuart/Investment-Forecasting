@@ -10,6 +10,11 @@ from investment_forecasting.communication.imessage import (
 )
 from investment_forecasting.communication.service import FailingAdapter, send_outbound_message
 from investment_forecasting.communication.templates import (
+    render_daily_failure,
+    render_daily_success,
+    render_expert_plan_ready,
+    render_expert_probation,
+    render_expert_retirement,
     render_jarvis_daily_summary,
     render_jarvis_weekly_summary,
     render_provider_warning,
@@ -110,6 +115,51 @@ def test_idempotency_key_does_not_send_duplicate_messages(tmp_path):
     assert count == 1
 
 
+def test_dry_run_idempotency_key_can_be_retried_as_real_send(tmp_path):
+    db_path = tmp_path / "communication.sqlite3"
+    init_db(db_path)
+    calls = []
+
+    def fake_runner(*args, **kwargs):
+        calls.append((args, kwargs))
+        return subprocess.CompletedProcess(args=args[0], returncode=0, stdout="", stderr="")
+
+    with connect(db_path) as conn:
+        seed_adapter_and_recipient(conn, dry_run_default=0)
+        first = send_outbound_message(
+            conn,
+            channel="imessage",
+            recipient_key="owner_phone",
+            template_key="daily_summary",
+            body="今日研究摘要，仅供研究参考。",
+            idempotency_key="same-key",
+            dry_run=True,
+        )
+        second = send_outbound_message(
+            conn,
+            channel="imessage",
+            recipient_key="owner_phone",
+            template_key="daily_summary",
+            body="今日研究摘要，仅供研究参考。",
+            idempotency_key="same-key",
+            dry_run=False,
+            adapter=IMessageAdapter(runner=fake_runner, run_system_preflight=False),
+        )
+        count = conn.execute("SELECT COUNT(*) AS count FROM outbound_messages").fetchone()["count"]
+        row = conn.execute("SELECT * FROM outbound_messages WHERE id = ?", (first["id"],)).fetchone()
+
+    assert first["status"] == "dry_run"
+    assert second["id"] == first["id"]
+    assert second["status"] == "sent"
+    assert second["duplicate"] is False
+    assert second["retried_from_dry_run"] is True
+    assert row["status"] == "sent"
+    assert row["sent_at"] is not None
+    assert row["retry_count"] == 1
+    assert count == 1
+    assert calls
+
+
 def test_failed_adapter_result_is_persisted(tmp_path):
     db_path = tmp_path / "communication.sqlite3"
     init_db(db_path)
@@ -194,6 +244,32 @@ def test_imessage_real_send_uses_adapter_boundary_and_persists_sent(tmp_path):
     assert calls[0][0][0][0] == "osascript"
 
 
+def test_enabled_adapter_defaults_to_real_send_when_dry_run_default_is_false(tmp_path):
+    db_path = tmp_path / "communication.sqlite3"
+    init_db(db_path)
+    calls = []
+
+    def fake_runner(*args, **kwargs):
+        calls.append((args, kwargs))
+        return subprocess.CompletedProcess(args=args[0], returncode=0, stdout="", stderr="")
+
+    with connect(db_path) as conn:
+        seed_adapter_and_recipient(conn, dry_run_default=0)
+        message = send_outbound_message(
+            conn,
+            channel="imessage",
+            recipient_key="owner_phone",
+            template_key="default_real_send",
+            body="默认真实发送边界测试，仅供研究系统使用。",
+            adapter=IMessageAdapter(runner=fake_runner, run_system_preflight=False),
+        )
+        row = conn.execute("SELECT * FROM outbound_messages WHERE id = ?", (message["id"],)).fetchone()
+
+    assert message["status"] == "sent"
+    assert row["sent_at"] is not None
+    assert calls
+
+
 def test_imessage_permission_failure_maps_to_permission_required(tmp_path):
     db_path = tmp_path / "communication.sqlite3"
     init_db(db_path)
@@ -215,6 +291,55 @@ def test_imessage_permission_failure_maps_to_permission_required(tmp_path):
 
     assert message["status"] == "permission_required"
     assert "-1743" in message["error"]
+
+
+def test_sent_idempotency_key_blocks_duplicate_after_dry_run_retry(tmp_path):
+    db_path = tmp_path / "communication.sqlite3"
+    init_db(db_path)
+
+    def fake_runner(*args, **kwargs):
+        return subprocess.CompletedProcess(args=args[0], returncode=0, stdout="", stderr="")
+
+    with connect(db_path) as conn:
+        seed_adapter_and_recipient(conn, dry_run_default=0)
+        first = send_outbound_message(
+            conn,
+            channel="imessage",
+            recipient_key="owner_phone",
+            template_key="daily_summary",
+            body="今日研究摘要，仅供研究参考。",
+            idempotency_key="same-key",
+            dry_run=True,
+        )
+        retried = send_outbound_message(
+            conn,
+            channel="imessage",
+            recipient_key="owner_phone",
+            template_key="daily_summary",
+            body="今日研究摘要，仅供研究参考。",
+            idempotency_key="same-key",
+            dry_run=False,
+            adapter=IMessageAdapter(runner=fake_runner, run_system_preflight=False),
+        )
+        duplicate = send_outbound_message(
+            conn,
+            channel="imessage",
+            recipient_key="owner_phone",
+            template_key="daily_summary",
+            body="今日研究摘要，仅供研究参考。",
+            idempotency_key="same-key",
+            dry_run=False,
+            adapter=FailingAdapter("duplicate must not execute"),
+        )
+        count = conn.execute("SELECT COUNT(*) AS count FROM outbound_messages").fetchone()["count"]
+        row = conn.execute("SELECT * FROM outbound_messages WHERE id = ?", (first["id"],)).fetchone()
+
+    assert retried["status"] == "sent"
+    assert duplicate["duplicate"] is True
+    assert duplicate["status"] == "sent"
+    assert count == 1
+    assert row["status"] == "sent"
+    assert row["error"] is None
 
 
 def test_verify_imessage_setup_can_skip_system_probe(tmp_path):
@@ -307,11 +432,142 @@ def test_jarvis_weekly_summary_template_is_safe_and_idempotent(tmp_path):
 
     assert notification.template_key == "jarvis_weekly_summary"
     assert "Jarvis 投资研究周报" in notification.body
+    assert "2026-05-17 至 2026-05-23" in notification.body
+    assert "覆盖：1 份日简报；缺失证据 1，过期证据 0。" in notification.body
+    assert "本周结论：偏防守，先确认数据" in notification.body
     assert "本消息仅作研究辅助" in notification.body
     assert "不构成真实买卖指令" in notification.body
     assert "raw" not in notification.body.lower()
     assert first["status"] == "dry_run"
     assert second["duplicate"] is True
+
+
+def test_notification_templates_preserve_safety_language_and_hide_raw_payloads(tmp_path):
+    db_path = tmp_path / "communication-template-safety.sqlite3"
+    init_db(db_path)
+    daily_brief = {
+        "brief_date": "2026-05-23",
+        "version": "jarvis_v1",
+        "focus_directions": [{"direction": "证据确认", "reason": "等待资金流更新"}],
+        "one_line_stance": "先观察",
+        "model_summary": {"status": "watch", "top_forecasts": [], "confidence_gates": []},
+        "expert_summary": [],
+        "risk_warnings": "仅作研究辅助，注意回撤风险。",
+        "missing_evidence": [],
+        "stale_evidence": [{"source": "capital_flow_observations"}],
+    }
+    weekly = render_jarvis_weekly_summary([daily_brief], period_start="2026-05-17", period_end="2026-05-23")
+    with connect(db_path) as conn:
+        notifications = [
+            render_daily_success(conn, run_date="2026-05-23", steps={"news": "ok", "model": "ok"}),
+            render_daily_failure(run_date="2026-05-23", completed_steps={"news": "ok"}, error="provider timeout"),
+            render_provider_warning(
+                run_date="2026-05-23",
+                provider="AKShare",
+                warning="资金流接口延迟",
+                next_action="等待下一轮调度重试",
+            ),
+            render_expert_plan_ready(conn, plan_date="2026-05-23"),
+            render_expert_probation(conn, review_date="2026-05-23"),
+            render_expert_retirement(conn, review_date="2026-05-23"),
+            render_jarvis_daily_summary(daily_brief),
+            weekly,
+        ]
+
+    expected_keys = {
+        "daily_workflow_success",
+        "daily_workflow_failure",
+        "provider_warning",
+        "expert_plan_ready",
+        "expert_probation",
+        "expert_retirement",
+        "jarvis_daily_summary",
+        "jarvis_weekly_summary",
+    }
+    assert {notification.template_key for notification in notifications} == expected_keys
+    for notification in notifications:
+        body = notification.body
+        assert any(
+            marker in body
+            for marker in (
+                "仅供研究辅助",
+                "仅作研究辅助",
+                "不构成",
+                "不是现实账户买卖指令",
+                "仅用于运行健康提醒",
+                "仅说明",
+                "真实资金决策仍需",
+            )
+        )
+        assert "raw" not in body.lower()
+        assert "payload" not in body.lower()
+        assert "{" not in body
+        assert "}" not in body
+        assert "+10000000000" not in body
+
+
+def test_failed_weekly_notification_remains_visible_after_later_daily_success(tmp_path):
+    db_path = tmp_path / "communication-weekly-failure-visible.sqlite3"
+    init_db(db_path)
+    weekly = render_jarvis_weekly_summary([], period_start="2026-05-17", period_end="2026-05-23")
+    daily = render_jarvis_daily_summary(
+        {
+            "brief_date": "2026-05-24",
+            "version": "jarvis_v1",
+            "focus_directions": [],
+            "one_line_stance": "继续观察",
+            "model_summary": {"status": "watch", "top_forecasts": []},
+            "expert_summary": [],
+            "risk_warnings": "仅作研究辅助。",
+        }
+    )
+    sent_calls = []
+
+    def fake_runner(command, **kwargs):
+        sent_calls.append(command)
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    with connect(db_path) as conn:
+        seed_adapter_and_recipient(conn, dry_run_default=0)
+        failed = send_outbound_message(
+            conn,
+            channel="imessage",
+            recipient_key="owner_phone",
+            template_key=weekly.template_key,
+            subject=weekly.subject,
+            body=weekly.body,
+            severity=weekly.severity,
+            payload_summary=weekly.payload_summary,
+            idempotency_key=weekly.idempotency_key,
+            dry_run=False,
+            adapter=FailingAdapter("weekly send failed"),
+        )
+        sent = send_outbound_message(
+            conn,
+            channel="imessage",
+            recipient_key="owner_phone",
+            template_key=daily.template_key,
+            subject=daily.subject,
+            body=daily.body,
+            severity=daily.severity,
+            payload_summary=daily.payload_summary,
+            idempotency_key=daily.idempotency_key,
+            dry_run=False,
+            adapter=IMessageAdapter(runner=fake_runner, run_system_preflight=False),
+        )
+        rows = conn.execute(
+            "SELECT template_key, status, error, sent_at FROM outbound_messages ORDER BY id"
+        ).fetchall()
+
+    assert failed["status"] == "failed"
+    assert sent["status"] == "sent"
+    assert [row["template_key"] for row in rows] == ["jarvis_weekly_summary", "jarvis_daily_summary"]
+    assert rows[0]["status"] == "failed"
+    assert rows[0]["error"] == "weekly send failed"
+    assert rows[0]["sent_at"] is None
+    assert rows[1]["status"] == "sent"
+    assert rows[1]["sent_at"]
+    assert sent_calls
 
 
 def test_communication_cli_configures_recipient_and_dry_run(tmp_path, capsys):

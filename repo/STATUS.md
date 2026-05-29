@@ -95,6 +95,56 @@
   semantics, expert buy/sell action persistence, and virtual portfolio
   average-cost/realized/unrealized return calculations.
 
+- Follow-up market/news interface recovery on 2026-05-29: Tushare news
+  retrieval now retries through environment, direct, and local proxy profiles
+  with token-safe diagnostics. `market_context_intraday` can recover market-level
+  capital-flow evidence through Tushare when the AKShare/Eastmoney
+  market-context path has a newer unrecovered failure or active provider gate,
+  and records the actual provider used per subject. Local operational evidence:
+  `news_hourly_incremental` run `114` completed `success`; `market_context_intraday`
+  run `120` completed `success` with Tushare fallback and 5 written
+  capital-flow rows. Test evidence after the fix: `267 passed, 3 xfailed`.
+
+- Follow-up market data green-path repair on 2026-05-29: the remaining
+  market/data warning was traced to historical same-day provider failures plus
+  missing secondary fallbacks. Tushare price fallback now uses the installed
+  `tushare 1.4.29` `pro_bar(api=...)` signature for stocks and `fund_daily`
+  for ETFs, `price_nav_post_close` records the provider actually used per
+  asset, and `market_context_intraday` can use Tushare stock-level moneyflow
+  for planned subjects instead of failing whenever Eastmoney stock flow is
+  unavailable. Operational evidence: `market_context_intraday` run `136`
+  completed `success`, wrote 105 capital-flow rows across 21 subjects, and had
+  `failed_subjects = 0`. Test evidence after the fix: `271 passed, 3 xfailed`.
+
+- Follow-up Jarvis/short-message recovery on 2026-05-29: today's Jarvis
+  failure was traced to the `sang_hongyang` expert run for target evidence date
+  `2026-05-28` timing out and being stored as `cancelled`, which kept Jarvis
+  readiness pending and prevented a new phone summary. Runtime timeouts now
+  persist `timed_out`, successful recovered agent runs clear stale
+  `failure_reason` text, `sang_hongyang` recovered as `agent_runs.id = 30` /
+  `expert_plans.id = 27`, and Jarvis recovered as `agent_runs.id = 26` /
+  `jarvis_daily_briefs.id = 6`. The real iMessage adapter created
+  `outbound_messages.id = 9` with `status = sent` at `2026-05-29 01:43:45`
+  for `owner_phone`; device-side receipt still needs human confirmation before
+  TASK-098 can claim accepted phone delivery. Test evidence after the fix:
+  `269 passed, 3 xfailed`.
+
+- Sequential scheduler/data/Jarvis repair on 2026-05-29: the remaining
+  TASK-098 D1/D2/D3 expected-failure defects are fixed. `scheduler
+  today-status` now tracks due scheduled occurrences, recovery counts, and
+  operator-interrupted manual probes correctly; Jarvis marks stale capital-flow
+  summaries as `degraded`; new expert plans carry capital-flow
+  freshness/degradation evidence. Operational recovery evidence:
+  `price_nav_post_close` run `143` completed `success` with 159 written price
+  rows and one explicit `stock:000004` no-history asset; `news_hourly_incremental`
+  run `146` completed `success` with 63 current news rows through Akshare
+  Eastmoney/Sina global sources; `jarvis_t_plus_one` occurrence
+  `2026-05-29T08:00:00` recovered as scheduler run `147` without duplicating
+  the already-sent `outbound_messages.id = 9`. Current `today-status` is
+  intentionally still `warn`: 5 jobs are `success`, while hourly market/news
+  remain `partial` because earlier same-day failures stay visible by design.
+  Test evidence after the pass: `277 passed, 2 warnings`.
+
 - Earlier Jarvis-first IA narrowing is closed, not the current active pause.
   `TASK-061` through `TASK-065` are complete: the AI provider boundary,
   expert/Jarvis prompt and evidence schemas, provider-backed orchestration,

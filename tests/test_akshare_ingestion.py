@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 
 import pytest
 
@@ -17,6 +18,7 @@ from investment_forecasting.providers.akshare_provider import (
     ProviderAccessPolicy,
     ProviderDataError,
     RetryConfig,
+    _run_curl_json,
     normalize_fund_info,
     normalize_price_rows,
 )
@@ -155,6 +157,18 @@ class FakeAkModule:
             {"净值日期": "2026-05-20", "单位净值": "1.1"},
             {"净值日期": "2026-05-21", "单位净值": "1.2"},
             {"净值日期": "2026-05-22", "单位净值": "1.3"},
+        ]
+
+    def stock_info_global_em(self):
+        return [
+            {"标题": "市场快讯", "摘要": "资金关注科技板块。", "发布时间": "2026-05-29 10:15:00", "链接": "https://example.test/a"},
+            {"标题": "旧新闻", "摘要": "昨日内容。", "发布时间": "2026-05-28 10:15:00", "链接": "https://example.test/b"},
+        ]
+
+    def stock_info_global_sina(self):
+        return [
+            {"时间": "2026-05-29 10:16:00", "内容": "指数震荡走强。"},
+            {"时间": "2026-05-28 10:16:00", "内容": "旧内容。"},
         ]
 
 
@@ -533,6 +547,25 @@ def test_provider_filters_fund_history_to_requested_dates():
     assert [row["trade_date"] for row in rows] == ["2026-05-20", "2026-05-21"]
 
 
+def test_provider_normalizes_global_news_sources():
+    provider = AkshareProvider(ak_module=FakeAkModule())
+
+    eastmoney = provider.news(source="eastmoney_global", start_datetime="2026-05-29T00:00:00", end_datetime="2026-05-29T23:59:59")
+    sina = provider.news(source="sina_global", start_datetime="2026-05-29T00:00:00", end_datetime="2026-05-29T23:59:59")
+
+    assert eastmoney == [
+        {
+            "id": "https://example.test/a",
+            "title": "市场快讯",
+            "content": "资金关注科技板块。",
+            "published_at": "2026-05-29 10:15:00",
+            "url": "https://example.test/a",
+        }
+    ]
+    assert sina[0]["title"] == "指数震荡走强。"
+    assert sina[0]["published_at"] == "2026-05-29 10:16:00"
+
+
 def test_provider_falls_back_to_sina_for_etf_history():
     provider = AkshareProvider(ak_module=FakeAkModuleWithEtfFallback())
     asset = next(asset for asset in MVP_UNIVERSE if asset.asset_type == "etf")
@@ -643,6 +676,27 @@ def test_provider_falls_back_to_direct_when_proxy_env_fails(monkeypatch):
     assert ak_module.calls == 2
     assert rows[0]["trade_date"] == "2026-05-20"
     assert os.environ["HTTPS_PROXY"] == "http://broken.proxy:7890"
+
+
+def test_eastmoney_curl_fallback_error_records_direct_and_local_proxy_profiles(monkeypatch):
+    calls = []
+
+    def fake_run(command, check, capture_output, text, env=None):
+        calls.append({"command": command, "env": env})
+        raise subprocess.CalledProcessError(7, command, stderr="Could not resolve host")
+
+    monkeypatch.setattr("investment_forecasting.providers.akshare_provider.subprocess.run", fake_run)
+    monkeypatch.setattr("investment_forecasting.providers.akshare_provider.time.sleep", lambda seconds: None)
+
+    with pytest.raises(ProviderDataError) as exc_info:
+        _run_curl_json("https://push2his.eastmoney.com/test")
+
+    message = str(exc_info.value)
+    assert "curl_no_proxy attempt 1" in message
+    assert "curl_local_proxy_127.0.0.1:7890 attempt 1" in message
+    assert calls[0]["env"] is None
+    assert calls[0]["command"][-2:] == ["--noproxy", "*"] or "--noproxy" in calls[0]["command"]
+    assert calls[-1]["env"]["https_proxy"] == "http://127.0.0.1:7890"
 
 
 def test_mvp_universe_has_representative_assets():

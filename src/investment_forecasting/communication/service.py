@@ -77,16 +77,24 @@ def send_outbound_message(
 ) -> dict[str, Any]:
     _validate_request(severity, body)
     key = idempotency_key or _idempotency_key(channel, recipient_key, template_key, body)
-    duplicate = conn.execute("SELECT * FROM outbound_messages WHERE idempotency_key = ?", (key,)).fetchone()
-    if duplicate is not None:
-        result = dict(duplicate)
-        result["duplicate"] = True
-        return result
 
     recipient = conn.execute("SELECT * FROM communication_recipients WHERE recipient_key = ?", (recipient_key,)).fetchone()
+    config = conn.execute("SELECT * FROM communication_adapter_configs WHERE channel = ?", (channel,)).fetchone()
+    effective_dry_run = bool(dry_run) if dry_run is not None else bool(config["dry_run_default"]) if config else True
+    duplicate = conn.execute("SELECT * FROM outbound_messages WHERE idempotency_key = ?", (key,)).fetchone()
+    retry_row = None
+    if duplicate is not None:
+        if duplicate["status"] == "dry_run" and not effective_dry_run:
+            retry_row = duplicate
+        else:
+            result = dict(duplicate)
+            result["duplicate"] = True
+            return result
+
     if recipient is None or recipient["channel"] != channel or not recipient["allowlisted"] or not recipient["enabled"]:
-        return _persist_message(
+        return _store_message_result(
             conn,
+            retry_row=retry_row,
             channel=channel,
             recipient=recipient,
             recipient_key=recipient_key,
@@ -101,8 +109,9 @@ def send_outbound_message(
 
     policy_status = _policy_status(conn, recipient, severity)
     if policy_status is not None:
-        return _persist_message(
+        return _store_message_result(
             conn,
+            retry_row=retry_row,
             channel=channel,
             recipient=recipient,
             recipient_key=recipient_key,
@@ -115,8 +124,6 @@ def send_outbound_message(
             result=policy_status,
         )
 
-    config = conn.execute("SELECT * FROM communication_adapter_configs WHERE channel = ?", (channel,)).fetchone()
-    effective_dry_run = bool(dry_run) if dry_run is not None else bool(config["dry_run_default"]) if config else True
     if effective_dry_run:
         result = DryRunAdapter().send(recipient=recipient, subject=subject, body=body, payload_summary=payload_summary)
     elif config is None or not config["enabled"]:
@@ -125,8 +132,9 @@ def send_outbound_message(
         delivery_adapter = adapter or _default_adapter(channel, config["config_json"])
         result = delivery_adapter.send(recipient=recipient, subject=subject, body=body, payload_summary=payload_summary)
 
-    return _persist_message(
+    return _store_message_result(
         conn,
+        retry_row=retry_row,
         channel=channel,
         recipient=recipient,
         recipient_key=recipient_key,
@@ -213,6 +221,108 @@ def _persist_message(
     )
     row = dict(cursor.fetchone())
     row["duplicate"] = False
+    return row
+
+
+def _store_message_result(
+    conn,
+    *,
+    retry_row: Any | None,
+    channel: str,
+    recipient: Any | None,
+    recipient_key: str,
+    template_key: str,
+    subject: str | None,
+    body: str,
+    severity: str,
+    payload_summary: str | None,
+    idempotency_key: str,
+    result: AdapterResult,
+) -> dict[str, Any]:
+    if retry_row is None:
+        return _persist_message(
+            conn,
+            channel=channel,
+            recipient=recipient,
+            recipient_key=recipient_key,
+            template_key=template_key,
+            subject=subject,
+            body=body,
+            severity=severity,
+            payload_summary=payload_summary,
+            idempotency_key=idempotency_key,
+            result=result,
+        )
+    return _update_message_result(
+        conn,
+        message_id=retry_row["id"],
+        channel=channel,
+        recipient=recipient,
+        recipient_key=recipient_key,
+        template_key=template_key,
+        subject=subject,
+        body=body,
+        severity=severity,
+        payload_summary=payload_summary,
+        result=result,
+    )
+
+
+def _update_message_result(
+    conn,
+    *,
+    message_id: int,
+    channel: str,
+    recipient: Any | None,
+    recipient_key: str,
+    template_key: str,
+    subject: str | None,
+    body: str,
+    severity: str,
+    payload_summary: str | None,
+    result: AdapterResult,
+) -> dict[str, Any]:
+    if result.status not in TERMINAL_STATUSES:
+        raise CommunicationError(f"unsupported adapter status: {result.status}")
+    cursor = conn.execute(
+        """
+        UPDATE outbound_messages
+        SET channel = ?,
+            recipient_id = ?,
+            recipient_key = ?,
+            template_key = ?,
+            subject = ?,
+            body = ?,
+            severity = ?,
+            payload_summary = ?,
+            status = ?,
+            adapter_result_json = ?,
+            error = ?,
+            sent_at = CASE WHEN ? = 'sent' THEN datetime('now') ELSE sent_at END,
+            updated_at = datetime('now'),
+            retry_count = retry_count + 1
+        WHERE id = ?
+        RETURNING *
+        """,
+        (
+            channel,
+            recipient["id"] if recipient is not None else None,
+            recipient_key,
+            template_key,
+            subject,
+            body,
+            severity,
+            payload_summary,
+            result.status,
+            result.as_json(),
+            result.error,
+            result.status,
+            message_id,
+        ),
+    )
+    row = dict(cursor.fetchone())
+    row["duplicate"] = False
+    row["retried_from_dry_run"] = True
     return row
 
 

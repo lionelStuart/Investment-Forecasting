@@ -8,8 +8,9 @@ from typing import Any
 
 
 def connect(db_path: str | Path) -> sqlite3.Connection:
-    conn = sqlite3.connect(db_path)
+    conn = sqlite3.connect(db_path, timeout=30)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout = 30000")
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA journal_mode = WAL")
     return conn
@@ -505,6 +506,7 @@ def update_agent_run(
     runtime_metadata: dict[str, Any] | None = None,
     submission_result: dict[str, Any] | None = None,
     failure_reason: str | None = None,
+    clear_failure_reason: bool = False,
     fallback_reason: str | None = None,
 ) -> None:
     row = get_agent_run(conn, agent_run_id)
@@ -518,7 +520,7 @@ def update_agent_run(
             launch_request_json = COALESCE(?, launch_request_json),
             runtime_metadata_json = COALESCE(?, runtime_metadata_json),
             submission_result_json = COALESCE(?, submission_result_json),
-            failure_reason = COALESCE(?, failure_reason),
+            failure_reason = CASE WHEN ? THEN NULL ELSE COALESCE(?, failure_reason) END,
             fallback_reason = COALESCE(?, fallback_reason),
             started_at = CASE WHEN ? = 'running' AND started_at IS NULL THEN datetime('now') ELSE started_at END,
             finished_at = CASE
@@ -534,6 +536,7 @@ def update_agent_run(
             _json_or_none(launch_request),
             _json_or_none(runtime_metadata),
             _json_or_none(submission_result),
+            1 if clear_failure_reason else 0,
             failure_reason,
             fallback_reason,
             next_status,

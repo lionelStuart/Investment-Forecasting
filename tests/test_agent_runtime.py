@@ -4,6 +4,8 @@ import json
 import subprocess
 from types import SimpleNamespace
 
+import pytest
+
 import investment_forecasting.agent_runtime.execution as execution
 import investment_forecasting.cli as cli_module
 from investment_forecasting.agent_runtime import (
@@ -19,6 +21,7 @@ from investment_forecasting.agent_runtime import (
     render_jarvis_agent_prompt,
 )
 from investment_forecasting.agent_runtime.models import CodexRuntimePolicy
+from investment_forecasting.agent_runtime.service import complete_agent_run
 from investment_forecasting.db import connect, get_agent_run, init_db, update_agent_run
 from investment_forecasting.experts.planning import run_expert_agent_plan_from_output
 from investment_forecasting.experts.roster import initialize_default_experts, list_roster
@@ -108,6 +111,19 @@ def test_create_and_fail_jarvis_agent_run(tmp_path):
 
     assert result.status == "failed"
     assert result.failure_reason == "expert evidence incomplete"
+
+
+def test_completed_agent_run_clears_stale_failure_reason(tmp_path):
+    db_path = init_db(tmp_path / "recovered_agent.sqlite3")
+    handle = create_or_prepare_agent_run(db_path, expert_launch_request())
+    fail_agent_run(db_path, handle.agent_run_id, error="previous timeout", status="timed_out")
+
+    complete_agent_run(db_path, handle.agent_run_id, status="completed", output={"status": "ok"})
+
+    with connect(db_path) as conn:
+        row = get_agent_run(conn, handle.agent_run_id)
+    assert row["status"] == "completed"
+    assert row["failure_reason"] is None
 
 
 def test_duplicate_agent_run_creation_is_idempotent(tmp_path):
@@ -203,6 +219,34 @@ def test_codex_cli_adapter_clears_stale_output_artifacts_on_prepare(tmp_path):
 
     for name in ("last_message", "events_jsonl", "stderr_log", "result_json"):
         assert open(paths[name], encoding="utf-8").read() == ""
+
+
+def test_wait_for_artifact_records_timeout_as_terminal_status(tmp_path):
+    db_path = init_db(tmp_path / "codex_cli_timeout.sqlite3")
+    adapter = CodexCliRuntimeAdapter(
+        db_path,
+        project_root=tmp_path,
+        codex_bin="codex",
+        runner=lambda *args, **kwargs: DummyProcess(),
+        completed_runner=lambda *args, **kwargs: subprocess.CompletedProcess(args[0], 0, stdout="Logged in using ChatGPT", stderr=""),
+    )
+    prepared = adapter.prepare_run(expert_launch_request(), prompt="slow expert")
+    adapter.start_run(prepared.agent_run_id)
+
+    result = execution._wait_for_artifact(
+        adapter,
+        db_path,
+        prepared.agent_run_id,
+        role_type="expert",
+        role_key="bai_gui",
+        timeout_seconds=0,
+    )
+
+    with connect(db_path) as conn:
+        row = get_agent_run(conn, prepared.agent_run_id)
+    assert result["status"] == "timed_out"
+    assert row["status"] == "timed_out"
+    assert row["failure_reason"] == "expert Codex execution timed out"
 
 
 def test_codex_cli_readiness_checks_binary_and_login(tmp_path):
@@ -410,6 +454,49 @@ def test_jarvis_readiness_reports_real_upstream_scheduler_evidence(tmp_path):
         "not_success_jobs": [],
         "readiness_only_jobs": [],
     }
+
+
+def test_jarvis_readiness_keeps_same_day_upstream_failures_visible(tmp_path):
+    db_path = init_db(tmp_path / "readiness-upstream-history.sqlite3")
+    experts = initialize_default_experts(db_path)
+    for expert in experts:
+        request = build_launch_request(
+            role_type="expert",
+            role_key=expert["expert_key"],
+            run_date="2026-05-25",
+            target_evidence_date="2026-05-25",
+            trigger_reason="expert_agent_daily_execution",
+            overview_skill="investment-expert-agent",
+            skill_bundle=get_role_tool_manifest("expert", expert["expert_key"]).skill_bundle,
+            prompt_ref={"kind": "test", "prompt_hash": f"sha256:{expert['expert_key']}"},
+            tool_manifest_ref={"kind": "inline", "manifest_hash": "sha256:test"},
+            output_contract={"schema_version": "expert_agent_output_v1", "submission_tool": "submit_expert_virtual_action"},
+        )
+        handle = create_or_prepare_agent_run(db_path, request)
+        with connect(db_path) as conn:
+            update_agent_run(conn, handle.agent_run_id, status="completed")
+    with connect(db_path) as conn:
+        scheduler_rows = [
+            ("news_hourly_incremental", "success", '{"real_provider_calls": true}', None, "2026-05-25 10:05:00"),
+            ("market_context_intraday", "success", '{"real_provider_calls": true}', None, "2026-05-25 10:15:00"),
+            ("price_nav_post_close", "failed", '{"real_provider_calls": true}', "stock:000004 no history", "2026-05-25 17:30:00"),
+            ("price_nav_post_close", "success", '{"real_provider_calls": true}', None, "2026-05-25 17:45:00"),
+            ("features_post_close", "success", '{"real_calculation": true}', None, "2026-05-25 18:10:00"),
+            ("model_post_close", "success", '{"real_model_run": true}', None, "2026-05-25 18:40:00"),
+        ]
+        for job_key, status, metadata, error, started_at in scheduler_rows:
+            conn.execute(
+                """
+                INSERT INTO scheduler_runs(job_key, scheduled_at, started_at, finished_at, status, metadata_json, error)
+                VALUES (?, '2026-05-25T18:00:00', ?, ?, ?, ?, ?)
+                """,
+                (job_key, started_at, started_at, status, metadata, error),
+            )
+
+    ready = jarvis_agent_readiness(db_path, "2026-05-25")
+
+    assert ready["upstream_evidence_status"]["ready"] is False
+    assert "price_nav_post_close" in ready["upstream_evidence_status"]["not_success_jobs"]
 
 
 def test_expert_agent_output_persists_plan_with_agent_run_evidence(tmp_path):

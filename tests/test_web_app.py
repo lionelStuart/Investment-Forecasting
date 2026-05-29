@@ -470,6 +470,61 @@ def test_settings_page_shows_scheduler_backoff_and_latest_runs(tmp_path, monkeyp
     assert "HTTP 429 rate limit" in settings
 
 
+def test_settings_page_surfaces_scheduler_failed_deferred_and_missed_states(tmp_path, monkeypatch):
+    from datetime import datetime
+
+    import investment_forecasting.scheduler.service as service
+
+    class FixedDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            current = datetime.fromisoformat("2026-05-25T10:30:00")
+            return current if tz is None else current.replace(tzinfo=tz)
+
+    monkeypatch.setattr(service, "datetime", FixedDatetime)
+    db_path = prepare_web_db(tmp_path)
+    initialize_scheduler(db_path, now=datetime.fromisoformat("2026-05-25T08:00:00"))
+    with connect(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO scheduler_runs(job_key, scheduled_at, started_at, finished_at, status, error)
+            VALUES (
+                'news_hourly_incremental', '2026-05-25T08:05:00',
+                '2026-05-25 08:05:01', '2026-05-25 08:05:02',
+                'failed', 'provider down'
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO scheduler_runs(job_key, scheduled_at, started_at, finished_at, status, deferred_reason)
+            VALUES (
+                'market_context_intraday', '2026-05-25T10:00:00',
+                '2026-05-25 10:00:01', '2026-05-25 10:00:02',
+                'deferred', 'provider hourly budget exhausted for akshare'
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO task_logs(task_name, run_date, status, message, error)
+            VALUES ('scheduler_job', '2026-05-25', 'failed', 'Running scheduler job news_hourly_incremental', 'provider down')
+            """
+        )
+
+    settings = render_route(db_path, "/settings", {})
+
+    assert "今日任务" in settings
+    assert "news_hourly_incremental" in settings
+    assert "market_context_intraday" in settings
+    assert "failed" in settings
+    assert "deferred" in settings
+    assert "missed" in settings
+    assert "provider down" in settings
+    assert "provider hourly budget exhausted for akshare" in settings
+    assert "未跑" in settings
+
+
 def test_timeline_shows_latest_three_advice_dates_and_missing_states(tmp_path):
     db_path = prepare_web_db(tmp_path)
     generate_daily_advice(db_path, advice_date="20260524")
@@ -679,6 +734,65 @@ def test_communication_page_can_record_dry_run_without_exposing_raw_recipient(tm
     assert "不会触发真实手机发送" in html
     assert "+13***5678" in html
     assert "+13800135678" not in html
+
+
+def test_communication_page_surfaces_terminal_statuses_and_recent_errors(tmp_path):
+    db_path = prepare_web_db(tmp_path)
+    seed_communication_web_state(db_path)
+
+    with connect(db_path) as conn:
+        recipient = conn.execute("SELECT * FROM communication_recipients WHERE recipient_key = 'owner_phone'").fetchone()
+        raw_address = recipient["address"]
+        rows = [
+            ("jarvis_daily_summary", "sent", None, "2026-05-24 08:10:00", "2026-05-24 08:10:10"),
+            ("daily_workflow_failure", "failed", "Messages send failed", "2026-05-24 08:11:00", None),
+            (
+                "provider_warning",
+                "permission_required",
+                "Messages permission missing",
+                "2026-05-24 08:12:00",
+                None,
+            ),
+        ]
+        for template_key, status, error, requested_at, sent_at in rows:
+            conn.execute(
+                """
+                INSERT INTO outbound_messages(
+                    channel, recipient_id, recipient_key, template_key, subject, body,
+                    severity, payload_summary, idempotency_key, status,
+                    adapter_result_json, error, requested_at, sent_at
+                )
+                VALUES (
+                    'imessage', ?, 'owner_phone', ?, 'TASK-098 communication state',
+                    '通信链路状态验证，仅供研究辅助。', 'warning', ?,
+                    ?, ?, '{"status":"test"}', ?, ?, ?
+                )
+                """,
+                (
+                    recipient["id"],
+                    template_key,
+                    f"{template_key} {status}",
+                    f"web-fixture-{template_key}-{status}",
+                    status,
+                    error,
+                    requested_at,
+                    sent_at,
+                ),
+            )
+
+    html = render_route(db_path, "/communication", {})
+
+    assert "近期有失败" in html
+    assert "最近错误数" in html
+    assert "dry_run" in html
+    assert "sent" in html
+    assert "failed" in html
+    assert "permission_required" in html
+    assert "Messages send failed" in html
+    assert "Messages permission missing" in html
+    assert "2026-05-24 08:10:10" in html
+    assert "+13***5678" in html
+    assert raw_address not in html
 
 
 def test_settings_page_saves_active_preference_and_advice_uses_it(tmp_path):

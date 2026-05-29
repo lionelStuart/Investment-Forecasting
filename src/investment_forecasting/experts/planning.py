@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -58,7 +58,7 @@ def run_expert_daily_plans(
                     value_virtual_portfolio(conn, portfolio_id=int(updated_existing["portfolio_id"]), valuation_date=target_date)
                     results.append(_deserialize_plan(updated_existing))
                     continue
-                plan = build_expert_plan(expert, portfolio, candidates, market, target_date, ai_analysis_id, analysis)
+                plan = build_expert_plan(expert, portfolio, candidates, market, target_date, ai_analysis_id, analysis, capital_flow=_capital_flow_evidence(conn, target_date))
                 check_expert_plan_compliance(plan)
                 transaction = _execute_plan(conn, portfolio["id"], plan)
                 valuation = value_virtual_portfolio(conn, portfolio_id=portfolio["id"], valuation_date=target_date)
@@ -138,7 +138,7 @@ def run_expert_agent_plan_from_output(
             _upsert_plan_item(conn, plan_id, plan)
             saved = _deserialize_plan(conn.execute("SELECT * FROM expert_plans WHERE id = ?", (plan_id,)).fetchone())
             return {**saved, "transaction": transaction, "valuation": valuation}
-        plan = build_expert_plan(expert, portfolio, candidates, market, target_date, ai_analysis_id, analysis)
+        plan = build_expert_plan(expert, portfolio, candidates, market, target_date, ai_analysis_id, analysis, capital_flow=_capital_flow_evidence(conn, target_date))
         plan["evidence"]["agent_run_id"] = agent_run_id
         plan["evidence"]["agent_output"] = agent_output
         if agent_output.get("outcome") in {"skipped", "failed"}:
@@ -187,6 +187,7 @@ def build_expert_plan(
     plan_date: str,
     ai_analysis_id: int | None = None,
     ai_analysis: dict[str, Any] | None = None,
+    capital_flow: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     focus = json.loads(expert["focus_weights_json"])
     best = max(candidates, key=lambda row: _candidate_score(row, focus))
@@ -210,6 +211,7 @@ def build_expert_plan(
         "price_date": best["price_date"],
         "market_snapshot_id": market["id"] if market else None,
         "model_evidence_packet": build_model_evidence_packet(best),
+        "capital_flow": capital_flow or {"status": "missing", "latest_date": None, "stale": False},
         "asset": {
             "id": best["asset_id"],
             "code": best["asset_code"],
@@ -235,6 +237,29 @@ def build_expert_plan(
         "evidence": evidence,
         "risk_checks": risk_checks,
         "risk_warnings": risk_warnings,
+    }
+
+
+def _capital_flow_evidence(conn: Any, target_date: str) -> dict[str, Any]:
+    row = conn.execute(
+        """
+        SELECT MAX(flow_date) AS latest_date, COUNT(*) AS count
+        FROM capital_flow_observations
+        WHERE flow_date <= ?
+        """,
+        (target_date,),
+    ).fetchone()
+    latest_date = row["latest_date"] if row else None
+    if not latest_date:
+        return {"status": "missing", "latest_date": None, "stale": False, "count": 0}
+    age_days = (datetime.fromisoformat(target_date).date() - datetime.fromisoformat(str(latest_date)).date()).days
+    stale = age_days > 3
+    return {
+        "status": "degraded" if stale else "available",
+        "latest_date": latest_date,
+        "stale": stale,
+        "age_days": age_days,
+        "count": int(row["count"] or 0),
     }
 
 

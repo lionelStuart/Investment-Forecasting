@@ -170,7 +170,7 @@ def synthesize_jarvis_payload(target_date: str, evidence: dict[str, Any]) -> dic
     model_summary = _model_summary(predictions, evidence["backtests"])
     expert_summary = [_expert_summary(item) for item in experts]
     disagreement = _disagreement(model_summary, expert_summary)
-    capital_flow_summary = _capital_flow_summary(evidence["capital_flows"])
+    capital_flow_summary = _capital_flow_summary(evidence["capital_flows"], target_date)
     model_summary["capital_flow"] = capital_flow_summary
     confidence_gates = _confidence_gates(model_summary, stale)
     model_summary["confidence_gates"] = confidence_gates
@@ -753,17 +753,25 @@ def _mean(values: Any) -> float | None:
     return mean(clean) if clean else None
 
 
-def _capital_flow_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
+def _capital_flow_summary(rows: list[dict[str, Any]], target_date: str | None = None) -> dict[str, Any]:
     if not rows:
         return {"status": "missing", "count": 0, "latest_date": None, "positive_count": 0, "negative_count": 0, "top_inflows": [], "top_outflows": []}
     positive = [row for row in rows if (row.get("main_net_inflow") or 0) > 0]
     negative = [row for row in rows if (row.get("main_net_inflow") or 0) < 0]
     top_inflows = sorted(positive, key=lambda row: float(row.get("main_net_inflow") or 0), reverse=True)[:3]
     top_outflows = sorted(negative, key=lambda row: float(row.get("main_net_inflow") or 0))[:3]
+    latest_date = max(row["flow_date"] for row in rows if row.get("flow_date"))
+    stale = False
+    age_days = 0
+    if target_date:
+        age_days = (datetime.fromisoformat(target_date).date() - datetime.fromisoformat(latest_date).date()).days
+        stale = age_days > 3
     return {
-        "status": "available",
+        "status": "degraded" if stale else "available",
         "count": len(rows),
-        "latest_date": max(row["flow_date"] for row in rows if row.get("flow_date")),
+        "latest_date": latest_date,
+        "stale": stale,
+        "age_days": age_days,
         "positive_count": len(positive),
         "negative_count": len(negative),
         "top_inflows": [_capital_flow_view(row) for row in top_inflows],

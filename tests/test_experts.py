@@ -451,6 +451,32 @@ def test_degraded_model_evidence_is_watch_only_for_expert_plans(tmp_path):
     assert all("只能作为观察线索" in row["rationale"] for row in rows)
 
 
+def test_expert_plan_evidence_marks_stale_capital_flow_as_degraded(tmp_path):
+    db_path = seed_expert_planning_db(tmp_path)
+    with connect(db_path) as conn:
+        asset = conn.execute("SELECT id, code, name FROM assets WHERE code = '510300'").fetchone()
+        conn.execute(
+            """
+            INSERT INTO capital_flow_observations(
+                flow_date, scope, subject_code, subject_name, asset_id,
+                main_net_inflow, main_net_inflow_pct, source, raw_payload
+            )
+            VALUES ('2026-05-18', 'stock', ?, ?, ?, -1200000, -0.04, 'test', '{}')
+            """,
+            (asset["code"], asset["name"], asset["id"]),
+        )
+
+    run_expert_daily_plans(db_path, plan_date="2026-05-23")
+
+    with connect(db_path) as conn:
+        row = conn.execute("SELECT evidence_json FROM expert_plans ORDER BY id LIMIT 1").fetchone()
+
+    evidence = json.loads(row["evidence_json"])
+    assert evidence["capital_flow"]["status"] == "degraded"
+    assert evidence["capital_flow"]["latest_date"] == "2026-05-18"
+    assert evidence["capital_flow"]["stale"] is True
+
+
 def test_run_expert_daily_plans_records_fake_provider_success(tmp_path, monkeypatch):
     monkeypatch.setenv("INVESTMENT_FORECASTING_AI_PROVIDER", "fake")
     db_path = seed_expert_planning_db(tmp_path)

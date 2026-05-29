@@ -571,6 +571,7 @@ def build_parser() -> argparse.ArgumentParser:
     scheduler_run_job_parser.add_argument("job_key")
     scheduler_run_job_parser.add_argument("--db", type=Path, default=Path("data/investment_forecasting.sqlite3"))
     scheduler_run_job_parser.add_argument("--now", help="Override current time in ISO format for deterministic runs.")
+    scheduler_run_job_parser.add_argument("--scheduled-at", help="Record the run against a specific scheduled occurrence in ISO format.")
     scheduler_install_parser = scheduler_subparsers.add_parser("install-cron", help="Install the local system cron runner for scheduler run-due")
     scheduler_install_parser.add_argument("--db", type=Path, default=Path("data/investment_forecasting.sqlite3"))
     scheduler_install_parser.add_argument("--project-root", type=Path, default=Path("."))
@@ -1398,7 +1399,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if result.get("ok") else 1
 
     if args.command == "scheduler" and args.scheduler_command == "run-job":
-        result = run_scheduler_job(args.db, args.job_key, now=_parse_optional_datetime(args.now))
+        result = run_scheduler_job(args.db, args.job_key, now=_parse_optional_datetime(args.now), scheduled_at=_parse_optional_datetime(args.scheduled_at))
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0 if result.get("status") in {"success", "skipped", "deferred"} else 1
 
